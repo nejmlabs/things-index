@@ -1,0 +1,727 @@
+#define name ThingsIndex Helper
+#define inputs file
+#define mac true
+
+#include 'actions/text'
+#include 'actions/calendar'
+
+// ThingsIndex exchanges one versioned JSON document with this Shortcut. Every
+// branch stops with JSON text; no branch asks for input or shows UI.
+@requestText = getText(ShortcutInput)
+@request = getDictionary(@requestText)
+@schemaVersion = "{@request['schemaVersion']}"
+@operation = "{@request['operation']}"
+
+if @schemaVersion != "1" {
+    output('{"schemaVersion":1,"ok":false,"code":"invalid_request"}')
+}
+
+if @operation == "ping" {
+    // This harmless lookup deliberately exercises Things so setup can grant
+    // access before the background worker starts.
+    rawAction("com.culturedcode.ThingsMac.TAIItemEntity", {
+        "UUID": "6599FE17-581B-4027-9E84-70A3818AAC1B",
+        "AppIntentDescriptor": {
+            "ActionRequiresAppInstallation": true,
+            "AppIntentIdentifier": "TAIItemEntity",
+            "BundleIdentifier": "com.culturedcode.ThingsMac",
+            "Name": "Things",
+            "TeamIdentifier": "JLMPQHK86H"
+        },
+        "WFContentItemFilter": {
+            "Value": {
+                "WFActionParameterFilterPrefix": 1,
+                "WFActionParameterFilterTemplates": [{
+                    "Operator": 4,
+                    "Property": "id",
+                    "Removable": true,
+                    "Values": {"String": "things-index-permission-check", "Unit": 4}
+                }],
+                "WFContentPredicateBoundedDate": false
+            },
+            "WFSerializationType": "WFContentPredicateTableTemplate"
+        },
+        "WFContentItemInputParameter": "Library",
+        "WFContentItemLimitEnabled": true,
+        "WFContentItemLimitNumber": 1
+    })
+    output('{"schemaVersion":1,"ok":true,"capabilities":["capture-task-v5","find-capture-v1","finalise-capture-v1"]}')
+}
+
+// Find a pending capture by its exact, worker-generated temporary title. The
+// query is limited to two because two results already require manual review.
+if @operation == "find-capture" {
+    @requestId = "{@request['requestId']}"
+    if !@requestId {
+        output('{"schemaVersion":1,"ok":false,"code":"invalid_request"}')
+    }
+    @pendingTitle = "ThingsIndex pending [{@requestId}]"
+    @matches: array
+    rawAction("com.culturedcode.ThingsMac.TAIItemEntity", {
+        "UUID": "63B1AAF5-512E-414C-9F25-4977BD626658",
+        "CustomOutputName": "ThingsIndex Find Matches",
+        "AppIntentDescriptor": {
+            "ActionRequiresAppInstallation": true,
+            "AppIntentIdentifier": "TAIItemEntity",
+            "BundleIdentifier": "com.culturedcode.ThingsMac",
+            "Name": "Things",
+            "TeamIdentifier": "JLMPQHK86H"
+        },
+        "WFContentItemFilter": {
+            "Value": {
+                "WFActionParameterFilterPrefix": 1,
+                "WFActionParameterFilterTemplates": [{
+                    "Operator": 4,
+                    "Property": "type",
+                    "Removable": true,
+                    "Values": {
+                        "Enumeration": {
+                            "Value": {
+                                "identifier": "todo",
+                                "title": {"key": "To-Do"},
+                                "value": "todo"
+                            },
+                            "WFSerializationType": "WFLinkDynamicOptionSubstitutableState"
+                        },
+                        "Unit": 4
+                    }
+                }, {
+                    "Operator": 4,
+                    "Property": "title",
+                    "Removable": true,
+                    "Values": {"String": "{@pendingTitle}", "Unit": 4}
+                }],
+                "WFContentPredicateBoundedDate": false
+            },
+            "WFSerializationType": "WFContentPredicateTableTemplate"
+        },
+        "WFContentItemInputParameter": "Library",
+        "WFContentItemLimitEnabled": true,
+        "WFContentItemLimitNumber": 2
+    })
+    rawAction("is.workflow.actions.setvariable", {
+        "WFInput": {
+            "Value": {
+                "OutputName": "ThingsIndex Find Matches",
+                "OutputUUID": "63B1AAF5-512E-414C-9F25-4977BD626658",
+                "Type": "ActionOutput"
+            },
+            "WFSerializationType": "WFTextTokenAttachment"
+        },
+        "WFVariableName": "matches",
+        "WFSerializationType": "WFTextTokenAttachment"
+    })
+    @ids = []
+    for match in @matches {
+        @matchId = "{@match['id']}"
+        if @matchId {
+            @ids += @matchId
+        }
+    }
+    @response = {"schemaVersion": 1, "ok": true}
+    @responseWithIds = rawAction("is.workflow.actions.setvalueforkey", {
+        "WFDictionary": "${@response}",
+        "WFDictionaryKey": "ids",
+        "WFDictionaryValue": "${@ids}"
+    })
+    @responseText = getText(@responseWithIds)
+    output(@responseText)
+}
+
+if @operation == "capture-task" {
+    @requestId = "{@request['requestId']}"
+    // Explicitly re-type nested JSON objects. Without this, Cherri emits
+    // generic property lookups instead of dictionary-key lookups for fields
+    // below task/destination.
+    @taskValue = getValue(@request, "task")
+    @task = getDictionary(@taskValue)
+    @title = "{@task['title']}"
+    if !@requestId {
+        output('{"schemaVersion":1,"ok":false,"code":"invalid_request"}')
+    }
+    if !@title {
+        output('{"schemaVersion":1,"ok":false,"code":"invalid_request"}')
+    }
+
+    @pendingTitle = "ThingsIndex pending [{@requestId}]"
+
+    @notes = "{@task['notes']}"
+    @destinationKind = "inbox"
+    @destinationName = ""
+    @headingName = ""
+    @destinationValue = getValue(@task, "destination")
+    if @destinationValue {
+        @destination = getDictionary(@destinationValue)
+        @destinationKind = "{@destination['kind']}"
+        @destinationName = "{@destination['name']}"
+        @headingName = "{@destination['heading']}"
+    }
+    if @destinationKind != "inbox" {
+        if @destinationKind != "project" {
+            if @destinationKind != "area" {
+                output('{"schemaVersion":1,"ok":false,"code":"invalid_request"}')
+            }
+        }
+    }
+    @start = "{@task['start']}"
+    @startDate = "{@task['startDate']}"
+    @evening = getValue(@task, "evening")
+    @reminderTime = "{@task['reminderTime']}"
+    @deadline = "{@task['deadline']}"
+    @startDayOffsetValue = getValue(@task, "startDayOffset")
+    @reminderMinuteOffsetValue = getValue(@task, "reminderMinuteOffset")
+    @deadlineDayOffsetValue = getValue(@task, "deadlineDayOffset")
+    @startDayOffset = number(@startDayOffsetValue)
+    @reminderMinuteOffset = number(@reminderMinuteOffsetValue)
+    @deadlineDayOffset = number(@deadlineDayOffsetValue)
+    @tags = getValue(@task, "tags")
+    @checklist = "{@task['checklist']}"
+
+    // Derive native Shortcuts Date values from numeric calendar offsets. The
+    // worker always supplies all three offsets, so these actions stay outside
+    // conditionals and preserve their Date output type.
+    @currentDate = currentDate()
+    @todayStart = adjustDate(@currentDate, "Get Start of Day")
+    @startDateValue = adjustDate(@todayStart, "Add", qty(@startDayOffset, "days"))
+    @reminderTimeValue = adjustDate(@startDateValue, "Add", qty(@reminderMinuteOffset, "min"))
+    @deadlineValue = adjustDate(@todayStart, "Add", qty(@deadlineDayOffset, "days"))
+
+    // Resolve placement before looking for a pending item. Keep each Things
+    // entity query in its own variable: Create To-Do needs the direct project,
+    // heading, or area query output to preserve App Entity provenance.
+    @hasParent = false
+    @hasHeading = false
+
+    if @destinationKind == "project" {
+        @projects: array
+        rawAction("com.culturedcode.ThingsMac.TAIItemEntity", {
+            "UUID": "9BA2F71B-AC1E-4089-84FE-0CEF7DAA034B",
+            "CustomOutputName": "ThingsIndex Projects",
+            "AppIntentDescriptor": {
+                "ActionRequiresAppInstallation": true,
+                "AppIntentIdentifier": "TAIItemEntity",
+                "BundleIdentifier": "com.culturedcode.ThingsMac",
+                "Name": "Things",
+                "TeamIdentifier": "JLMPQHK86H"
+            },
+            "WFContentItemFilter": {
+                "Value": {
+                    "WFActionParameterFilterPrefix": 1,
+                    "WFActionParameterFilterTemplates": [{
+                        "Operator": 4,
+                        "Property": "type",
+                        "Removable": true,
+                        "Values": {
+                            "Enumeration": {
+                                "Value": {
+                                    "identifier": "project",
+                                    "title": {"key": "Project"},
+                                    "value": "project"
+                                },
+                                "WFSerializationType": "WFLinkDynamicOptionSubstitutableState"
+                            },
+                            "Unit": 4
+                        }
+                    }, {
+                        "Operator": 4,
+                        "Property": "title",
+                        "Removable": true,
+                        "Values": {"String": "{@destinationName}", "Unit": 4}
+                    }],
+                    "WFContentPredicateBoundedDate": false
+                },
+                "WFSerializationType": "WFContentPredicateTableTemplate"
+            },
+            "WFContentItemInputParameter": "Library",
+            "WFContentItemLimitEnabled": true,
+            "WFContentItemLimitNumber": 2
+        })
+        rawAction("is.workflow.actions.setvariable", {
+            "WFInput": {
+                "Value": {
+                    "OutputName": "ThingsIndex Projects",
+                    "OutputUUID": "9BA2F71B-AC1E-4089-84FE-0CEF7DAA034B",
+                    "Type": "ActionOutput"
+                },
+                "WFSerializationType": "WFTextTokenAttachment"
+            },
+            "WFVariableName": "projects",
+            "WFSerializationType": "WFTextTokenAttachment"
+        })
+        @parentCount = count(@projects)
+        if @parentCount == 0 {
+            output('{"schemaVersion":1,"ok":false,"code":"destination_not_found"}')
+        }
+        if @parentCount != 1 {
+            output('{"schemaVersion":1,"ok":false,"code":"destination_ambiguous"}')
+        }
+        @hasParent = true
+
+        if @headingName {
+            for project in @projects {
+                @projectId = "{@project['id']}"
+            }
+            @headings: array
+            rawAction("com.culturedcode.ThingsMac.TAIItemEntity", {
+                "UUID": "7920CF63-FEC7-4AB3-9FE9-2CA44DEC80C8",
+                "CustomOutputName": "ThingsIndex Headings",
+                "AppIntentDescriptor": {
+                    "ActionRequiresAppInstallation": true,
+                    "AppIntentIdentifier": "TAIItemEntity",
+                    "BundleIdentifier": "com.culturedcode.ThingsMac",
+                    "Name": "Things",
+                    "TeamIdentifier": "JLMPQHK86H"
+                },
+                "WFContentItemFilter": {
+                    "Value": {
+                        "WFActionParameterFilterPrefix": 1,
+                        "WFActionParameterFilterTemplates": [{
+                            "Operator": 4,
+                            "Property": "type",
+                            "Removable": true,
+                            "Values": {
+                                "Enumeration": {
+                                    "Value": {
+                                        "identifier": "heading",
+                                        "title": {"key": "Heading"},
+                                        "value": "heading"
+                                    },
+                                    "WFSerializationType": "WFLinkDynamicOptionSubstitutableState"
+                                },
+                                "Unit": 4
+                            }
+                        }, {
+                            "Operator": 4,
+                            "Property": "title",
+                            "Removable": true,
+                            "Values": {"String": "{@headingName}", "Unit": 4}
+                        }, {
+                            "Operator": 4,
+                            "Property": "parentID",
+                            "Removable": true,
+                            "Values": {"String": "{@projectId}", "Unit": 4}
+                        }],
+                        "WFContentPredicateBoundedDate": false
+                    },
+                    "WFSerializationType": "WFContentPredicateTableTemplate"
+                },
+                "WFContentItemInputParameter": "Library",
+                "WFContentItemLimitEnabled": true,
+                "WFContentItemLimitNumber": 2
+            })
+            rawAction("is.workflow.actions.setvariable", {
+                "WFInput": {
+                    "Value": {
+                        "OutputName": "ThingsIndex Headings",
+                        "OutputUUID": "7920CF63-FEC7-4AB3-9FE9-2CA44DEC80C8",
+                        "Type": "ActionOutput"
+                    },
+                    "WFSerializationType": "WFTextTokenAttachment"
+                },
+                "WFVariableName": "headings",
+                "WFSerializationType": "WFTextTokenAttachment"
+            })
+            @headingCount = count(@headings)
+            if @headingCount == 0 {
+                output('{"schemaVersion":1,"ok":false,"code":"heading_not_found"}')
+            }
+            if @headingCount != 1 {
+                output('{"schemaVersion":1,"ok":false,"code":"heading_ambiguous"}')
+            }
+            @hasHeading = true
+        }
+    }
+
+    if @destinationKind == "area" {
+        @areas: array
+        rawAction("com.culturedcode.ThingsMac.TAIItemEntity", {
+            "UUID": "64915463-AB75-42CF-809A-8187305811F4",
+            "CustomOutputName": "ThingsIndex Areas",
+            "AppIntentDescriptor": {
+                "ActionRequiresAppInstallation": true,
+                "AppIntentIdentifier": "TAIItemEntity",
+                "BundleIdentifier": "com.culturedcode.ThingsMac",
+                "Name": "Things",
+                "TeamIdentifier": "JLMPQHK86H"
+            },
+            "WFContentItemFilter": {
+                "Value": {
+                    "WFActionParameterFilterPrefix": 1,
+                    "WFActionParameterFilterTemplates": [{
+                        "Operator": 4,
+                        "Property": "type",
+                        "Removable": true,
+                        "Values": {
+                            "Enumeration": {
+                                "Value": {
+                                    "identifier": "area",
+                                    "title": {"key": "Area"},
+                                    "value": "area"
+                                },
+                                "WFSerializationType": "WFLinkDynamicOptionSubstitutableState"
+                            },
+                            "Unit": 4
+                        }
+                    }, {
+                        "Operator": 4,
+                        "Property": "title",
+                        "Removable": true,
+                        "Values": {"String": "{@destinationName}", "Unit": 4}
+                    }],
+                    "WFContentPredicateBoundedDate": false
+                },
+                "WFSerializationType": "WFContentPredicateTableTemplate"
+            },
+            "WFContentItemInputParameter": "Library",
+            "WFContentItemLimitEnabled": true,
+            "WFContentItemLimitNumber": 2
+        })
+        rawAction("is.workflow.actions.setvariable", {
+            "WFInput": {
+                "Value": {
+                    "OutputName": "ThingsIndex Areas",
+                    "OutputUUID": "64915463-AB75-42CF-809A-8187305811F4",
+                    "Type": "ActionOutput"
+                },
+                "WFSerializationType": "WFTextTokenAttachment"
+            },
+            "WFVariableName": "areas",
+            "WFSerializationType": "WFTextTokenAttachment"
+        })
+        @parentCount = count(@areas)
+        if @parentCount == 0 {
+            output('{"schemaVersion":1,"ok":false,"code":"destination_not_found"}')
+        }
+        if @parentCount != 1 {
+            output('{"schemaVersion":1,"ok":false,"code":"destination_ambiguous"}')
+        }
+        @hasParent = true
+    }
+
+    if @destinationKind != "inbox" {
+        if !@hasParent {
+            output('{"schemaVersion":1,"ok":false,"code":"invalid_request"}')
+        }
+    }
+
+    // Reuse exactly one pending item. Placement is applied atomically by the
+    // Create action; the idempotent field edits below can then be retried.
+    @pendingItems: array
+    rawAction("com.culturedcode.ThingsMac.TAIItemEntity", {
+        "UUID": "5BF5B101-5BDA-42CD-9D9A-4C0E3860961F",
+        "CustomOutputName": "ThingsIndex Pending Items",
+        "AppIntentDescriptor": {
+            "ActionRequiresAppInstallation": true,
+            "AppIntentIdentifier": "TAIItemEntity",
+            "BundleIdentifier": "com.culturedcode.ThingsMac",
+            "Name": "Things",
+            "TeamIdentifier": "JLMPQHK86H"
+        },
+        "WFContentItemFilter": {
+            "Value": {
+                "WFActionParameterFilterPrefix": 1,
+                "WFActionParameterFilterTemplates": [{
+                    "Operator": 4,
+                    "Property": "type",
+                    "Removable": true,
+                    "Values": {
+                        "Enumeration": {
+                            "Value": {
+                                "identifier": "todo",
+                                "title": {"key": "To-Do"},
+                                "value": "todo"
+                            },
+                            "WFSerializationType": "WFLinkDynamicOptionSubstitutableState"
+                        },
+                        "Unit": 4
+                    }
+                }, {
+                    "Operator": 4,
+                    "Property": "title",
+                    "Removable": true,
+                    "Values": {"String": "{@pendingTitle}", "Unit": 4}
+                }],
+                "WFContentPredicateBoundedDate": false
+            },
+            "WFSerializationType": "WFContentPredicateTableTemplate"
+        },
+        "WFContentItemInputParameter": "Library",
+        "WFContentItemLimitEnabled": true,
+        "WFContentItemLimitNumber": 2
+    })
+    rawAction("is.workflow.actions.setvariable", {
+        "WFInput": {
+            "Value": {
+                "OutputName": "ThingsIndex Pending Items",
+                "OutputUUID": "5BF5B101-5BDA-42CD-9D9A-4C0E3860961F",
+                "Type": "ActionOutput"
+            },
+            "WFSerializationType": "WFTextTokenAttachment"
+        },
+        "WFVariableName": "pendingItems",
+        "WFSerializationType": "WFTextTokenAttachment"
+    })
+    @pendingCount = count(@pendingItems)
+    if @pendingCount > 1 {
+        output('{"schemaVersion":1,"ok":false,"code":"manual_review_required"}')
+    }
+
+    @tasks: array
+    if @pendingCount == 1 {
+        // A retry edits the single pending query result directly. Avoid feeding
+        // its entity ID into another Things query, which duplicates the same
+        // item in Shortcuts' privacy provenance.
+        @tasks = @pendingItems
+    }
+    if @pendingCount == 0 {
+        // Native Edit Items has no Heading detail. Create To-Do exposes a
+        // separate Heading parameter and requires its project as Parent.
+        if @destinationKind == "project" {
+            if @hasHeading {
+                rawAction("com.culturedcode.ThingsMac.TAIAddTodo2", {
+                    "UUID": "7B5E0989-907C-4DDF-B812-E14313E3A422",
+                    "AppIntentDescriptor": {"AppIntentIdentifier": "TAIAddTodo2", "BundleIdentifier": "com.culturedcode.ThingsMac", "Name": "Things", "TeamIdentifier": "JLMPQHK86H"},
+                    "ShowWhenRun": false, "title": "{@pendingTitle}",
+                    "parent": "${@projects}", "heading": "${@headings}"
+                })
+            } else {
+                rawAction("com.culturedcode.ThingsMac.TAIAddTodo2", {
+                    "UUID": "48E9FDF4-6A39-4209-844B-B3B671F734B2",
+                    "AppIntentDescriptor": {"AppIntentIdentifier": "TAIAddTodo2", "BundleIdentifier": "com.culturedcode.ThingsMac", "Name": "Things", "TeamIdentifier": "JLMPQHK86H"},
+                    "ShowWhenRun": false, "title": "{@pendingTitle}",
+                    "parent": "${@projects}"
+                })
+            }
+        } else {
+            if @destinationKind == "area" {
+                rawAction("com.culturedcode.ThingsMac.TAIAddTodo2", {
+                    "UUID": "F35D0B03-CB8E-41B8-B08D-BD7F7E7F3E7F",
+                    "AppIntentDescriptor": {"AppIntentIdentifier": "TAIAddTodo2", "BundleIdentifier": "com.culturedcode.ThingsMac", "Name": "Things", "TeamIdentifier": "JLMPQHK86H"},
+                    "ShowWhenRun": false, "title": "{@pendingTitle}",
+                    "parent": "${@areas}"
+                })
+            } else {
+                rawAction("com.culturedcode.ThingsMac.TAIAddTodo2", {
+                    "UUID": "CEE55B20-6073-4DEA-BF98-C007945BF36E",
+                    "AppIntentDescriptor": {"AppIntentIdentifier": "TAIAddTodo2", "BundleIdentifier": "com.culturedcode.ThingsMac", "Name": "Things", "TeamIdentifier": "JLMPQHK86H"},
+                    "ShowWhenRun": false, "title": "{@pendingTitle}"
+                })
+            }
+        }
+
+        // Create output is intentionally not used as query input. Resolve the
+        // newly created item by its unique pending title so the edit target is
+        // a native Things entity array with only one entity provenance source.
+        rawAction("com.culturedcode.ThingsMac.TAIItemEntity", {
+            "UUID": "B5694172-399E-491D-A448-AAF718C68B1C",
+            "CustomOutputName": "ThingsIndex Fresh Task",
+            "AppIntentDescriptor": {
+                "ActionRequiresAppInstallation": true,
+                "AppIntentIdentifier": "TAIItemEntity",
+                "BundleIdentifier": "com.culturedcode.ThingsMac",
+                "Name": "Things",
+                "TeamIdentifier": "JLMPQHK86H"
+            },
+            "WFContentItemFilter": {
+                "Value": {
+                    "WFActionParameterFilterPrefix": 1,
+                    "WFContentPredicateBoundedDate": false,
+                    "WFActionParameterFilterTemplates": [{
+                        "Operator": 4,
+                        "Property": "type",
+                        "Removable": true,
+                        "Values": {
+                            "Enumeration": {
+                                "Value": {
+                                    "identifier": "todo",
+                                    "title": {"key": "To-Do"},
+                                    "value": "todo"
+                                },
+                                "WFSerializationType": "WFLinkDynamicOptionSubstitutableState"
+                            },
+                            "Unit": 4
+                        }
+                    }, {
+                        "Operator": 4,
+                        "Property": "title",
+                        "Removable": true,
+                        "Values": {"String": "{@pendingTitle}", "Unit": 4}
+                    }]
+                },
+                "WFSerializationType": "WFContentPredicateTableTemplate"
+            },
+            "WFContentItemInputParameter": "Library",
+            "WFContentItemLimitEnabled": true,
+            "WFContentItemLimitNumber": 2
+        })
+        rawAction("is.workflow.actions.setvariable", {
+            "WFInput": {
+                "Value": {
+                    "OutputName": "ThingsIndex Fresh Task",
+                    "OutputUUID": "B5694172-399E-491D-A448-AAF718C68B1C",
+                    "Type": "ActionOutput"
+                },
+                "WFSerializationType": "WFTextTokenAttachment"
+            },
+            "WFVariableName": "tasks",
+            "WFSerializationType": "WFTextTokenAttachment"
+        })
+    }
+
+    @targetCount = count(@tasks)
+    if @targetCount != 1 {
+        output('{"schemaVersion":1,"ok":false,"code":"create_failed"}')
+    }
+    @targetId = ""
+    for targetTask in @tasks {
+        @targetId = "{@targetTask['id']}"
+    }
+    if !@targetId {
+        output('{"schemaVersion":1,"ok":false,"code":"create_failed"}')
+    }
+
+    // Start is a non-resolvable enumeration, so each native value is literal.
+    if @start == "on_date" {
+        rawAction("com.culturedcode.ThingsMac.TAIEditItems", {
+            "UUID": "63CCE73B-AC5D-479E-8704-3C8152BAE005",
+            "AppIntentDescriptor": {"AppIntentIdentifier": "TAIEditItems", "BundleIdentifier": "com.culturedcode.ThingsMac", "Name": "Things", "TeamIdentifier": "JLMPQHK86H"},
+            "ShowWhenRun": false, "detail": "start", "items": "${@tasks}", "startAction": "set",
+            "start": "onDate", "startDate": "{@startDateValue}", "evening": "${@evening}"
+        })
+    }
+    if @start == "anytime" {
+        rawAction("com.culturedcode.ThingsMac.TAIEditItems", {
+            "UUID": "4F26FA4B-E475-41D3-963E-701874248B69",
+            "AppIntentDescriptor": {"AppIntentIdentifier": "TAIEditItems", "BundleIdentifier": "com.culturedcode.ThingsMac", "Name": "Things", "TeamIdentifier": "JLMPQHK86H"},
+            "ShowWhenRun": false, "detail": "start", "items": "${@tasks}", "startAction": "set", "start": "anytime"
+        })
+    }
+    if @start == "someday" {
+        rawAction("com.culturedcode.ThingsMac.TAIEditItems", {
+            "UUID": "FA5C581B-46A0-40F8-A371-988B6FDE2061",
+            "AppIntentDescriptor": {"AppIntentIdentifier": "TAIEditItems", "BundleIdentifier": "com.culturedcode.ThingsMac", "Name": "Things", "TeamIdentifier": "JLMPQHK86H"},
+            "ShowWhenRun": false, "detail": "start", "items": "${@tasks}", "startAction": "set", "start": "someday"
+        })
+    }
+    if @reminderTime {
+        rawAction("com.culturedcode.ThingsMac.TAIEditItems", {
+            "UUID": "D14B4075-177E-45EB-AEA8-543A2EA08EEA",
+            "AppIntentDescriptor": {"AppIntentIdentifier": "TAIEditItems", "BundleIdentifier": "com.culturedcode.ThingsMac", "Name": "Things", "TeamIdentifier": "JLMPQHK86H"},
+            "ShowWhenRun": false, "detail": "reminderTime", "items": "${@tasks}", "reminderTimeAction": "set",
+            "reminderTime": "{@reminderTimeValue}"
+        })
+    }
+    if @deadline {
+        rawAction("com.culturedcode.ThingsMac.TAIEditItems", {
+            "UUID": "EFFEEEB2-2653-4698-AFB8-6D9DDC13BA78",
+            "AppIntentDescriptor": {"AppIntentIdentifier": "TAIEditItems", "BundleIdentifier": "com.culturedcode.ThingsMac", "Name": "Things", "TeamIdentifier": "JLMPQHK86H"},
+            "ShowWhenRun": false, "detail": "deadline", "items": "${@tasks}", "deadlineAction": "set",
+            "deadline": "{@deadlineValue}"
+        })
+    }
+
+    @tagCount = count(@tags)
+    if @tagCount > 0 {
+        rawAction("com.culturedcode.ThingsMac.TAIEditItems", {
+            "UUID": "9A67C4CD-A535-4F3F-88FF-67E8AF0F90C0",
+            "AppIntentDescriptor": {"AppIntentIdentifier": "TAIEditItems", "BundleIdentifier": "com.culturedcode.ThingsMac", "Name": "Things", "TeamIdentifier": "JLMPQHK86H"},
+            "ShowWhenRun": false, "detail": "tags", "items": "${@tasks}", "tagsAction": "set", "tags": "${@tags}"
+        })
+    }
+    if @notes {
+        rawAction("com.culturedcode.ThingsMac.TAIEditItems", {
+            "UUID": "8611D650-24F7-4F75-8C5F-CAA0573543D6",
+            "AppIntentDescriptor": {"AppIntentIdentifier": "TAIEditItems", "BundleIdentifier": "com.culturedcode.ThingsMac", "Name": "Things", "TeamIdentifier": "JLMPQHK86H"},
+            "ShowWhenRun": false, "detail": "notes", "items": "${@tasks}", "notesAction": "set", "notes": "{@notes}"
+        })
+    }
+    if @checklist {
+        rawAction("com.culturedcode.ThingsMac.TAIEditItems", {
+            "UUID": "5B62D3CC-0781-4002-B0FA-E10895EC912C",
+            "AppIntentDescriptor": {"AppIntentIdentifier": "TAIEditItems", "BundleIdentifier": "com.culturedcode.ThingsMac", "Name": "Things", "TeamIdentifier": "JLMPQHK86H"},
+            "ShowWhenRun": false, "detail": "checklist", "items": "${@tasks}", "checklistAction": "set", "checklist": "{@checklist}"
+        })
+    }
+
+    @captureResponse = {"schemaVersion": 1, "ok": true, "id": "{@targetId}"}
+    @captureResponseText = getText(@captureResponse)
+    output(@captureResponseText)
+}
+
+if @operation == "finalise-capture" {
+    @itemId = "{@request['id']}"
+    @finalTitle = "{@request['title']}"
+    if !@itemId {
+        output('{"schemaVersion":1,"ok":false,"code":"invalid_request"}')
+    }
+    if !@finalTitle {
+        output('{"schemaVersion":1,"ok":false,"code":"invalid_request"}')
+    }
+
+    @items: array
+    rawAction("com.culturedcode.ThingsMac.TAIItemEntity", {
+        "UUID": "BDC31C5F-91DA-42EC-B4AF-E4DE10C0BD85",
+        "CustomOutputName": "ThingsIndex Finalise Items",
+        "AppIntentDescriptor": {
+            "ActionRequiresAppInstallation": true,
+            "AppIntentIdentifier": "TAIItemEntity",
+            "BundleIdentifier": "com.culturedcode.ThingsMac",
+            "Name": "Things",
+            "TeamIdentifier": "JLMPQHK86H"
+        },
+        "WFContentItemFilter": {
+            "Value": {
+                "WFActionParameterFilterPrefix": 1,
+                "WFActionParameterFilterTemplates": [{
+                    "Operator": 4,
+                    "Property": "id",
+                    "Removable": true,
+                    "Values": {"String": "{@itemId}", "Unit": 4}
+                }],
+                "WFContentPredicateBoundedDate": false
+            },
+            "WFSerializationType": "WFContentPredicateTableTemplate"
+        },
+        "WFContentItemInputParameter": "Library",
+        "WFContentItemLimitEnabled": true,
+        "WFContentItemLimitNumber": 2
+    })
+    rawAction("is.workflow.actions.setvariable", {
+        "WFInput": {
+            "Value": {
+                "OutputName": "ThingsIndex Finalise Items",
+                "OutputUUID": "BDC31C5F-91DA-42EC-B4AF-E4DE10C0BD85",
+                "Type": "ActionOutput"
+            },
+            "WFSerializationType": "WFTextTokenAttachment"
+        },
+        "WFVariableName": "items",
+        "WFSerializationType": "WFTextTokenAttachment"
+    })
+    @itemCount = count(@items)
+    if @itemCount == 0 {
+        output('{"schemaVersion":1,"ok":false,"code":"finalise_not_found"}')
+    }
+    if @itemCount != 1 {
+        output('{"schemaVersion":1,"ok":false,"code":"finalise_ambiguous"}')
+    }
+
+    rawAction("com.culturedcode.ThingsMac.TAIEditItems", {
+        "UUID": "596D8689-5B48-4C09-8DE8-CC1308F1C826",
+        "AppIntentDescriptor": {
+            "ActionRequiresAppInstallation": true,
+            "AppIntentIdentifier": "TAIEditItems",
+            "BundleIdentifier": "com.culturedcode.ThingsMac",
+            "Name": "Things",
+            "TeamIdentifier": "JLMPQHK86H"
+        },
+        "ShowWhenRun": false,
+        "detail": "title",
+        "items": "${@items}",
+        "titleAction": "set",
+        "title": "{@finalTitle}"
+    })
+    output('{"schemaVersion":1,"ok":true}')
+}
+
+output('{"schemaVersion":1,"ok":false,"code":"invalid_request"}')

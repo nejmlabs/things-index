@@ -1,0 +1,13 @@
+/bin/
+/dist/
+/.tmp-*.json
+/status.md
+/*.db
+/*.db-shm
+/*.db-wal
+/deploy/launchd/*.plist
+/docs/local-deployment.md
+/shortcuts/*.plist
+/shortcuts/*_processed.cherri
+/shortcuts/*_unsigned.shortcut
+.DS_Store

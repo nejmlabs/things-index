@@ -1,0 +1,32 @@
+[Unit]
+Description=ThingsIndex MCP server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=things-index
+Group=things-index
+EnvironmentFile=/etc/things-index/server.env
+ExecStart=/usr/local/bin/things-index-server
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/things-index
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

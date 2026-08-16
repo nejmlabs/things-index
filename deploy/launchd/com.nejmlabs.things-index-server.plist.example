@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.nejmlabs.things-index-server</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/REPLACE_ME/.local/bin/things-index-server</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>THINGS_INDEX_LISTEN_ADDR</key>
+        <string>127.0.0.1:8080</string>
+        <key>THINGS_INDEX_DB_PATH</key>
+        <string>/Users/REPLACE_ME/Library/Application Support/ThingsIndex/queue.db</string>
+        <key>THINGS_INDEX_PUBLIC_TOKEN</key>
+        <string>REPLACE_WITH_PUBLIC_TOKEN</string>
+        <key>THINGS_INDEX_WORKER_TOKEN</key>
+        <string>REPLACE_WITH_WORKER_TOKEN</string>
+        <key>THINGS_INDEX_DASHBOARD_TOKEN</key>
+        <string></string>
+        <key>THINGS_INDEX_SUCCEEDED_RETENTION_DAYS</key>
+        <string>7</string>
+        <key>THINGS_INDEX_FAILED_RETENTION_DAYS</key>
+        <string>30</string>
+    </dict>
+
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/REPLACE_ME/Library/Logs/ThingsIndex/server.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/REPLACE_ME/Library/Logs/ThingsIndex/server-error.log</string>
+</dict>
+</plist>

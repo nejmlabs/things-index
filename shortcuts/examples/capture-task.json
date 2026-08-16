@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "operation": "capture-task",
+  "requestId": "00000000000000000000000000000001",
+  "task": {
+    "title": "ThingsIndex Shortcut test — safe to delete",
+    "notes": "Created by the bundled helper verification example.",
+    "start": "anytime",
+    "startDayOffset": 0,
+    "evening": false,
+    "reminderMinuteOffset": 0,
+    "deadlineDayOffset": 0,
+    "tags": [],
+    "checklist": ""
+  }
+}

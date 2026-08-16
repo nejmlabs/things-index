@@ -1,0 +1,172 @@
+package server
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/nejmlabs/things-index/internal/queue"
+	"github.com/nejmlabs/things-index/internal/worker"
+)
+
+const (
+	testPublicToken = "public-token-00000000000000000000"
+	testWorkerToken = "worker-token-00000000000000000000"
+)
+
+func TestMCPAndWorkerRoundTrip(t *testing.T) {
+	store, err := queue.Open(filepath.Join(t.TempDir(), "queue.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	handler, err := NewHandler(store, Config{
+		PublicToken:    testPublicToken,
+		WorkerToken:    testWorkerToken,
+		WaitForResult:  5 * time.Millisecond,
+		WorkerLongPoll: 5 * time.Millisecond,
+		PollInterval:   time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inMemoryTransport := handlerTransport{handler: handler}
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "things-index-test", Version: "1"}, nil)
+	httpClient := &http.Client{Transport: authTransport{token: testPublicToken, base: inMemoryTransport}}
+	session, err := client.Connect(context.Background(), &mcp.StreamableClientTransport{
+		Endpoint:             "http://things-index.test/mcp",
+		HTTPClient:           httpClient,
+		DisableStandaloneSSE: true,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+
+	captureResult, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "capture_things_task",
+		Arguments: map[string]any{"title": "Buy milk"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	queued := decodeCaptureResult(t, captureResult)
+	if queued.Status != "queued" || !validID(queued.RequestID) {
+		t.Fatalf("unexpected queued result: %+v", queued)
+	}
+
+	workerClient, err := worker.NewClient(worker.ClientConfig{
+		BaseURL: "http://127.0.0.1", Token: testWorkerToken,
+		HTTPClient: &http.Client{Transport: inMemoryTransport},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := workerClient.Lease(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease == nil || lease.ID != queued.RequestID || lease.Task.Title != "Buy milk" {
+		t.Fatalf("unexpected worker lease: %+v", lease)
+	}
+	if err := workerClient.Complete(context.Background(), *lease, worker.Outcome{ThingsID: "things-id-1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	statusResult, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "things_capture_status", Arguments: map[string]any{"request_id": queued.RequestID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	created := decodeCaptureResult(t, statusResult)
+	if created.Status != "created" || created.ThingsID != "things-id-1" {
+		t.Fatalf("unexpected completed result: %+v", created)
+	}
+}
+
+func TestBearerTokensAreSeparated(t *testing.T) {
+	store, err := queue.Open(filepath.Join(t.TempDir(), "queue.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	handler, err := NewHandler(store, Config{PublicToken: testPublicToken, WorkerToken: testWorkerToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "/worker/v1/lease", nil)
+	request.Header.Set("Authorization", "Bearer "+testPublicToken)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("public token reached worker API: status %d", response.Code)
+	}
+
+	request = httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(`{}`))
+	request.Header.Set("Authorization", "Bearer "+testWorkerToken)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("worker token reached MCP API: status %d", response.Code)
+	}
+}
+
+func TestNewHandlerRejectsWeakOrSharedTokens(t *testing.T) {
+	store, err := queue.Open(filepath.Join(t.TempDir(), "queue.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := NewHandler(store, Config{PublicToken: "short", WorkerToken: testWorkerToken}); err == nil {
+		t.Fatal("weak public token was accepted")
+	}
+	if _, err := NewHandler(store, Config{PublicToken: testPublicToken, WorkerToken: testPublicToken}); err == nil {
+		t.Fatal("shared public and worker token was accepted")
+	}
+}
+
+type authTransport struct {
+	token string
+	base  http.RoundTripper
+}
+
+func (transport authTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	copy := request.Clone(request.Context())
+	copy.Header.Set("Authorization", "Bearer "+transport.token)
+	return transport.base.RoundTrip(copy)
+}
+
+type handlerTransport struct {
+	handler http.Handler
+}
+
+func (transport handlerTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	recorder := httptest.NewRecorder()
+	transport.handler.ServeHTTP(recorder, request)
+	response := recorder.Result()
+	response.Request = request
+	return response, nil
+}
+
+func decodeCaptureResult(t *testing.T, result *mcp.CallToolResult) CaptureResult {
+	t.Helper()
+	encoded, err := json.Marshal(result.StructuredContent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded CaptureResult
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	return decoded
+}

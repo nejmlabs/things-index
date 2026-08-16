@@ -1,0 +1,65 @@
+http:
+  middlewares:
+    things-index-worker-internal:
+      ipAllowList:
+        sourceRange:
+          - "192.168.1.0/24"
+          - "100.64.0.0/10"
+    things-index-rate-limit:
+      rateLimit:
+        average: 30
+        burst: 20
+        period: 1m
+    things-index-security-headers:
+      headers:
+        contentTypeNosniff: true
+        frameDeny: true
+        referrerPolicy: "no-referrer"
+
+  routers:
+    things-index-mcp:
+      entryPoints:
+        - https
+      rule: "Host(`things-index.example.com`) && Path(`/mcp`)"
+      middlewares:
+        - things-index-rate-limit
+        - things-index-security-headers
+      service: things-index
+      tls: {}
+
+    things-index-worker:
+      entryPoints:
+        - https
+      rule: "Host(`things-index-worker.internal.example.com`) && PathPrefix(`/worker/`)"
+      middlewares:
+        - things-index-worker-internal
+        - things-index-security-headers
+      service: things-index
+      tls: {}
+
+    things-index-health:
+      entryPoints:
+        - https
+      rule: "Host(`things-index-worker.internal.example.com`) && Path(`/healthz`)"
+      middlewares:
+        - things-index-worker-internal
+        - things-index-security-headers
+      service: things-index
+      tls: {}
+
+    things-index-dashboard:
+      entryPoints:
+        - https
+      rule: "Host(`things-index-dashboard.internal.example.com`) && Path(`/dashboard`)"
+      middlewares:
+        - things-index-worker-internal
+        - things-index-security-headers
+      service: things-index
+      tls: {}
+
+  services:
+    things-index:
+      loadBalancer:
+        servers:
+          - url: "http://192.168.1.50:8080"
+        passHostHeader: true
