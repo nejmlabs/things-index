@@ -48,19 +48,159 @@ type Schedule struct {
 	ReminderAt string    `json:"reminder_at,omitempty" jsonschema:"Reminder timestamp with timezone in RFC3339 form."`
 }
 
+type HeadingRequest struct {
+	Project  string `json:"project" jsonschema:"Required exact name of the project."`
+	Heading  string `json:"heading" jsonschema:"Required heading title."`
+	NewTitle string `json:"new_title,omitempty" jsonschema:"Optional new heading title (when renaming)."`
+}
+
+func (h HeadingRequest) Validate() error {
+	if strings.TrimSpace(h.Project) == "" {
+		return errors.New("project name is required")
+	}
+	if strings.TrimSpace(h.Heading) == "" {
+		return errors.New("heading title is required")
+	}
+	return nil
+}
+
+type ArchiveTaskRequest struct {
+	ID      string `json:"id,omitempty" jsonschema:"Optional Things task UUID."`
+	Title   string `json:"title,omitempty" jsonschema:"Optional task title to look up if ID is omitted."`
+	Project string `json:"project,omitempty" jsonschema:"Optional project name to disambiguate the task title."`
+	Action  string `json:"action,omitempty" jsonschema:"Archive action: complete (default), cancel, or trash."`
+}
+
+func (r ArchiveTaskRequest) Validate() error {
+	if strings.TrimSpace(r.ID) == "" && strings.TrimSpace(r.Title) == "" {
+		return errors.New("either task id or title is required")
+	}
+	switch r.Action {
+	case "", "complete", "cancel", "trash":
+	default:
+		return errors.New("action must be 'complete', 'cancel', or 'trash'")
+	}
+	return nil
+}
+
+type ArchiveProjectRequest struct {
+	ID     string `json:"id,omitempty" jsonschema:"Optional Things project UUID."`
+	Name   string `json:"name,omitempty" jsonschema:"Optional project name to look up if ID is omitted."`
+	Action string `json:"action,omitempty" jsonschema:"Archive action: complete (default) or cancel."`
+}
+
+func (r ArchiveProjectRequest) Validate() error {
+	if strings.TrimSpace(r.ID) == "" && strings.TrimSpace(r.Name) == "" {
+		return errors.New("either project id or name is required")
+	}
+	switch r.Action {
+	case "", "complete", "cancel":
+	default:
+		return errors.New("action must be 'complete' or 'cancel'")
+	}
+	return nil
+}
+
+type QueryTasksRequest struct {
+	Scope            string `json:"scope,omitempty" jsonschema:"Scope: 'today', 'inbox', 'anytime', 'someday', 'projects', or 'all' (default: 'today')."`
+	Query            string `json:"query,omitempty" jsonschema:"Optional search text to filter by title and notes."`
+	Project          string `json:"project,omitempty" jsonschema:"Optional project name filter."`
+	Area             string `json:"area,omitempty" jsonschema:"Optional area name filter."`
+	Tag              string `json:"tag,omitempty" jsonschema:"Optional tag name filter."`
+	IncludeCompleted bool   `json:"include_completed,omitempty" jsonschema:"Include completed tasks (default: false)."`
+	Limit            int    `json:"limit,omitempty" jsonschema:"Max results to return (default: 50)."`
+}
+
+func (q QueryTasksRequest) Validate() error {
+	return nil
+}
+
+type CreateProjectRequest struct {
+	Title    string   `json:"title" jsonschema:"Required title of the new project."`
+	Area     string   `json:"area,omitempty" jsonschema:"Optional name of the area to place the project in."`
+	Notes    string   `json:"notes,omitempty" jsonschema:"Optional project notes."`
+	Deadline string   `json:"deadline,omitempty" jsonschema:"Optional deadline in YYYY-MM-DD form."`
+	When     string   `json:"when,omitempty" jsonschema:"Optional start time: today, someday, or YYYY-MM-DD."`
+	Tags     []string `json:"tags,omitempty" jsonschema:"Optional tag names."`
+}
+
+func (c CreateProjectRequest) Validate() error {
+	if strings.TrimSpace(c.Title) == "" {
+		return errors.New("project title is required")
+	}
+	return nil
+}
+
+type UpdateTaskRequest struct {
+	ID           string   `json:"id,omitempty" jsonschema:"Things task UUID (optional if title is provided)."`
+	Title        string   `json:"title,omitempty" jsonschema:"Task title to find if ID is omitted."`
+	Project      string   `json:"project,omitempty" jsonschema:"Optional project name to disambiguate the task title."`
+	NewTitle     string   `json:"new_title,omitempty" jsonschema:"Optional new title for the task."`
+	Notes        string   `json:"notes,omitempty" jsonschema:"Replace existing notes."`
+	AppendNotes  string   `json:"append_notes,omitempty" jsonschema:"Append to existing notes."`
+	Deadline     string   `json:"deadline,omitempty" jsonschema:"New deadline in YYYY-MM-DD form."`
+	When         string   `json:"when,omitempty" jsonschema:"Reschedule task: today, evening, someday, anytime, or YYYY-MM-DD."`
+	AddTags      []string `json:"add_tags,omitempty" jsonschema:"Tags to add."`
+	AddChecklist []string `json:"add_checklist,omitempty" jsonschema:"Checklist lines to append."`
+}
+
+func (u UpdateTaskRequest) Validate() error {
+	if strings.TrimSpace(u.ID) == "" && strings.TrimSpace(u.Title) == "" {
+		return errors.New("either task id or title is required")
+	}
+	return nil
+}
+
 type Request struct {
-	Title       string       `json:"title" jsonschema:"Required Things task title."`
-	Notes       string       `json:"notes,omitempty" jsonschema:"Optional task notes."`
-	Destination *Destination `json:"destination,omitempty" jsonschema:"Optional exact destination; omitted tasks go to Inbox."`
-	Schedule    *Schedule    `json:"schedule,omitempty" jsonschema:"Optional Things start date and reminder."`
-	Deadline    string       `json:"deadline,omitempty" jsonschema:"Optional deadline in YYYY-MM-DD form."`
-	Tags        []string     `json:"tags,omitempty" jsonschema:"Existing Things tag names to apply."`
-	Checklist   []string     `json:"checklist,omitempty" jsonschema:"Checklist lines to create."`
+	Title                 string                 `json:"title,omitempty" jsonschema:"Things task title."`
+	Notes                 string                 `json:"notes,omitempty" jsonschema:"Optional task notes."`
+	Destination           *Destination           `json:"destination,omitempty" jsonschema:"Optional exact destination; omitted tasks go to Inbox."`
+	Schedule              *Schedule              `json:"schedule,omitempty" jsonschema:"Optional Things start date and reminder."`
+	Deadline              string                 `json:"deadline,omitempty" jsonschema:"Optional deadline in YYYY-MM-DD form."`
+	Tags                  []string               `json:"tags,omitempty" jsonschema:"Existing Things tag names to apply."`
+	Checklist             []string               `json:"checklist,omitempty" jsonschema:"Checklist lines to create."`
+	IdempotencyKey        string                 `json:"idempotency_key,omitempty" jsonschema:"Optional client-provided idempotency key for safe retries."`
+	HeadingOperation      string                 `json:"heading_operation,omitempty"`
+	HeadingRequest        *HeadingRequest        `json:"heading_request,omitempty"`
+	ArchiveTaskRequest    *ArchiveTaskRequest    `json:"archive_task_request,omitempty"`
+	ArchiveProjectRequest *ArchiveProjectRequest `json:"archive_project_request,omitempty"`
+	QueryTasksRequest     *QueryTasksRequest     `json:"query_tasks_request,omitempty"`
+	CreateProjectRequest  *CreateProjectRequest  `json:"create_project_request,omitempty"`
+	UpdateTaskRequest     *UpdateTaskRequest     `json:"update_task_request,omitempty"`
 }
 
 func (r Request) Validate() error {
+	if r.QueryTasksRequest != nil {
+		return r.QueryTasksRequest.Validate()
+	}
+	if r.CreateProjectRequest != nil {
+		return r.CreateProjectRequest.Validate()
+	}
+	if r.UpdateTaskRequest != nil {
+		return r.UpdateTaskRequest.Validate()
+	}
+	if r.ArchiveTaskRequest != nil {
+		return r.ArchiveTaskRequest.Validate()
+	}
+	if r.ArchiveProjectRequest != nil {
+		return r.ArchiveProjectRequest.Validate()
+	}
+	if r.HeadingOperation != "" {
+		if r.HeadingRequest == nil {
+			return errors.New("heading_request is required when heading_operation is set")
+		}
+		return r.HeadingRequest.Validate()
+	}
 	if strings.TrimSpace(r.Title) == "" {
 		return errors.New("title is required")
+	}
+	if r.IdempotencyKey != "" {
+		if !utf8.ValidString(r.IdempotencyKey) || len(r.IdempotencyKey) > 128 {
+			return errors.New("idempotency_key must be valid UTF-8 and at most 128 bytes")
+		}
+		if strings.ContainsAny(r.IdempotencyKey, "\r\n") {
+			return errors.New("idempotency_key must be a single line")
+		}
 	}
 	if !utf8.ValidString(r.Title) || len(r.Title) > MaxTitleBytes {
 		return fmt.Errorf("title must be valid UTF-8 and at most %d bytes", MaxTitleBytes)

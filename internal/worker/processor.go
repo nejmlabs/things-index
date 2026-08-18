@@ -30,7 +30,7 @@ func IsRetryable(err error) bool {
 	}
 	var operationError *helper.OperationError
 	if errors.As(err, &operationError) {
-		return operationError.Code == "create_failed"
+		return operationError.Code == "create_failed" || operationError.Code == "finalise_not_found"
 	}
 	return true
 }
@@ -39,6 +39,14 @@ type Helper interface {
 	Capture(ctx context.Context, requestID string, task capture.Request) (helper.Response, error)
 	FindCapture(ctx context.Context, requestID string) ([]string, error)
 	FinaliseCapture(ctx context.Context, id, title string) error
+	CreateHeading(ctx context.Context, project, headingTitle string) (helper.Response, error)
+	ArchiveHeading(ctx context.Context, project, headingTitle string) (helper.Response, error)
+	RenameHeading(ctx context.Context, project, oldHeadingTitle, newHeadingTitle string) (helper.Response, error)
+	ArchiveTask(ctx context.Context, id, title, project, action string) (helper.Response, error)
+	ArchiveProject(ctx context.Context, id, name, action string) (helper.Response, error)
+	QueryTasks(ctx context.Context, req capture.QueryTasksRequest) (helper.Response, error)
+	CreateProject(ctx context.Context, req capture.CreateProjectRequest) (helper.Response, error)
+	UpdateTask(ctx context.Context, req capture.UpdateTaskRequest) (helper.Response, error)
 }
 
 type Journal interface {
@@ -75,6 +83,70 @@ func (p *Processor) Process(ctx context.Context, job Job) (Outcome, error) {
 	if err := job.Task.Validate(); err != nil {
 		return Outcome{}, permanentError(fmt.Errorf("invalid capture job: %w", err))
 	}
+
+	if job.Task.QueryTasksRequest != nil {
+		resp, err := p.Helper.QueryTasks(ctx, *job.Task.QueryTasksRequest)
+		if err != nil {
+			return Outcome{}, err
+		}
+		return Outcome{ThingsID: resp.ID}, nil
+	}
+
+	if job.Task.CreateProjectRequest != nil {
+		resp, err := p.Helper.CreateProject(ctx, *job.Task.CreateProjectRequest)
+		if err != nil {
+			return Outcome{}, err
+		}
+		return Outcome{ThingsID: resp.ID}, nil
+	}
+
+	if job.Task.UpdateTaskRequest != nil {
+		resp, err := p.Helper.UpdateTask(ctx, *job.Task.UpdateTaskRequest)
+		if err != nil {
+			return Outcome{}, err
+		}
+		return Outcome{ThingsID: resp.ID}, nil
+	}
+
+	if job.Task.ArchiveTaskRequest != nil {
+		resp, err := p.Helper.ArchiveTask(ctx, job.Task.ArchiveTaskRequest.ID, job.Task.ArchiveTaskRequest.Title, job.Task.ArchiveTaskRequest.Project, job.Task.ArchiveTaskRequest.Action)
+		if err != nil {
+			return Outcome{}, err
+		}
+		return Outcome{ThingsID: resp.ID}, nil
+	}
+
+	if job.Task.ArchiveProjectRequest != nil {
+		resp, err := p.Helper.ArchiveProject(ctx, job.Task.ArchiveProjectRequest.ID, job.Task.ArchiveProjectRequest.Name, job.Task.ArchiveProjectRequest.Action)
+		if err != nil {
+			return Outcome{}, err
+		}
+		return Outcome{ThingsID: resp.ID}, nil
+	}
+
+	if job.Task.HeadingOperation != "" && job.Task.HeadingRequest != nil {
+		switch job.Task.HeadingOperation {
+		case "create":
+			resp, err := p.Helper.CreateHeading(ctx, job.Task.HeadingRequest.Project, job.Task.HeadingRequest.Heading)
+			if err != nil {
+				return Outcome{}, err
+			}
+			return Outcome{ThingsID: resp.ID}, nil
+		case "archive":
+			resp, err := p.Helper.ArchiveHeading(ctx, job.Task.HeadingRequest.Project, job.Task.HeadingRequest.Heading)
+			if err != nil {
+				return Outcome{}, err
+			}
+			return Outcome{ThingsID: resp.ID}, nil
+		case "rename":
+			resp, err := p.Helper.RenameHeading(ctx, job.Task.HeadingRequest.Project, job.Task.HeadingRequest.Heading, job.Task.HeadingRequest.NewTitle)
+			if err != nil {
+				return Outcome{}, err
+			}
+			return Outcome{ThingsID: resp.ID}, nil
+		}
+	}
+
 	payloadHash, err := job.Task.Hash()
 	if err != nil {
 		return Outcome{}, fmt.Errorf("hash capture job: %w", err)
@@ -167,6 +239,18 @@ func (p *Processor) Process(ctx context.Context, job Job) (Outcome, error) {
 
 func (p *Processor) MarkReported(ctx context.Context, jobID string) error {
 	return p.Journal.MarkReported(ctx, jobID)
+}
+
+// UsesJournal reports whether processing this task records idempotency state
+// in the journal. Query, update, archive, and heading operations execute
+// directly and leave no journal entry to mark reported.
+func UsesJournal(task capture.Request) bool {
+	return task.QueryTasksRequest == nil &&
+		task.CreateProjectRequest == nil &&
+		task.UpdateTaskRequest == nil &&
+		task.ArchiveTaskRequest == nil &&
+		task.ArchiveProjectRequest == nil &&
+		task.HeadingOperation == ""
 }
 
 func isDestinationError(err error) bool {

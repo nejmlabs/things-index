@@ -1,0 +1,931 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/nejmlabs/things-index/internal/capture"
+	"github.com/nejmlabs/things-index/internal/helper"
+	"github.com/nejmlabs/things-index/internal/journal"
+	"github.com/nejmlabs/things-index/internal/queue"
+	"github.com/nejmlabs/things-index/internal/server"
+	"github.com/nejmlabs/things-index/internal/serverapp"
+	"github.com/nejmlabs/things-index/internal/worker"
+)
+
+const version = "0.2.0"
+
+func main() {
+	if len(os.Args) < 2 {
+		if err := runDefault(); err != nil && !errors.Is(err, context.Canceled) {
+			log.Fatal(err)
+		}
+		return
+	}
+
+	command := os.Args[1]
+	var err error
+	switch command {
+	case "start", "run", "local":
+		err = runStandaloneHTTP()
+	case "stdio":
+		err = runStdio()
+	case "server":
+		err = runDedicatedServer()
+	case "worker":
+		if len(os.Args) >= 3 && (os.Args[2] == "--setup" || os.Args[2] == "setup" || os.Args[2] == "-s") {
+			err = runWorkerSetup()
+		} else {
+			err = runDedicatedWorker()
+		}
+	case "config":
+		err = printConfig()
+	case "uninstall", "teardown":
+		err = runUninstall()
+	case "--version", "-v", "version":
+		fmt.Printf("things-index v%s (%s/%s)\n", version, runtime.GOOS, runtime.GOARCH)
+	case "--help", "-h", "help":
+		printHelp()
+	default:
+		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", command)
+		printHelp()
+		os.Exit(1)
+	}
+
+	if err != nil && !errors.Is(err, context.Canceled) {
+		log.Fatal(err)
+	}
+}
+
+func runDefault() error {
+	if runtime.GOOS == "darwin" {
+		return runStandaloneHTTP()
+	}
+	return runDedicatedServer()
+}
+
+func runStandaloneHTTP() error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	listenAddr := os.Getenv("THINGS_INDEX_LISTEN_ADDR")
+	if listenAddr == "" {
+		listenAddr = "127.0.0.1:8080"
+	}
+	if err := serverapp.ValidateListenAddress(listenAddr); err != nil {
+		return err
+	}
+
+	stateDir := os.Getenv("THINGS_INDEX_STATE_DIR")
+	if stateDir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return err
+		}
+		stateDir = filepath.Join(home, "Library", "Application Support", "ThingsIndex")
+	}
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return fmt.Errorf("create state directory: %w", err)
+	}
+
+	dbPath := os.Getenv("THINGS_INDEX_DB_PATH")
+	if dbPath == "" {
+		dbPath = filepath.Join(stateDir, "local-queue.sqlite")
+	}
+
+	publicToken := os.Getenv("THINGS_INDEX_PUBLIC_TOKEN")
+	if publicToken == "" {
+		var err error
+		publicToken, err = generateToken()
+		if err != nil {
+			return fmt.Errorf("generate public token: %w", err)
+		}
+	}
+
+	workerToken, err := generateToken()
+	if err != nil {
+		return fmt.Errorf("generate worker token: %w", err)
+	}
+
+	queueStore, err := queue.Open(dbPath)
+	if err != nil {
+		return fmt.Errorf("open queue: %w", err)
+	}
+	defer queueStore.Close()
+
+	srvHandler, err := server.NewHandler(queueStore, server.Config{
+		PublicToken: publicToken,
+		WorkerToken: workerToken,
+	})
+	if err != nil {
+		return fmt.Errorf("create server: %w", err)
+	}
+
+	httpServer := &http.Server{
+		Addr:              listenAddr,
+		Handler:           srvHandler,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       35 * time.Second,
+		WriteTimeout:      35 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	serverURL := "http://" + displayHost(listenAddr)
+
+	captureAdapter := helper.NewClient(os.Getenv("THINGS_INDEX_THINGS_AUTH_TOKEN"))
+	if thingsDB := os.Getenv("THINGS_INDEX_THINGS_DB_PATH"); thingsDB != "" {
+		captureAdapter.DBPath = thingsDB
+	}
+	if err := captureAdapter.Ping(ctx); err != nil {
+		log.Printf("⚠️  Warning: Could not connect to Things 3 database: %v", err)
+	}
+
+	journalPath := filepath.Join(stateDir, "journal.sqlite")
+	journalStore, err := journal.Open(journalPath)
+	if err != nil {
+		return fmt.Errorf("open journal: %w", err)
+	}
+	defer journalStore.Close()
+
+	processor := &worker.Processor{Helper: captureAdapter, Journal: journalStore}
+
+	// Start the embedded worker loop in the background. It shares the process
+	// with the queue, so it leases directly from the store instead of going
+	// through the worker HTTP API.
+	go func() {
+		const maxAttempts = 5
+		const leaseDuration = 90 * time.Second
+		for ctx.Err() == nil {
+			job, found := leaseNextJob(ctx, queueStore, maxAttempts, leaseDuration)
+			if !found {
+				select {
+				case <-time.After(500 * time.Millisecond):
+				case <-ctx.Done():
+					return
+				}
+				continue
+			}
+			outcome, processErr := processor.Process(ctx, worker.Job{ID: job.ID, Task: job.Task})
+			if processErr != nil {
+				_ = queueStore.Fail(ctx, job.ID, job.LeaseToken, processErr.Error(), worker.IsRetryable(processErr))
+			} else {
+				_ = queueStore.Complete(ctx, job.ID, job.LeaseToken, outcome.ThingsID, outcome.Warnings)
+				if worker.UsesJournal(job.Task) {
+					_ = journalStore.MarkReported(ctx, job.ID)
+				}
+			}
+		}
+	}()
+
+	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	fmt.Println("  🚀 ThingsIndex Standalone Mode (All-in-One Local Mac)")
+	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	fmt.Printf("  • Server Endpoint: %s/mcp\n", serverURL)
+	fmt.Printf("  • Bearer Token:    %s\n", publicToken)
+	fmt.Println("─────────────────────────────────────────────────────────────────")
+	fmt.Println("  Paste into Claude Desktop / Pebble Index config:")
+	fmt.Println()
+	fmt.Printf(`  {
+    "mcpServers": {
+      "things": {
+        "url": "%s/mcp",
+        "headers": {
+          "Authorization": "Bearer %s"
+        }
+      }
+    }
+  }`, serverURL, publicToken)
+	fmt.Println()
+	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	fmt.Printf("ThingsIndex listening on %s... (Press Ctrl+C to stop)\n", listenAddr)
+
+	listener, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
+
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = httpServer.Shutdown(shutdownCtx)
+	}()
+
+	if err := httpServer.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return nil
+}
+
+func runStdio() error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	captureAdapter := helper.NewClient(os.Getenv("THINGS_INDEX_THINGS_AUTH_TOKEN"))
+	if thingsDB := os.Getenv("THINGS_INDEX_THINGS_DB_PATH"); thingsDB != "" {
+		captureAdapter.DBPath = thingsDB
+	}
+
+	mcpServer := mcp.NewServer(&mcp.Implementation{
+		Name:    "things-index",
+		Version: version,
+	}, &mcp.ServerOptions{
+		Instructions: "Capture tasks directly in Things 3 on this Mac.",
+	})
+
+	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name:        "capture_things_task",
+		Description: "Create one task in Things 3 on this Mac with zero prompts and zero window focus steal.",
+	}, func(callCtx context.Context, _ *mcp.CallToolRequest, task capture.Request) (*mcp.CallToolResult, struct {
+		RequestID string `json:"request_id"`
+		Status    string `json:"status"`
+		ThingsID  string `json:"things_id,omitempty"`
+	}, error) {
+		if err := task.Validate(); err != nil {
+			return nil, struct {
+				RequestID string `json:"request_id"`
+				Status    string `json:"status"`
+				ThingsID  string `json:"things_id,omitempty"`
+			}{}, fmt.Errorf("invalid Things task: %w", err)
+		}
+
+		reqID := randomHex(16)
+		resp, err := captureAdapter.Capture(callCtx, reqID, task)
+		if err != nil {
+			return nil, struct {
+				RequestID string `json:"request_id"`
+				Status    string `json:"status"`
+				ThingsID  string `json:"things_id,omitempty"`
+			}{}, fmt.Errorf("capture task in Things 3: %w", err)
+		}
+
+		return nil, struct {
+			RequestID string `json:"request_id"`
+			Status    string `json:"status"`
+			ThingsID  string `json:"things_id,omitempty"`
+		}{
+			RequestID: reqID,
+			Status:    "created",
+			ThingsID:  resp.ID,
+		}, nil
+	})
+
+	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name:        "create_things_heading",
+		Description: "Create a new section heading inside a Things 3 project.",
+	}, func(callCtx context.Context, _ *mcp.CallToolRequest, input capture.HeadingRequest) (*mcp.CallToolResult, struct {
+		Status   string `json:"status"`
+		ThingsID string `json:"things_id,omitempty"`
+	}, error) {
+		if err := input.Validate(); err != nil {
+			return nil, struct {
+				Status   string `json:"status"`
+				ThingsID string `json:"things_id,omitempty"`
+			}{}, fmt.Errorf("invalid heading request: %w", err)
+		}
+		resp, err := captureAdapter.CreateHeading(callCtx, input.Project, input.Heading)
+		if err != nil {
+			return nil, struct {
+				Status   string `json:"status"`
+				ThingsID string `json:"things_id,omitempty"`
+			}{}, fmt.Errorf("create heading: %w", err)
+		}
+		return nil, struct {
+			Status   string `json:"status"`
+			ThingsID string `json:"things_id,omitempty"`
+		}{
+			Status:   "created",
+			ThingsID: resp.ID,
+		}, nil
+	})
+
+	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name:        "archive_things_heading",
+		Description: "Archive/hide a section heading from an active Things 3 project.",
+	}, func(callCtx context.Context, _ *mcp.CallToolRequest, input capture.HeadingRequest) (*mcp.CallToolResult, struct {
+		Status   string `json:"status"`
+		ThingsID string `json:"things_id,omitempty"`
+	}, error) {
+		if err := input.Validate(); err != nil {
+			return nil, struct {
+				Status   string `json:"status"`
+				ThingsID string `json:"things_id,omitempty"`
+			}{}, fmt.Errorf("invalid heading request: %w", err)
+		}
+		resp, err := captureAdapter.ArchiveHeading(callCtx, input.Project, input.Heading)
+		if err != nil {
+			return nil, struct {
+				Status   string `json:"status"`
+				ThingsID string `json:"things_id,omitempty"`
+			}{}, fmt.Errorf("archive heading: %w", err)
+		}
+		return nil, struct {
+			Status   string `json:"status"`
+			ThingsID string `json:"things_id,omitempty"`
+		}{
+			Status:   "archived",
+			ThingsID: resp.ID,
+		}, nil
+	})
+
+	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name:        "rename_things_heading",
+		Description: "Rename an existing section heading inside a Things 3 project.",
+	}, func(callCtx context.Context, _ *mcp.CallToolRequest, input capture.HeadingRequest) (*mcp.CallToolResult, struct {
+		Status   string `json:"status"`
+		ThingsID string `json:"things_id,omitempty"`
+	}, error) {
+		if err := input.Validate(); err != nil {
+			return nil, struct {
+				Status   string `json:"status"`
+				ThingsID string `json:"things_id,omitempty"`
+			}{}, fmt.Errorf("invalid heading request: %w", err)
+		}
+		if strings.TrimSpace(input.NewTitle) == "" {
+			return nil, struct {
+				Status   string `json:"status"`
+				ThingsID string `json:"things_id,omitempty"`
+			}{}, errors.New("new_title is required when renaming a heading")
+		}
+		resp, err := captureAdapter.RenameHeading(callCtx, input.Project, input.Heading, input.NewTitle)
+		if err != nil {
+			return nil, struct {
+				Status   string `json:"status"`
+				ThingsID string `json:"things_id,omitempty"`
+			}{}, fmt.Errorf("rename heading: %w", err)
+		}
+		return nil, struct {
+			Status   string `json:"status"`
+			ThingsID string `json:"things_id,omitempty"`
+		}{
+			Status:   "renamed",
+			ThingsID: resp.ID,
+		}, nil
+	})
+
+	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name:        "archive_things_task",
+		Description: "Archive a task in Things 3 (mark completed, canceled, or move to trash).",
+	}, func(callCtx context.Context, _ *mcp.CallToolRequest, input capture.ArchiveTaskRequest) (*mcp.CallToolResult, struct {
+		Status   string `json:"status"`
+		ThingsID string `json:"things_id,omitempty"`
+	}, error) {
+		if err := input.Validate(); err != nil {
+			return nil, struct {
+				Status   string `json:"status"`
+				ThingsID string `json:"things_id,omitempty"`
+			}{}, fmt.Errorf("invalid archive task request: %w", err)
+		}
+		resp, err := captureAdapter.ArchiveTask(callCtx, input.ID, input.Title, input.Project, input.Action)
+		if err != nil {
+			return nil, struct {
+				Status   string `json:"status"`
+				ThingsID string `json:"things_id,omitempty"`
+			}{}, fmt.Errorf("archive task: %w", err)
+		}
+		return nil, struct {
+			Status   string `json:"status"`
+			ThingsID string `json:"things_id,omitempty"`
+		}{
+			Status:   "archived",
+			ThingsID: resp.ID,
+		}, nil
+	})
+
+	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name:        "archive_things_project",
+		Description: "Archive an entire project in Things 3 (mark completed or canceled).",
+	}, func(callCtx context.Context, _ *mcp.CallToolRequest, input capture.ArchiveProjectRequest) (*mcp.CallToolResult, struct {
+		Status   string `json:"status"`
+		ThingsID string `json:"things_id,omitempty"`
+	}, error) {
+		if err := input.Validate(); err != nil {
+			return nil, struct {
+				Status   string `json:"status"`
+				ThingsID string `json:"things_id,omitempty"`
+			}{}, fmt.Errorf("invalid archive project request: %w", err)
+		}
+		resp, err := captureAdapter.ArchiveProject(callCtx, input.ID, input.Name, input.Action)
+		if err != nil {
+			return nil, struct {
+				Status   string `json:"status"`
+				ThingsID string `json:"things_id,omitempty"`
+			}{}, fmt.Errorf("archive project: %w", err)
+		}
+		return nil, struct {
+			Status   string `json:"status"`
+			ThingsID string `json:"things_id,omitempty"`
+		}{
+			Status:   "archived",
+			ThingsID: resp.ID,
+		}, nil
+	})
+
+	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name:        "get_things_today",
+		Description: "Get all tasks scheduled for Today in Things 3.",
+	}, func(callCtx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
+		resp, err := captureAdapter.QueryTasks(callCtx, capture.QueryTasksRequest{Scope: "today"})
+		if err != nil {
+			return nil, nil, fmt.Errorf("get today: %w", err)
+		}
+		var items any
+		_ = json.Unmarshal([]byte(resp.ID), &items)
+		return nil, items, nil
+	})
+
+	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name:        "get_things_inbox",
+		Description: "Get all unorganized tasks in Things 3 Inbox.",
+	}, func(callCtx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
+		resp, err := captureAdapter.QueryTasks(callCtx, capture.QueryTasksRequest{Scope: "inbox"})
+		if err != nil {
+			return nil, nil, fmt.Errorf("get inbox: %w", err)
+		}
+		var items any
+		_ = json.Unmarshal([]byte(resp.ID), &items)
+		return nil, items, nil
+	})
+
+	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name:        "list_things_projects",
+		Description: "List all active projects and their areas in Things 3.",
+	}, func(callCtx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
+		resp, err := captureAdapter.QueryTasks(callCtx, capture.QueryTasksRequest{Scope: "projects"})
+		if err != nil {
+			return nil, nil, fmt.Errorf("list projects: %w", err)
+		}
+		var items any
+		_ = json.Unmarshal([]byte(resp.ID), &items)
+		return nil, items, nil
+	})
+
+	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name:        "search_things_tasks",
+		Description: "Search tasks in Things 3 across any scope (today, inbox, anytime, someday, all) by title, project, area, or tag.",
+	}, func(callCtx context.Context, _ *mcp.CallToolRequest, input capture.QueryTasksRequest) (*mcp.CallToolResult, any, error) {
+		resp, err := captureAdapter.QueryTasks(callCtx, input)
+		if err != nil {
+			return nil, nil, fmt.Errorf("search tasks: %w", err)
+		}
+		var items any
+		_ = json.Unmarshal([]byte(resp.ID), &items)
+		return nil, items, nil
+	})
+
+	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name:        "create_things_project",
+		Description: "Create a new project in Things 3.",
+	}, func(callCtx context.Context, _ *mcp.CallToolRequest, input capture.CreateProjectRequest) (*mcp.CallToolResult, struct {
+		Status   string `json:"status"`
+		ThingsID string `json:"things_id,omitempty"`
+	}, error) {
+		if err := input.Validate(); err != nil {
+			return nil, struct {
+				Status   string `json:"status"`
+				ThingsID string `json:"things_id,omitempty"`
+			}{}, fmt.Errorf("invalid create project request: %w", err)
+		}
+		resp, err := captureAdapter.CreateProject(callCtx, input)
+		if err != nil {
+			return nil, struct {
+				Status   string `json:"status"`
+				ThingsID string `json:"things_id,omitempty"`
+			}{}, fmt.Errorf("create project: %w", err)
+		}
+		return nil, struct {
+			Status   string `json:"status"`
+			ThingsID string `json:"things_id,omitempty"`
+		}{
+			Status:   "created",
+			ThingsID: resp.ID,
+		}, nil
+	})
+
+	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name:        "update_things_task",
+		Description: "Update, reschedule, or add notes/checklists to an existing task in Things 3.",
+	}, func(callCtx context.Context, _ *mcp.CallToolRequest, input capture.UpdateTaskRequest) (*mcp.CallToolResult, struct {
+		Status   string `json:"status"`
+		ThingsID string `json:"things_id,omitempty"`
+	}, error) {
+		if err := input.Validate(); err != nil {
+			return nil, struct {
+				Status   string `json:"status"`
+				ThingsID string `json:"things_id,omitempty"`
+			}{}, fmt.Errorf("invalid update task request: %w", err)
+		}
+		resp, err := captureAdapter.UpdateTask(callCtx, input)
+		if err != nil {
+			return nil, struct {
+				Status   string `json:"status"`
+				ThingsID string `json:"things_id,omitempty"`
+			}{}, fmt.Errorf("update task: %w", err)
+		}
+		return nil, struct {
+			Status   string `json:"status"`
+			ThingsID string `json:"things_id,omitempty"`
+		}{
+			Status:   "updated",
+			ThingsID: resp.ID,
+		}, nil
+	})
+
+	return mcpServer.Run(ctx, &mcp.StdioTransport{})
+}
+
+func runDedicatedServer() error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return serverapp.Run(ctx)
+}
+
+func runDedicatedWorker() error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	serverURL := os.Getenv("THINGS_INDEX_SERVER_URL")
+	workerToken := os.Getenv("THINGS_INDEX_WORKER_TOKEN")
+	if serverURL == "" || workerToken == "" {
+		return errors.New("THINGS_INDEX_SERVER_URL and THINGS_INDEX_WORKER_TOKEN are required. Run 'things-index worker --setup' for interactive setup.")
+	}
+
+	stateDir := os.Getenv("THINGS_INDEX_STATE_DIR")
+	if stateDir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return err
+		}
+		stateDir = filepath.Join(home, "Library", "Application Support", "ThingsIndex")
+	}
+	_ = os.MkdirAll(stateDir, 0o700)
+
+	journalPath := os.Getenv("THINGS_INDEX_JOURNAL_PATH")
+	if journalPath == "" {
+		journalPath = filepath.Join(stateDir, "journal.sqlite")
+	}
+
+	journalStore, err := journal.Open(journalPath)
+	if err != nil {
+		return fmt.Errorf("open journal: %w", err)
+	}
+	defer journalStore.Close()
+
+	captureAdapter := helper.NewClient(os.Getenv("THINGS_INDEX_THINGS_AUTH_TOKEN"))
+	if thingsDB := os.Getenv("THINGS_INDEX_THINGS_DB_PATH"); thingsDB != "" {
+		captureAdapter.DBPath = thingsDB
+	}
+	if err := captureAdapter.Ping(ctx); err != nil {
+		return fmt.Errorf("connect to Things 3 database: %w", err)
+	}
+
+	serverClient, err := worker.NewClient(worker.ClientConfig{
+		BaseURL: serverURL,
+		Token:   workerToken,
+	})
+	if err != nil {
+		return fmt.Errorf("create server client: %w", err)
+	}
+
+	retentionDays := 14
+	if daysStr := os.Getenv("THINGS_INDEX_JOURNAL_RETENTION_DAYS"); daysStr != "" {
+		if d, err := strconv.Atoi(daysStr); err == nil && d > 0 {
+			retentionDays = d
+		}
+	}
+	cutoffDuration := time.Duration(retentionDays) * 24 * time.Hour
+
+	processor := &worker.Processor{Helper: captureAdapter, Journal: journalStore}
+
+	log.Printf("ThingsIndex Worker active (polling %s)...", serverURL)
+	for ctx.Err() == nil {
+		lease, err := serverClient.Lease(ctx)
+		if err != nil {
+			select {
+			case <-time.After(2 * time.Second):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			continue
+		}
+		if lease == nil {
+			continue
+		}
+		log.Printf("Received leased job: %s (attempts: %d)", lease.ID, lease.Attempts)
+
+		outcome, processErr := processor.Process(ctx, lease.Job)
+		var reportErr error
+		if processErr != nil {
+			log.Printf("Job %s failed: %v", lease.ID, processErr)
+			reportErr = serverClient.Fail(ctx, *lease, processErr, worker.IsRetryable(processErr))
+		} else {
+			log.Printf("Job %s succeeded (things_id=%s)", lease.ID, outcome.ThingsID)
+			reportErr = serverClient.Complete(ctx, *lease, outcome)
+		}
+		if reportErr != nil {
+			log.Printf("report job %s: %v", lease.ID, reportErr)
+			continue
+		}
+		if processErr == nil && worker.UsesJournal(lease.Job.Task) {
+			_ = journalStore.MarkReported(ctx, lease.ID)
+		}
+		_, _ = journalStore.PruneReported(ctx, time.Now().Add(-cutoffDuration))
+	}
+	return ctx.Err()
+}
+
+func runWorkerSetup() error {
+	if runtime.GOOS != "darwin" {
+		return errors.New("the Mac worker setup wizard must be run on macOS")
+	}
+
+	reader := bufio.NewReader(os.Stdin)
+	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	fmt.Println("  🛠️  ThingsIndex Mac Worker Setup Wizard")
+	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	fmt.Println()
+
+	// 1. Prompt for Server URL
+	defaultServer := os.Getenv("THINGS_INDEX_SERVER_URL")
+	if defaultServer == "" {
+		defaultServer = "http://127.0.0.1:8080"
+	}
+	fmt.Printf("• Enter Server URL [%s]: ", defaultServer)
+	serverURLInput, _ := reader.ReadString('\n')
+	serverURL := strings.TrimSpace(serverURLInput)
+	if serverURL == "" {
+		serverURL = defaultServer
+	}
+
+	// 2. Prompt for Worker Token
+	defaultToken := os.Getenv("THINGS_INDEX_WORKER_TOKEN")
+	fmt.Print("• Enter Worker Token: ")
+	tokenInput, _ := reader.ReadString('\n')
+	workerToken := strings.TrimSpace(tokenInput)
+	if workerToken == "" {
+		workerToken = defaultToken
+	}
+	if len(workerToken) < 32 {
+		return errors.New("worker token must be at least 32 characters long")
+	}
+
+	// 3. Validate the URL/token against the same rules the worker daemon
+	// enforces at startup, so the wizard cannot bless a configuration the
+	// installed worker will refuse.
+	if _, err := worker.NewClient(worker.ClientConfig{BaseURL: serverURL, Token: workerToken}); err != nil {
+		fmt.Println()
+		fmt.Println("  ✗ This server URL cannot be used by the worker daemon:")
+		fmt.Printf("    %v\n", err)
+		fmt.Println()
+		fmt.Println("  The worker requires HTTPS unless the server is reached via a literal")
+		fmt.Println("  loopback IP. For a homelab server on plain HTTP, either:")
+		fmt.Println("    • put it behind an HTTPS reverse proxy (see deploy/traefik), or")
+		fmt.Println("    • keep an SSH tunnel open: ssh -N -L 8080:<server-ip>:8080 <user>@<server-host>")
+		fmt.Println("      and enter http://127.0.0.1:8080 here instead.")
+		return errors.New("worker setup aborted: server URL rejected")
+	}
+
+	// 4. Test Server Connection
+	fmt.Printf("• Checking server connection to %s...\n", serverURL)
+	httpClient := &http.Client{Timeout: 5 * time.Second}
+	healthURL := strings.TrimRight(serverURL, "/") + "/healthz"
+	resp, err := httpClient.Get(healthURL)
+	if err != nil {
+		fmt.Printf("  ⚠️  Could not reach %s: %v (Continuing anyway)\n", healthURL, err)
+	} else {
+		_ = resp.Body.Close()
+		fmt.Println("  ✓ Server connection OK!")
+	}
+
+	// 5. Auto-detect Things 3 SQLite Database
+	fmt.Println("• Detecting Things 3 SQLite database...")
+	thingsDB, err := helper.FindThingsDatabase()
+	if err != nil {
+		return fmt.Errorf("Things 3 database not found: %w", err)
+	}
+	fmt.Printf("  ✓ Found database: %s\n", thingsDB)
+
+	// 6. Test Things 3 Access
+	captureAdapter := helper.NewClient("")
+	captureAdapter.DBPath = thingsDB
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := captureAdapter.Ping(ctx); err != nil {
+		return fmt.Errorf("failed to query Things 3 database: %w", err)
+	}
+	fmt.Println("  ✓ Things 3 database query verified (Read-Only OK)")
+
+	// 7. Install Background Launcher Script
+	home, _ := os.UserHomeDir()
+	binDir := filepath.Join(home, ".local", "bin")
+	_ = os.MkdirAll(binDir, 0o755)
+
+	exePath, err := os.Executable()
+	if err != nil {
+		exePath = "/usr/local/bin/things-index"
+	}
+
+	launcherScript := filepath.Join(binDir, "run-things-worker.sh")
+	scriptContent := fmt.Sprintf(`#!/bin/zsh -l
+export HOME=%s
+export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.local/bin"
+export THINGS_INDEX_SERVER_URL=%s
+export THINGS_INDEX_WORKER_TOKEN=%s
+export THINGS_INDEX_JOURNAL_PATH="$HOME/Library/Application Support/ThingsIndex/journal.sqlite"
+export THINGS_INDEX_THINGS_DB_PATH=%s
+
+exec %s worker
+`, shellQuote(home), shellQuote(serverURL), shellQuote(workerToken), shellQuote(thingsDB), shellQuote(exePath))
+
+	if err := os.WriteFile(launcherScript, []byte(scriptContent), 0o700); err != nil {
+		return fmt.Errorf("write launcher script: %w", err)
+	}
+	fmt.Printf("  ✓ Created launcher script: %s\n", launcherScript)
+
+	// 8. Install @reboot crontab persistence & start background session
+	fmt.Println("• Configuring background persistence...")
+	cronLine := "@reboot /usr/bin/screen -dmS things-worker " + shellQuote(launcherScript)
+	cronCmd := fmt.Sprintf(`(crontab -l 2>/dev/null | grep -v "things-worker"; echo %s) | crontab -`, shellQuote(cronLine))
+	_ = exec.Command("/bin/sh", "-c", cronCmd).Run()
+
+	// Restart screen session
+	restartCmd := fmt.Sprintf(`pkill -f "things-index worker" 2>/dev/null || true; screen -wipe 2>/dev/null || true; screen -dmS things-worker %s`, shellQuote(launcherScript))
+	_ = exec.Command("/bin/sh", "-c", restartCmd).Run()
+
+	fmt.Println()
+	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	fmt.Println("  🎉 ThingsIndex Mac Worker Successfully Configured & Active!")
+	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	fmt.Printf("  • Server Target:      %s\n", serverURL)
+	fmt.Printf("  • Things Database:    %s\n", thingsDB)
+	fmt.Printf("  • Background Session: screen -ls | grep things-worker\n")
+	fmt.Println("────────────────────────────────────────────────────────────")
+	fmt.Println("  The worker is now actively listening in the background.")
+	fmt.Println("  It will automatically start on boot and process jobs prompt-free.")
+	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	return nil
+}
+
+func runUninstall() error {
+	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	fmt.Println("  🗑️  ThingsIndex Uninstaller")
+	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	fmt.Println()
+
+	if runtime.GOOS == "darwin" {
+		fmt.Println("• Stopping running worker processes and screen sessions...")
+		_ = exec.Command("/bin/sh", "-c", `pkill -f "things-index" 2>/dev/null || true`).Run()
+		_ = exec.Command("/bin/sh", "-c", `screen -S things-worker -X quit 2>/dev/null || true`).Run()
+
+		home, _ := os.UserHomeDir()
+
+		fmt.Println("• Removing @reboot crontab entries...")
+		_ = exec.Command("/bin/sh", "-c", `(crontab -l 2>/dev/null | grep -v "things-worker") | crontab - 2>/dev/null || true`).Run()
+
+		fmt.Println("• Removing LaunchAgents...")
+		plistPath := filepath.Join(home, "Library", "LaunchAgents", "com.nejmlabs.things-index-worker.plist")
+		_ = exec.Command("/bin/sh", "-c", fmt.Sprintf(`launchctl bootout gui/$(id -u) "%s" 2>/dev/null || true; rm -f "%s"`, plistPath, plistPath)).Run()
+
+		fmt.Println("• Removing launcher scripts...")
+		_ = os.Remove(filepath.Join(home, ".local", "bin", "run-things-worker.sh"))
+		_ = os.Remove(filepath.Join(home, ".local", "bin", "things-index-worker-launcher.sh"))
+
+		fmt.Println("• Removing Application Support databases & state...")
+		_ = os.RemoveAll(filepath.Join(home, "Library", "Application Support", "ThingsIndex"))
+		_ = os.RemoveAll(filepath.Join(home, ".local", "state", "things-index"))
+
+		fmt.Println("• Removing Logs...")
+		_ = os.RemoveAll(filepath.Join(home, "Library", "Logs", "ThingsIndex"))
+
+		fmt.Println()
+		fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+		fmt.Println("  ✓ ThingsIndex has been completely removed from this Mac.")
+		fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+		return nil
+	}
+
+	// Linux / Server uninstaller
+	fmt.Println("• Stopping and disabling systemd service...")
+	_ = exec.Command("/bin/sh", "-c", "systemctl stop things-index-server 2>/dev/null || true; systemctl disable things-index-server 2>/dev/null || true").Run()
+	_ = os.Remove("/etc/systemd/system/things-index-server.service")
+	_ = exec.Command("systemctl", "daemon-reload").Run()
+
+	fmt.Println("• Removing configuration and database directories...")
+	_ = os.RemoveAll("/etc/things-index")
+	_ = os.RemoveAll("/var/lib/things-index")
+	_ = os.Remove("/usr/local/bin/things-index-server")
+
+	fmt.Println()
+	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	fmt.Println("  ✓ ThingsIndex Server has been completely removed.")
+	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	return nil
+}
+
+func printConfig() error {
+	exe, err := os.Executable()
+	if err != nil {
+		exe = "things-index"
+	}
+	fmt.Printf(`{
+  "mcpServers": {
+    "things": {
+      "command": "%s",
+      "args": ["stdio"]
+    }
+  }
+}
+`, exe)
+	return nil
+}
+
+func printHelp() {
+	fmt.Println(`things-index - Native Things 3 Model Context Protocol (MCP) Server
+
+Usage:
+  things-index [command] [options]
+
+Commands:
+  start, run      Start All-in-One local MCP HTTP server & background worker (default on macOS)
+  stdio           Run as a direct stdio MCP server for Claude Desktop / Cursor
+  server          Run headless server queue (for Linux / Docker / Proxmox)
+  worker          Run dedicated background worker connecting to a remote server
+  worker --setup  Interactive Mac worker setup wizard (auto-detects DB & configures daemon)
+  config          Print ready-to-paste Claude Desktop stdio JSON configuration
+  uninstall       Stop and cleanly remove all daemons, databases, crontab, and scripts
+  version         Print things-index version
+
+Environment Variables:
+  THINGS_INDEX_LISTEN_ADDR            HTTP listen address (default: 127.0.0.1:8080)
+  THINGS_INDEX_ALLOW_UNSPECIFIED_BIND Set to 1 to allow binding 0.0.0.0 / [::] (containers)
+  THINGS_INDEX_PUBLIC_TOKEN           Bearer token for MCP clients (auto-generated if omitted)
+  THINGS_INDEX_WORKER_TOKEN           Bearer token for Mac worker authentication
+  THINGS_INDEX_SERVER_URL             Server URL for worker daemon (e.g. https://...)
+  THINGS_INDEX_THINGS_AUTH_TOKEN      Things 3 URL-scheme auth token (Things settings)
+  THINGS_INDEX_THINGS_DB_PATH         Custom path to Things 3 SQLite database
+  THINGS_INDEX_STATE_DIR              State directory for queue and journal databases`)
+}
+
+func generateToken() (string, error) {
+	tokenBytes := make([]byte, 32)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(tokenBytes), nil
+}
+
+// displayHost rewrites wildcard listen addresses to a loopback host that MCP
+// clients on this machine can actually connect to.
+func displayHost(listenAddr string) string {
+	host, port, err := net.SplitHostPort(listenAddr)
+	if err != nil {
+		return listenAddr
+	}
+	ip := net.ParseIP(host)
+	if host == "" || (ip != nil && ip.IsUnspecified()) {
+		return net.JoinHostPort("127.0.0.1", port)
+	}
+	return listenAddr
+}
+
+func leaseNextJob(ctx context.Context, store *queue.Store, maxAttempts int, leaseDuration time.Duration) (queue.Job, bool) {
+	if _, err := store.ExpireLeases(ctx, time.Now(), maxAttempts); err != nil {
+		return queue.Job{}, false
+	}
+	job, found, err := store.Lease(ctx, time.Now(), leaseDuration)
+	if err != nil || !found {
+		return queue.Job{}, false
+	}
+	return job, true
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", `'\''`) + "'"
+}
+
+func randomHex(bytesLen int) string {
+	b := make([]byte, bytesLen)
+	if _, err := rand.Read(b); err != nil {
+		return hex.EncodeToString([]byte(fmt.Sprintf("%d", time.Now().UnixNano())))[:bytesLen*2]
+	}
+	return hex.EncodeToString(b)
+}

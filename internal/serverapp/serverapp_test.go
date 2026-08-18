@@ -1,4 +1,4 @@
-package main
+package serverapp
 
 import (
 	"path/filepath"
@@ -6,25 +6,34 @@ import (
 	"time"
 )
 
-func TestRequireNonPublicAddress(t *testing.T) {
+func TestValidateListenAddress(t *testing.T) {
 	tests := []struct {
-		address string
-		valid   bool
+		address          string
+		allowUnspecified bool
+		valid            bool
 	}{
-		{"127.0.0.1:8080", true},
-		{"localhost:8080", true},
-		{"192.168.1.50:8080", true},
-		{"10.20.30.40:8080", true},
-		{"[fd12:3456::10]:8080", true},
-		{"0.0.0.0:8080", false},
-		{"[::]:8080", false},
-		{"8.8.8.8:8080", false},
-		{"things-index.example:8080", false},
-		{"missing-port", false},
+		{"127.0.0.1:8080", false, true},
+		{"localhost:8080", false, true},
+		{"192.168.1.50:8080", false, true},
+		{"10.20.30.40:8080", false, true},
+		{"[fd12:3456::10]:8080", false, true},
+		{"0.0.0.0:8080", false, false},
+		{"[::]:8080", false, false},
+		{"0.0.0.0:8080", true, true},
+		{"[::]:8080", true, true},
+		{"8.8.8.8:8080", false, false},
+		{"8.8.8.8:8080", true, false},
+		{"things-index.example:8080", false, false},
+		{"things-index.example:8080", true, false},
+		{"missing-port", false, false},
 	}
 	for _, test := range tests {
-		t.Run(test.address, func(t *testing.T) {
-			err := requireNonPublicAddress(test.address)
+		name := test.address
+		if test.allowUnspecified {
+			name += "+unspecified"
+		}
+		t.Run(name, func(t *testing.T) {
+			err := validateListenAddress(test.address, test.allowUnspecified)
 			if test.valid && err != nil {
 				t.Fatalf("expected address to be accepted: %v", err)
 			}

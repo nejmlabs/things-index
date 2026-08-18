@@ -7,8 +7,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -29,7 +27,6 @@ type fakeVerifier struct {
 func (f *fakeVerifier) Ping(context.Context) error {
 	f.pingCalls++
 	return f.pingErr
-
 }
 
 func (f *fakeVerifier) Capture(_ context.Context, _ string, _ capture.Request) (helper.Response, error) {
@@ -41,51 +38,12 @@ func (f *fakeVerifier) Capture(_ context.Context, _ string, _ capture.Request) (
 	if id == "" {
 		id = "setup-test-id"
 	}
-	return helper.Response{SchemaVersion: 1, OK: true, ID: id}, nil
+	return helper.Response{OK: true, ID: id}, nil
 }
 
 func (f *fakeVerifier) FinaliseCapture(context.Context, string, string) error {
 	f.finaliseCalls++
 	return f.finaliseErr
-}
-
-func TestInstallWritesExactNamedShortcutAndOpensIt(t *testing.T) {
-	t.Parallel()
-
-	stateDirectory := t.TempDir()
-	var opened string
-	app := newApplication(Config{
-		Shortcut: []byte("signed shortcut"),
-		StateDir: stateDirectory,
-		Verifier: &fakeVerifier{},
-		OpenFile: func(_ context.Context, path string) error {
-			opened = path
-			return nil
-		},
-		OpenBrowser: func(context.Context, string) error { return nil },
-	}, "secret")
-
-	response := postForm(app.handler(), "/install", url.Values{"token": {"secret"}})
-	if response.Code != http.StatusOK {
-		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
-	}
-	if filepath.Base(opened) != shortcutFilename {
-		t.Fatalf("opened %q", opened)
-	}
-	data, err := os.ReadFile(opened)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != "signed shortcut" {
-		t.Fatalf("unexpected helper content %q", data)
-	}
-	info, err := os.Stat(opened)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode().Perm() != 0o600 {
-		t.Fatalf("helper permissions are %o", info.Mode().Perm())
-	}
 }
 
 func TestVerifyEnablesCaptureTestWithoutFinishing(t *testing.T) {
@@ -100,7 +58,7 @@ func TestVerifyEnablesCaptureTestWithoutFinishing(t *testing.T) {
 	if verifier.pingCalls != 1 || !app.currentState().Access || app.currentState().Ready {
 		t.Fatalf("unexpected verifier calls/state: %d %#v", verifier.pingCalls, app.currentState())
 	}
-	if !strings.Contains(response.Body.String(), "Access verified") {
+	if !strings.Contains(response.Body.String(), "Things 3 connected") {
 		t.Fatalf("access status missing: %s", response.Body.String())
 	}
 }
@@ -178,7 +136,7 @@ func TestSetupRejectsWrongToken(t *testing.T) {
 		t.Fatalf("GET status = %d", response.Code)
 	}
 
-	response = postForm(app.handler(), "/install", url.Values{"token": {"wrong"}})
+	response = postForm(app.handler(), "/verify", url.Values{"token": {"wrong"}})
 	if response.Code != http.StatusForbidden {
 		t.Fatalf("POST status = %d", response.Code)
 	}
@@ -199,10 +157,8 @@ func TestSetupAddsBrowserSecurityHeaders(t *testing.T) {
 func testApplication(t *testing.T, verifier Verifier) *application {
 	t.Helper()
 	return newApplication(Config{
-		Shortcut:    []byte("signed shortcut"),
 		StateDir:    t.TempDir(),
 		Verifier:    verifier,
-		OpenFile:    func(context.Context, string) error { return nil },
 		OpenBrowser: func(context.Context, string) error { return nil },
 	}, "secret")
 }

@@ -128,15 +128,16 @@ func (s *Store) Get(ctx context.Context, jobID string) (Entry, error) {
 	return entry, nil
 }
 
-// PruneReported removes delivery records that the server has already
-// acknowledged. Incomplete records are retained for crash recovery.
+// PruneReported removes delivery records that are reported or finalised
+// older than the retention cutoff. Incomplete records (received, creating,
+// created) are retained for crash recovery.
 func (s *Store) PruneReported(ctx context.Context, before time.Time) (int64, error) {
 	if before.IsZero() {
 		return 0, nil
 	}
 	result, err := s.db.ExecContext(ctx, `
 		DELETE FROM deliveries
-		WHERE state = 'reported' AND updated_at < ?`, before.UTC().UnixMilli())
+		WHERE state IN ('reported', 'finalised') AND updated_at < ?`, before.UTC().UnixMilli())
 	if err != nil {
 		return 0, fmt.Errorf("prune reported deliveries: %w", err)
 	}

@@ -1,102 +1,81 @@
 # ThingsIndex
 
-ThingsIndex is a small, write-only MCP service for capturing tasks from Pebble
-Index 01 into Things on a Mac.
+ThingsIndex is a production-grade, zero-prompt Model Context Protocol (MCP) server for capturing, reading, searching, updating, and archiving tasks from **Pebble Index 01**, **Claude Desktop**, **Cursor**, and AI agents into **Things 3** on macOS.
 
-This first phase does not use, modify, or depend on the Things3 Pages Obsidian
-plugin. A single `ThingsIndex Helper` Shortcut uses Things' native Shortcuts
-actions for prompt-free routine capture, confirmation, and crash recovery.
+---
 
-The Mac worker includes a short-lived setup GUI. Run
-`things-index-worker --setup` to install the bundled Shortcut and verify Things
-access without assembling actions or entering protocol commands. Its labelled
-capture test grants Create and Edit access before the first real request. The
-setup page listens only on loopback and stops when setup is complete.
+## ⚡ Quick Start & Onboarding
 
-## Deployment profiles
+### Option 1: All-in-One Local Mac Mode
+For running directly on a Mac for local Claude Desktop or Cursor:
 
-The same binaries support two layouts.
+```bash
+# 1. Build the binary
+make build
 
-### Mac-only
+# 2. Get ready-to-paste Claude Desktop / Cursor stdio configuration:
+./bin/things-index config
 
-```text
-Pebble Cloud ──HTTPS──> tunnel or reverse proxy ──> Mac server on loopback
-                                                          ▲
-                                                          │ HTTP loopback
-                                                          │
-                                                   Mac worker ──> Things
+# 3. Or start a local Streamable HTTP MCP server:
+./bin/things-index start
 ```
 
-This is the simplest option for anyone with an always-on Intel or Apple silicon
-Mac. The server and worker run as separate LaunchAgents so the durable queue and
-delivery journal retain their existing crash-recovery boundaries.
+---
 
-### Homelab
+### Option 2: Homelab / Distributed Mode (Proxmox / Docker + Mac mini)
+For 24/7 homelab infrastructure where the MCP server runs on Linux and leases jobs to a remote Mac:
 
-```text
-Pebble Cloud ──HTTPS──> reverse proxy ──> Linux server and durable queue
-                                                       ▲
-                                                       │ private HTTPS
-                                                       │
-                                                Mac worker ──> Things
+1. **Deploy Server on Linux / Proxmox**:
+   * **Proxmox VE 1-Click LXC Installer**:
+     ```bash
+     bash -c "$(wget -qLO - https://raw.githubusercontent.com/nejmlabs/ThingsIndex/main/deploy/proxmox-install.sh)"
+     ```
+   * **Docker Compose** (the server refuses to start without tokens):
+     ```bash
+     make tokens > .env   # or set the three THINGS_INDEX_*_TOKEN vars yourself
+     docker compose up -d
+     ```
+
+2. **Connect the Mac Worker (10-Second Setup Wizard)**:
+   ```bash
+   things-index worker --setup
+   ```
+   * Auto-detects Things 3 SQLite database.
+   * Verifies read-only connectivity.
+   * Installs and starts the background daemon automatically with `@reboot` persistence.
+
+---
+
+## 🛠️ Complete MCP Tools Directory
+
+| Tool Name | Type | Description |
+| :--- | :---: | :--- |
+| `get_things_today` | Read | Returns all tasks currently scheduled for **Today** with area, project, heading, and notes. |
+| `get_things_inbox` | Read | Returns all unprocessed tasks in the **Inbox**. |
+| `list_things_projects` | Read | Lists all active **Projects**, their parent Areas, notes, and open task counts. |
+| `search_things_tasks` | Read | Search tasks across any scope (`today`, `inbox`, `anytime`, `someday`, `all`) by text query, project, area, or tag. |
+| `capture_things_task` | Write | Create a task in Inbox, Project, Area, or under a Heading with notes, tags, checklists, deadlines, and reminders. |
+| `create_things_project` | Write | Create a new project inside an Area with notes, tags, start schedule, and deadline. |
+| `update_things_task` | Write | Update an open task’s title or notes, reschedule it, or add deadlines, tags, and checklists (deadline/tags/checklist/non-today schedules need the Things auth token). |
+| `create_things_heading` | Write | Create a new section heading inside a project (requires the Things auth token). |
+| `rename_things_heading` | Write | Rename an existing section heading inside a project (requires the Things auth token; verified via SQLite before reporting success). |
+| `archive_things_heading` | Write | Archive a section heading from an active project (requires the Things auth token; verified via SQLite before reporting success). |
+| `archive_things_task` | Write | Archive a task: mark `completed` (Logbook), `canceled` (Logbook), or move to `trash`. |
+| `archive_things_project` | Write | Archive an entire project: mark `completed` or `canceled`. |
+| `things_capture_status` | Read | Check async status of any queued operation via `request_id` (server mode only; stdio mode captures synchronously). |
+
+---
+
+## 🔒 Key Guarantees
+* **Zero-Prompt Execution**: Uses the official Things URL Scheme (`things:///add`, `add-project`, `update`) & read-only SQLite preflights. Task/project archiving falls back to AppleScript, which triggers macOS's one-time Automation permission grant on first use.
+* **Zero Foreground Steal**: Suppresses window focus and automatically quits Things 3 (no Dock dot) if it was closed before capture.
+* **Strictly Read-Only SQLite (`_query_only=1`)**: Never performs raw SQL writes to Cultured Code's database; Cultured Code's official engine handles writing and Things Cloud sync.
+* **Durable Queue**: In server mode, If the Mac is asleep or rebooting, tasks wait safely in the server queue and process immediately on wakeup.
+
+---
+
+## 🗑️ Clean Uninstallation
+To completely remove all daemons, databases, crontab entries, and launcher scripts:
+```bash
+things-index uninstall
 ```
-
-This keeps the public service isolated from the Mac and allows captures to wait
-while the Mac or Things is temporarily unavailable.
-
-See [Deployment profiles](docs/deployment.md), [Mac-only](docs/macos-only.md),
-and [Homelab](docs/homelab.md).
-
-## MCP tools
-
-- `capture_things_task` queues one task and waits briefly for the Mac to create
-  it. It returns `created`, `queued`, or `failed` plus a stable `request_id`.
-- `things_capture_status` checks a previous `request_id`.
-
-An optional, independently authenticated `/dashboard` shows authoritative
-sent-to-Mac, processing, retry, failure, and confirmed-in-Things states for
-retained jobs. It is disabled unless a separate dashboard token is configured.
-
-Capture supports title, notes, an exact project, area, or project heading,
-Anytime/Someday/date, This Evening, reminder time, deadline, existing tags, and
-checklist items.
-
-## Dependencies
-
-The binaries use Go's standard library plus:
-
-- the official Model Context Protocol Go SDK; and
-- `go-sqlite3`, which embeds SQLite and requires CGO when building.
-
-The required Shortcut adds no Go dependency. Its installable, Apple-signed
-artifact, readable source, versioned protocol, and maintainer rebuild notes are
-under [`shortcuts/`](shortcuts/README.md).
-
-## Build and test
-
-Build on the target operating system so CGO uses the correct C toolchain:
-
-```sh
-go test ./...
-go build -trimpath -o dist/things-index-server ./cmd/things-index-server
-go build -trimpath -o dist/things-index-worker ./cmd/things-index-worker
-```
-
-The worker is macOS-only at runtime because it controls Things. The server runs
-on macOS for the Mac-only profile or Linux for the homelab profile.
-
-## Security properties
-
-- Public MCP and worker APIs require different bearer tokens of at least 32
-  characters.
-- The server refuses wildcard and public-interface listen addresses.
-- Worker HTTP is accepted only for a literal loopback IP; every remote worker
-  connection requires HTTPS.
-- Public and worker routes use separate URL prefixes so an ingress can publish
-  only `/mcp`.
-- Request bodies, headers, and task fields have explicit limits.
-- Dynamic values are exchanged with the Shortcut in private JSON request files;
-  they are never interpolated into shell source.
-- Queue and delivery state use SQLite WAL with full synchronous durability.
-- Configurable retention removes only terminal server jobs and Mac deliveries
-  that the server has already acknowledged.

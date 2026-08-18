@@ -3,6 +3,7 @@ package queue
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -108,18 +109,59 @@ func (s *Store) Enqueue(ctx context.Context, task capture.Request) (Job, error) 
 	if err != nil {
 		return Job{}, fmt.Errorf("encode capture task: %w", err)
 	}
-	id, err := randomID()
-	if err != nil {
-		return Job{}, err
+	var id string
+	if task.IdempotencyKey != "" {
+		id = idempotencyID(task.IdempotencyKey)
+		existing, getErr := s.Get(ctx, id)
+		if getErr == nil {
+			existingPayload, marshalErr := json.Marshal(existing.Task)
+			if marshalErr != nil || string(existingPayload) != string(payload) {
+				return Job{}, errors.New("idempotency key already used with different payload")
+			}
+			return existing, nil
+		}
+	} else {
+		id, err = randomID()
+		if err != nil {
+			return Job{}, err
+		}
 	}
 	now := time.Now().UTC()
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO jobs (id, payload, state, created_at)
 		VALUES (?, ?, 'queued', ?)`, id, string(payload), now.UnixMilli())
 	if err != nil {
+		if task.IdempotencyKey != "" {
+			if existing, getErr := s.Get(ctx, id); getErr == nil {
+				existingPayload, marshalErr := json.Marshal(existing.Task)
+				if marshalErr == nil && string(existingPayload) == string(payload) {
+					return existing, nil
+				}
+				return Job{}, errors.New("idempotency key already used with different payload")
+			}
+		}
 		return Job{}, fmt.Errorf("enqueue capture task: %w", err)
 	}
 	return Job{ID: id, Task: task, State: StateQueued, CreatedAt: now}, nil
+}
+
+func (s *Store) ExpireLeases(ctx context.Context, now time.Time, maxAttempts int) (int64, error) {
+	if maxAttempts <= 0 {
+		return 0, nil
+	}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE jobs
+		SET state = 'failed',
+		    last_error = 'lease expired and maximum delivery attempts exceeded',
+		    lease_token = '',
+		    lease_until = 0,
+		    completed_at = ?
+		WHERE state = 'leased' AND lease_until <= ? AND attempts >= ?`,
+		now.UTC().UnixMilli(), now.UTC().UnixMilli(), maxAttempts)
+	if err != nil {
+		return 0, fmt.Errorf("expire exceeded leases: %w", err)
+	}
+	return result.RowsAffected()
 }
 
 func (s *Store) Lease(ctx context.Context, now time.Time, duration time.Duration) (Job, bool, error) {
@@ -336,4 +378,9 @@ func randomID() (string, error) {
 		return "", fmt.Errorf("generate identifier: %w", err)
 	}
 	return hex.EncodeToString(bytes[:]), nil
+}
+
+func idempotencyID(key string) string {
+	sum := sha256.Sum256([]byte("things-index-idempotency:" + key))
+	return hex.EncodeToString(sum[:16])
 }

@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -13,9 +14,7 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -24,10 +23,7 @@ import (
 	"github.com/nejmlabs/things-index/internal/helper"
 )
 
-const (
-	shortcutFilename = "ThingsIndex Helper.shortcut"
-	maxFormBytes     = 4 << 10
-)
+const maxFormBytes = 4 << 10
 
 type Verifier interface {
 	Ping(context.Context) error
@@ -38,7 +34,6 @@ type Verifier interface {
 type OpenFunc func(context.Context, string) error
 
 type Config struct {
-	Shortcut    []byte
 	StateDir    string
 	Verifier    Verifier
 	OpenFile    OpenFunc
@@ -126,17 +121,14 @@ func Run(ctx context.Context, config Config) error {
 }
 
 func validateConfig(config Config) error {
-	if len(config.Shortcut) == 0 {
-		return errors.New("signed helper Shortcut is required")
-	}
 	if strings.TrimSpace(config.StateDir) == "" {
 		return errors.New("setup state directory is required")
 	}
 	if config.Verifier == nil {
-		return errors.New("Shortcut verifier is required")
+		return errors.New("Things verifier is required")
 	}
-	if config.OpenFile == nil || config.OpenBrowser == nil {
-		return errors.New("file and browser openers are required")
+	if config.OpenBrowser == nil {
+		return errors.New("browser opener is required")
 	}
 	return nil
 }
@@ -150,8 +142,8 @@ func newApplication(config Config, token string) *application {
 		testID: hex.EncodeToString(testHash[:16]),
 		state: pageState{
 			Kind:    "pending",
-			Heading: "Helper not yet verified",
-			Detail:  "Install the bundled Shortcut, then verify its Things access.",
+			Heading: "Things 3 access not yet verified",
+			Detail:  "Verify Things 3 connectivity, then run the test capture.",
 		},
 	}
 }
@@ -159,7 +151,6 @@ func newApplication(config Config, token string) *application {
 func (a *application) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", a.show)
-	mux.HandleFunc("POST /install", a.install)
 	mux.HandleFunc("POST /verify", a.verify)
 	mux.HandleFunc("POST /test-capture", a.testCapture)
 	mux.HandleFunc("POST /finish", a.complete)
@@ -174,28 +165,6 @@ func (a *application) show(response http.ResponseWriter, request *http.Request) 
 	a.render(response)
 }
 
-func (a *application) install(response http.ResponseWriter, request *http.Request) {
-	if !a.authoriseForm(response, request) {
-		return
-	}
-	path, err := a.writeShortcut()
-	if err == nil {
-		err = a.config.OpenFile(request.Context(), path)
-	}
-	if err != nil {
-		a.setState("failed", "Could not open the helper", err.Error(), false, false)
-	} else {
-		a.setState(
-			"progress",
-			"Installation opened in Shortcuts",
-			"Choose Add Shortcut, return here, then select Verify Access. Replacing an existing copy resets its privacy grants.",
-			false,
-			false,
-		)
-	}
-	a.render(response)
-}
-
 func (a *application) verify(response http.ResponseWriter, request *http.Request) {
 	if !a.authoriseForm(response, request) {
 		return
@@ -203,16 +172,16 @@ func (a *application) verify(response http.ResponseWriter, request *http.Request
 	if err := a.config.Verifier.Ping(request.Context()); err != nil {
 		a.setState(
 			"failed",
-			"Helper is not ready",
-			"Install it under the exact name “ThingsIndex Helper”, approve Things access if prompted, then try again. "+err.Error(),
+			"Things 3 connection failed",
+			"Ensure Things 3 is installed and has been opened at least once. "+err.Error(),
 			false,
 			false,
 		)
 	} else {
 		a.setState(
 			"progress",
-			"Access verified",
-			"The helper supports the current protocol. Run the capture test to grant Create and Edit access before finishing.",
+			"Things 3 connected",
+			"Things 3 database verified. Run the test capture to confirm background capture.",
 			true,
 			false,
 		)
@@ -225,7 +194,7 @@ func (a *application) testCapture(response http.ResponseWriter, request *http.Re
 		return
 	}
 	if !a.currentState().Access {
-		http.Error(response, "verify helper access before testing capture", http.StatusConflict)
+		http.Error(response, "verify Things 3 access before testing capture", http.StatusConflict)
 		return
 	}
 
@@ -233,12 +202,17 @@ func (a *application) testCapture(response http.ResponseWriter, request *http.Re
 	defer a.testMu.Unlock()
 
 	if a.thingsID == "" {
+		today := time.Now()
 		created, err := a.config.Verifier.Capture(request.Context(), a.testID, capture.Request{
 			Title: "ThingsIndex setup test — safe to delete",
 			Notes: "Created by the ThingsIndex setup GUI to verify background capture permissions.",
 			Schedule: &capture.Schedule{
-				Start: capture.StartAnytime,
+				Start:      capture.StartOnDate,
+				Date:       today.Format("2006-01-02"),
+				ReminderAt: today.Add(time.Hour).Format(time.RFC3339),
 			},
+			Deadline:  today.Add(24 * time.Hour).Format("2006-01-02"),
+			Checklist: []string{"Verify permissions", "Safe to delete"},
 		})
 		if err != nil {
 			a.setState("failed", "Capture test could not create a task", err.Error(), true, false)
@@ -252,7 +226,7 @@ func (a *application) testCapture(response http.ResponseWriter, request *http.Re
 		a.setState(
 			"failed",
 			"Capture test needs attention",
-			"The task was created safely. Choose Always Allow on any Edit Items prompt, then run this test again. "+err.Error(),
+			err.Error(),
 			true,
 			false,
 		)
@@ -260,7 +234,7 @@ func (a *application) testCapture(response http.ResponseWriter, request *http.Re
 		a.setState(
 			"ready",
 			"Capture path ready",
-			"Create and Edit both succeeded. Delete “ThingsIndex setup test — safe to delete” from Things when convenient.",
+			"Task created and confirmed in Things 3. Delete “ThingsIndex setup test — safe to delete” when convenient.",
 			true,
 			true,
 		)
@@ -273,7 +247,7 @@ func (a *application) complete(response http.ResponseWriter, request *http.Reque
 		return
 	}
 	if !a.currentState().Ready {
-		http.Error(response, "verify the helper before finishing setup", http.StatusConflict)
+		http.Error(response, "complete verification before finishing setup", http.StatusConflict)
 		return
 	}
 	response.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -282,12 +256,12 @@ func (a *application) complete(response http.ResponseWriter, request *http.Reque
 }
 
 func (a *application) authorised(request *http.Request) bool {
-	return request.URL.Query().Get("token") == a.token
+	return subtle.ConstantTimeCompare([]byte(request.URL.Query().Get("token")), []byte(a.token)) == 1
 }
 
 func (a *application) authoriseForm(response http.ResponseWriter, request *http.Request) bool {
 	request.Body = http.MaxBytesReader(response, request.Body, maxFormBytes)
-	if err := request.ParseForm(); err != nil || request.Form.Get("token") != a.token {
+	if err := request.ParseForm(); err != nil || subtle.ConstantTimeCompare([]byte(request.Form.Get("token")), []byte(a.token)) != 1 {
 		http.Error(response, "invalid setup request", http.StatusForbidden)
 		return false
 	}
@@ -311,42 +285,6 @@ func (a *application) currentState() pageState {
 	a.stateMu.RLock()
 	defer a.stateMu.RUnlock()
 	return a.state
-}
-
-func (a *application) writeShortcut() (string, error) {
-	directory := filepath.Join(a.config.StateDir, "Setup")
-	if err := os.MkdirAll(directory, 0o700); err != nil {
-		return "", fmt.Errorf("create setup directory: %w", err)
-	}
-	if err := os.Chmod(directory, 0o700); err != nil {
-		return "", fmt.Errorf("secure setup directory: %w", err)
-	}
-	temporary, err := os.CreateTemp(directory, ".helper-*.shortcut")
-	if err != nil {
-		return "", fmt.Errorf("create helper file: %w", err)
-	}
-	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
-	if err := temporary.Chmod(0o600); err != nil {
-		temporary.Close()
-		return "", fmt.Errorf("secure helper file: %w", err)
-	}
-	if _, err := temporary.Write(a.config.Shortcut); err != nil {
-		temporary.Close()
-		return "", fmt.Errorf("write helper file: %w", err)
-	}
-	if err := temporary.Sync(); err != nil {
-		temporary.Close()
-		return "", fmt.Errorf("flush helper file: %w", err)
-	}
-	if err := temporary.Close(); err != nil {
-		return "", fmt.Errorf("close helper file: %w", err)
-	}
-	path := filepath.Join(directory, shortcutFilename)
-	if err := os.Rename(temporaryPath, path); err != nil {
-		return "", fmt.Errorf("install helper file: %w", err)
-	}
-	return path, nil
 }
 
 func randomToken() (string, error) {
@@ -410,7 +348,7 @@ var setupTemplate = template.Must(template.New("setup").Parse(`<!doctype html>
 <main>
   <p class="eyebrow">Mac worker onboarding</p>
   <h1>ThingsIndex Setup</h1>
-  <p class="intro">Install one native helper Shortcut and verify that background capture can reach Things without repeated prompts.</p>
+  <p class="intro">Verify Things 3 connectivity and test instantaneous background capture.</p>
 
   <section class="status {{.State.Kind}}" aria-live="polite">
     <span class="dot" aria-hidden="true">{{if .State.Ready}}✓{{else if eq .State.Kind "failed"}}!{{else}}…{{end}}</span>
@@ -418,15 +356,13 @@ var setupTemplate = template.Must(template.New("setup").Parse(`<!doctype html>
   </section>
 
   <ol class="steps">
-    <li>Select <strong>Install Shortcut</strong>, then choose <strong>Add Shortcut</strong> in the Shortcuts app.</li>
-    <li>Select <strong>Verify Access</strong>. Choose <strong>Always Allow</strong> for the helper's external input and Things access.</li>
-    <li>Select <strong>Test Capture</strong>. This creates one labelled Inbox task while granting the separate Create and Edit permissions.</li>
-    <li>Shortcuts may ask separately on first use. These grants persist unless the helper is replaced or its privacy is reset.</li>
+    <li>Select <strong>Verify Things 3</strong> to confirm database connectivity.</li>
+    <li>Select <strong>Test Capture</strong> to create and finalise a test task.</li>
+    <li>Select <strong>Finish Setup</strong> to exit onboarding.</li>
   </ol>
 
   <div class="actions">
-    <form method="post" action="/install"><input type="hidden" name="token" value="{{.Token}}"><button class="primary" type="submit">Install Shortcut</button></form>
-    <form method="post" action="/verify"><input type="hidden" name="token" value="{{.Token}}"><button type="submit">Verify Access</button></form>
+    <form method="post" action="/verify"><input type="hidden" name="token" value="{{.Token}}"><button class="primary" type="submit">Verify Things 3</button></form>
     <form method="post" action="/test-capture"><input type="hidden" name="token" value="{{.Token}}"><button type="submit" {{if not .State.Access}}disabled{{end}}>Test Capture</button></form>
     <form method="post" action="/finish"><input type="hidden" name="token" value="{{.Token}}"><button type="submit" {{if not .State.Ready}}disabled{{end}}>Finish Setup</button></form>
   </div>
@@ -436,4 +372,4 @@ var setupTemplate = template.Must(template.New("setup").Parse(`<!doctype html>
 </body>
 </html>`))
 
-const finishedPage = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ThingsIndex Setup Complete</title><style>:root{color-scheme:light dark;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}body{min-height:100vh;margin:0;display:grid;place-items:center;background:#74809518}main{max-width:34rem;margin:1rem;padding:2rem;border:1px solid #74809555;border-radius:1rem;background:Canvas;text-align:center}span{display:inline-grid;place-items:center;width:3rem;height:3rem;border-radius:50%;background:#d9f7e7;color:#0b6b3a;font-size:1.5rem;font-weight:900}h1{margin:1rem 0 .5rem}p{color:GrayText;line-height:1.5}</style></head><body><main><span>✓</span><h1>Setup complete</h1><p>ThingsIndex Helper is ready. You can close this tab and start the worker.</p></main></body></html>`
+const finishedPage = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ThingsIndex Setup Complete</title><style>:root{color-scheme:light dark;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}body{min-height:100vh;margin:0;display:grid;place-items:center;background:#74809518}main{max-width:34rem;margin:1rem;padding:2rem;border:1px solid #74809555;border-radius:1rem;background:Canvas;text-align:center}span{display:inline-grid;place-items:center;width:3rem;height:3rem;border-radius:50%;background:#d9f7e7;color:#0b6b3a;font-size:1.5rem;font-weight:900}h1{margin:1rem 0 .5rem}p{color:GrayText;line-height:1.5}</style></head><body><main><span>✓</span><h1>Setup complete</h1><p>Things 3 connection is verified and ready. You can close this tab and start the worker.</p></main></body></html>`

@@ -102,7 +102,17 @@ func TestPruneReportedRetainsIncompleteDeliveries(t *testing.T) {
 	if err := store.MarkCreated(ctx, "incomplete", "things-2", "notes"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.MarkFinalised(ctx, "incomplete"); err != nil {
+
+	if _, _, err := store.Ensure(ctx, "finalised-unacked", "hash-3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkCreating(ctx, "finalised-unacked"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkCreated(ctx, "finalised-unacked", "things-3", "notes"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkFinalised(ctx, "finalised-unacked"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -114,11 +124,14 @@ func TestPruneReportedRetainsIncompleteDeliveries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if count != 1 {
-		t.Fatalf("pruned %d deliveries, want 1", count)
+	if count != 2 {
+		t.Fatalf("pruned %d deliveries, want 2", count)
 	}
 	if _, err := store.Get(ctx, "reported"); err == nil {
 		t.Fatal("expired reported delivery was retained")
+	}
+	if _, err := store.Get(ctx, "finalised-unacked"); err == nil {
+		t.Fatal("expired finalised delivery was retained")
 	}
 	if _, err := store.Get(ctx, "incomplete"); err != nil {
 		t.Fatalf("incomplete delivery was pruned: %v", err)

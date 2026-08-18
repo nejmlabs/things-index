@@ -1,0 +1,31 @@
+services:
+  things-index-server:
+    build: .
+    image: nejmlabs/things-index-server:latest
+    container_name: things-index-server
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - THINGS_INDEX_LISTEN_ADDR=0.0.0.0:8080
+      # Required for the wildcard bind above; the container sits behind
+      # Docker's network layer and the bearer-token checks.
+      - THINGS_INDEX_ALLOW_UNSPECIFIED_BIND=1
+      - THINGS_INDEX_DB_PATH=/var/lib/things-index/queue.sqlite
+      # Required: set secure 64-char hex tokens (generate via `make tokens` or `openssl rand -hex 32`)
+      # The server will refuse to start if these are missing or too short.
+      - THINGS_INDEX_PUBLIC_TOKEN=${THINGS_INDEX_PUBLIC_TOKEN}
+      - THINGS_INDEX_WORKER_TOKEN=${THINGS_INDEX_WORKER_TOKEN}
+      - THINGS_INDEX_DASHBOARD_TOKEN=${THINGS_INDEX_DASHBOARD_TOKEN}
+    volumes:
+      - things_data:/var/lib/things-index
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8080/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  things_data:
+    driver: local

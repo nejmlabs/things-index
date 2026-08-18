@@ -135,6 +135,60 @@ func TestNewHandlerRejectsWeakOrSharedTokens(t *testing.T) {
 	}
 }
 
+func TestMCPIdempotency(t *testing.T) {
+	store, err := queue.Open(filepath.Join(t.TempDir(), "queue.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	handler, err := NewHandler(store, Config{
+		PublicToken:    testPublicToken,
+		WorkerToken:    testWorkerToken,
+		WaitForResult:  5 * time.Millisecond,
+		WorkerLongPoll: 5 * time.Millisecond,
+		PollInterval:   time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inMemoryTransport := handlerTransport{handler: handler}
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "things-index-test", Version: "1"}, nil)
+	httpClient := &http.Client{Transport: authTransport{token: testPublicToken, base: inMemoryTransport}}
+	session, err := client.Connect(context.Background(), &mcp.StreamableClientTransport{
+		Endpoint:             "http://things-index.test/mcp",
+		HTTPClient:           httpClient,
+		DisableStandaloneSSE: true,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+
+	firstResult, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "capture_things_task",
+		Arguments: map[string]any{"title": "Buy milk", "idempotency_key": "pebble-event-001"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstQueued := decodeCaptureResult(t, firstResult)
+
+	secondResult, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "capture_things_task",
+		Arguments: map[string]any{"title": "Buy milk", "idempotency_key": "pebble-event-001"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondQueued := decodeCaptureResult(t, secondResult)
+
+	if firstQueued.RequestID != secondQueued.RequestID {
+		t.Fatalf("expected identical request ID %q, got %q", firstQueued.RequestID, secondQueued.RequestID)
+	}
+}
+
 type authTransport struct {
 	token string
 	base  http.RoundTripper

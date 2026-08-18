@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 
@@ -28,7 +29,7 @@ func (f *fakeHelper) Capture(_ context.Context, _ string, task capture.Request) 
 	if call < len(f.captureErrors) && f.captureErrors[call] != nil {
 		return helper.Response{}, f.captureErrors[call]
 	}
-	return helper.Response{SchemaVersion: 1, OK: true, ID: f.createdID, AppliedTags: f.appliedTags}, nil
+	return helper.Response{OK: true, ID: f.createdID, AppliedTags: f.appliedTags}, nil
 }
 
 func (f *fakeHelper) FindCapture(_ context.Context, _ string) ([]string, error) {
@@ -39,6 +40,38 @@ func (f *fakeHelper) FinaliseCapture(_ context.Context, id, title string) error 
 	f.finalisedID = id
 	f.finalisedTitle = title
 	return nil
+}
+
+func (f *fakeHelper) CreateHeading(_ context.Context, _, _ string) (helper.Response, error) {
+	return helper.Response{OK: true, ID: "fake-heading-id"}, nil
+}
+
+func (f *fakeHelper) ArchiveHeading(_ context.Context, _, _ string) (helper.Response, error) {
+	return helper.Response{OK: true, ID: "fake-heading-id"}, nil
+}
+
+func (f *fakeHelper) RenameHeading(_ context.Context, _, _, _ string) (helper.Response, error) {
+	return helper.Response{OK: true, ID: "fake-heading-id"}, nil
+}
+
+func (f *fakeHelper) ArchiveTask(_ context.Context, _, _, _, _ string) (helper.Response, error) {
+	return helper.Response{OK: true, ID: "fake-task-id"}, nil
+}
+
+func (f *fakeHelper) ArchiveProject(_ context.Context, _, _, _ string) (helper.Response, error) {
+	return helper.Response{OK: true, ID: "fake-project-id"}, nil
+}
+
+func (f *fakeHelper) QueryTasks(_ context.Context, _ capture.QueryTasksRequest) (helper.Response, error) {
+	return helper.Response{OK: true, ID: `[]`}, nil
+}
+
+func (f *fakeHelper) CreateProject(_ context.Context, _ capture.CreateProjectRequest) (helper.Response, error) {
+	return helper.Response{OK: true, ID: "fake-project-id"}, nil
+}
+
+func (f *fakeHelper) UpdateTask(_ context.Context, _ capture.UpdateTaskRequest) (helper.Response, error) {
+	return helper.Response{OK: true, ID: "fake-task-id"}, nil
 }
 
 func TestProcessorCreatesAndFinalisesOnce(t *testing.T) {
@@ -146,5 +179,28 @@ func TestProcessorTreatsOmittedAppliedTagsAsUnverified(t *testing.T) {
 	}
 	if len(outcome.Warnings) != 0 {
 		t.Fatalf("unverified tags produced warnings: %#v", outcome.Warnings)
+	}
+}
+
+func TestIsRetryable(t *testing.T) {
+	t.Parallel()
+
+	if IsRetryable(nil) {
+		t.Fatal("nil error should not be retryable")
+	}
+	if IsRetryable(permanentError(errors.New("invalid job"))) {
+		t.Fatal("permanentError should not be retryable")
+	}
+	if !IsRetryable(&helper.OperationError{Code: "create_failed"}) {
+		t.Fatal("create_failed should be retryable")
+	}
+	if !IsRetryable(&helper.OperationError{Code: "finalise_not_found"}) {
+		t.Fatal("finalise_not_found should be retryable")
+	}
+	if IsRetryable(&helper.OperationError{Code: "invalid_request"}) {
+		t.Fatal("invalid_request should not be retryable")
+	}
+	if IsRetryable(&helper.OperationError{Code: "destination_not_found"}) {
+		t.Fatal("destination_not_found should not be retryable")
 	}
 }

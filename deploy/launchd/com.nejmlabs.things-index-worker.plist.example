@@ -17,9 +17,13 @@
         <key>THINGS_INDEX_WORKER_TOKEN</key>
         <string>REPLACE_WITH_WORKER_TOKEN</string>
         <key>THINGS_INDEX_JOURNAL_PATH</key>
-        <string>/Users/REPLACE_ME/Library/Application Support/ThingsIndex/journal.db</string>
-        <key>THINGS_INDEX_HELPER_TEMP_DIR</key>
-        <string>/Users/REPLACE_ME/Library/Application Support/ThingsIndex/HelperRequests</string>
+        <string>/Users/REPLACE_ME/Library/Application Support/ThingsIndex/journal.sqlite</string>
+        <!-- Optional: Things URL-scheme auth token (Things > Settings > General >
+             Enable Things URLs > Manage) enables heading, deadline, tag, and
+             checklist updates.
+        <key>THINGS_INDEX_THINGS_AUTH_TOKEN</key>
+        <string>REPLACE_WITH_THINGS_AUTH_TOKEN</string>
+        -->
         <key>THINGS_INDEX_JOURNAL_RETENTION_DAYS</key>
         <string>30</string>
     </dict>

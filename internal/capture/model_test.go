@@ -1,6 +1,9 @@
 package capture
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestRequestValidate(t *testing.T) {
 	t.Parallel()
@@ -68,5 +71,24 @@ func TestRequestHashIsStable(t *testing.T) {
 	}
 	if first != second {
 		t.Fatalf("hash changed: %q != %q", first, second)
+	}
+}
+
+func TestRequestValidateIdempotencyKey(t *testing.T) {
+	t.Parallel()
+
+	valid := Request{Title: "Buy milk", IdempotencyKey: "pebble-event-12345"}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("valid idempotency key rejected: %v", err)
+	}
+
+	multiline := Request{Title: "Buy milk", IdempotencyKey: "key\nwith\nnewlines"}
+	if err := multiline.Validate(); err == nil {
+		t.Fatal("expected multiline idempotency key to be rejected")
+	}
+
+	tooLong := Request{Title: "Buy milk", IdempotencyKey: strings.Repeat("a", 129)}
+	if err := tooLong.Validate(); err == nil {
+		t.Fatal("expected oversized idempotency key to be rejected")
 	}
 }

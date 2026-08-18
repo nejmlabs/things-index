@@ -15,7 +15,10 @@ Things <── native Shortcut <── Mac worker ──────────
 
 Give the server a stable private address and set `THINGS_INDEX_LISTEN_ADDR` to
 that exact address, for example `192.168.1.50:8080`. The binary rejects
-`0.0.0.0`, `[::]`, hostnames, and public IP addresses.
+hostnames and public IP addresses, and rejects `0.0.0.0` / `[::]` unless
+`THINGS_INDEX_ALLOW_UNSPECIFIED_BIND=1` is set explicitly — the Docker and
+Proxmox LXC deployments set it because containers must bind all interfaces for
+port publishing to work.
 
 Build the server natively on Linux and install it as
 `/usr/local/bin/things-index-server`. The example files under `deploy/systemd/`
@@ -61,8 +64,8 @@ Build `things-index-worker` natively on the Mac. Copy and fill in
 ```text
 THINGS_INDEX_SERVER_URL=https://things-index-worker.internal.example.com
 THINGS_INDEX_WORKER_TOKEN=<independent worker token>
-THINGS_INDEX_JOURNAL_PATH=<user-owned path>/journal.db
-THINGS_INDEX_HELPER_TEMP_DIR=<user-owned path>/HelperRequests
+THINGS_INDEX_JOURNAL_PATH=<user-owned path>/journal.sqlite
+THINGS_INDEX_THINGS_AUTH_TOKEN=<optional Things URL-scheme auth token>
 THINGS_INDEX_JOURNAL_RETENTION_DAYS=30
 ```
 

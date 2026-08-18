@@ -24,6 +24,7 @@ const maxRequestBodyBytes = 64 << 10
 type Queue interface {
 	Enqueue(context.Context, capture.Request) (queue.Job, error)
 	Lease(context.Context, time.Time, time.Duration) (queue.Job, bool, error)
+	ExpireLeases(context.Context, time.Time, int) (int64, error)
 	Complete(context.Context, string, string, string, []string) error
 	Fail(context.Context, string, string, string, bool) error
 	Get(context.Context, string) (queue.Job, error)
@@ -44,9 +45,10 @@ type Config struct {
 }
 
 type CaptureResult struct {
-	Status    string   `json:"status" jsonschema:"Capture state: queued, created, or failed."`
+	Status    string   `json:"status" jsonschema:"Operation state: queued, created, succeeded, or failed."`
 	RequestID string   `json:"request_id" jsonschema:"Stable request identifier for status checks."`
-	ThingsID  string   `json:"things_id,omitempty" jsonschema:"Things task identifier, once created."`
+	ThingsID  string   `json:"things_id,omitempty" jsonschema:"Things task/project identifier, once created."`
+	Data      any      `json:"data,omitempty" jsonschema:"Structured query results."`
 	Warnings  []string `json:"warnings,omitempty" jsonschema:"Non-fatal capture warnings."`
 	Error     string   `json:"error,omitempty" jsonschema:"Failure description, if capture failed."`
 }
@@ -92,6 +94,50 @@ func NewHandler(store Queue, config Config) (http.Handler, error) {
 		Name:        "things_capture_status",
 		Description: "Check a Things capture using the request_id returned by capture_things_task.",
 	}, service.captureStatus)
+	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name:        "create_things_heading",
+		Description: "Create a new section heading inside a Things 3 project.",
+	}, service.createHeading)
+	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name:        "archive_things_heading",
+		Description: "Archive/hide a section heading from an active Things 3 project.",
+	}, service.archiveHeading)
+	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name:        "rename_things_heading",
+		Description: "Rename an existing section heading inside a Things 3 project.",
+	}, service.renameHeading)
+	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name:        "archive_things_task",
+		Description: "Archive a task in Things 3 (mark completed, canceled, or move to trash).",
+	}, service.archiveTask)
+	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name:        "archive_things_project",
+		Description: "Archive an entire project in Things 3 (mark completed or canceled).",
+	}, service.archiveProject)
+	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name:        "get_things_today",
+		Description: "Get all tasks scheduled for Today in Things 3.",
+	}, service.getToday)
+	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name:        "get_things_inbox",
+		Description: "Get all unorganized tasks in Things 3 Inbox.",
+	}, service.getInbox)
+	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name:        "list_things_projects",
+		Description: "List all active projects and their areas in Things 3.",
+	}, service.listProjects)
+	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name:        "search_things_tasks",
+		Description: "Search tasks in Things 3 across any scope (today, inbox, anytime, someday, all) by title, project, area, or tag.",
+	}, service.searchTasks)
+	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name:        "create_things_project",
+		Description: "Create a new project in Things 3.",
+	}, service.createProject)
+	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name:        "update_things_task",
+		Description: "Update, reschedule, or add notes/checklists to an existing task in Things 3.",
+	}, service.updateTask)
 
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
 		return mcpServer
@@ -155,6 +201,198 @@ func (s *service) captureStatus(ctx context.Context, _ *mcp.CallToolRequest, inp
 	return nil, captureResult(job), nil
 }
 
+func (s *service) createHeading(ctx context.Context, _ *mcp.CallToolRequest, input capture.HeadingRequest) (*mcp.CallToolResult, CaptureResult, error) {
+	if err := input.Validate(); err != nil {
+		return nil, CaptureResult{}, fmt.Errorf("invalid heading request: %w", err)
+	}
+	task := capture.Request{
+		HeadingOperation: "create",
+		HeadingRequest:   &input,
+	}
+	job, err := s.queue.Enqueue(ctx, task)
+	if err != nil {
+		return nil, CaptureResult{}, fmt.Errorf("queue heading creation: %w", err)
+	}
+	result, err := s.waitForResult(ctx, job.ID, s.config.WaitForResult)
+	if err != nil {
+		return nil, CaptureResult{}, err
+	}
+	return nil, result, nil
+}
+
+func (s *service) archiveHeading(ctx context.Context, _ *mcp.CallToolRequest, input capture.HeadingRequest) (*mcp.CallToolResult, CaptureResult, error) {
+	if err := input.Validate(); err != nil {
+		return nil, CaptureResult{}, fmt.Errorf("invalid heading request: %w", err)
+	}
+	task := capture.Request{
+		HeadingOperation: "archive",
+		HeadingRequest:   &input,
+	}
+	job, err := s.queue.Enqueue(ctx, task)
+	if err != nil {
+		return nil, CaptureResult{}, fmt.Errorf("queue heading archive: %w", err)
+	}
+	result, err := s.waitForResult(ctx, job.ID, s.config.WaitForResult)
+	if err != nil {
+		return nil, CaptureResult{}, err
+	}
+	return nil, result, nil
+}
+
+func (s *service) renameHeading(ctx context.Context, _ *mcp.CallToolRequest, input capture.HeadingRequest) (*mcp.CallToolResult, CaptureResult, error) {
+	if err := input.Validate(); err != nil {
+		return nil, CaptureResult{}, fmt.Errorf("invalid heading request: %w", err)
+	}
+	if strings.TrimSpace(input.NewTitle) == "" {
+		return nil, CaptureResult{}, errors.New("new_title is required when renaming a heading")
+	}
+	task := capture.Request{
+		HeadingOperation: "rename",
+		HeadingRequest:   &input,
+	}
+	job, err := s.queue.Enqueue(ctx, task)
+	if err != nil {
+		return nil, CaptureResult{}, fmt.Errorf("queue heading rename: %w", err)
+	}
+	result, err := s.waitForResult(ctx, job.ID, s.config.WaitForResult)
+	if err != nil {
+		return nil, CaptureResult{}, err
+	}
+	return nil, result, nil
+}
+
+func (s *service) archiveTask(ctx context.Context, _ *mcp.CallToolRequest, input capture.ArchiveTaskRequest) (*mcp.CallToolResult, CaptureResult, error) {
+	if err := input.Validate(); err != nil {
+		return nil, CaptureResult{}, fmt.Errorf("invalid archive task request: %w", err)
+	}
+	task := capture.Request{
+		ArchiveTaskRequest: &input,
+	}
+	job, err := s.queue.Enqueue(ctx, task)
+	if err != nil {
+		return nil, CaptureResult{}, fmt.Errorf("queue task archive: %w", err)
+	}
+	result, err := s.waitForResult(ctx, job.ID, s.config.WaitForResult)
+	if err != nil {
+		return nil, CaptureResult{}, err
+	}
+	return nil, result, nil
+}
+
+func (s *service) archiveProject(ctx context.Context, _ *mcp.CallToolRequest, input capture.ArchiveProjectRequest) (*mcp.CallToolResult, CaptureResult, error) {
+	if err := input.Validate(); err != nil {
+		return nil, CaptureResult{}, fmt.Errorf("invalid archive project request: %w", err)
+	}
+	task := capture.Request{
+		ArchiveProjectRequest: &input,
+	}
+	job, err := s.queue.Enqueue(ctx, task)
+	if err != nil {
+		return nil, CaptureResult{}, fmt.Errorf("queue project archive: %w", err)
+	}
+	result, err := s.waitForResult(ctx, job.ID, s.config.WaitForResult)
+	if err != nil {
+		return nil, CaptureResult{}, err
+	}
+	return nil, result, nil
+}
+
+func (s *service) getToday(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, CaptureResult, error) {
+	task := capture.Request{
+		QueryTasksRequest: &capture.QueryTasksRequest{Scope: "today"},
+	}
+	job, err := s.queue.Enqueue(ctx, task)
+	if err != nil {
+		return nil, CaptureResult{}, fmt.Errorf("queue get today: %w", err)
+	}
+	result, err := s.waitForResult(ctx, job.ID, s.config.WaitForResult)
+	if err != nil {
+		return nil, CaptureResult{}, err
+	}
+	return nil, result, nil
+}
+
+func (s *service) getInbox(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, CaptureResult, error) {
+	task := capture.Request{
+		QueryTasksRequest: &capture.QueryTasksRequest{Scope: "inbox"},
+	}
+	job, err := s.queue.Enqueue(ctx, task)
+	if err != nil {
+		return nil, CaptureResult{}, fmt.Errorf("queue get inbox: %w", err)
+	}
+	result, err := s.waitForResult(ctx, job.ID, s.config.WaitForResult)
+	if err != nil {
+		return nil, CaptureResult{}, err
+	}
+	return nil, result, nil
+}
+
+func (s *service) listProjects(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, CaptureResult, error) {
+	task := capture.Request{
+		QueryTasksRequest: &capture.QueryTasksRequest{Scope: "projects"},
+	}
+	job, err := s.queue.Enqueue(ctx, task)
+	if err != nil {
+		return nil, CaptureResult{}, fmt.Errorf("queue list projects: %w", err)
+	}
+	result, err := s.waitForResult(ctx, job.ID, s.config.WaitForResult)
+	if err != nil {
+		return nil, CaptureResult{}, err
+	}
+	return nil, result, nil
+}
+
+func (s *service) searchTasks(ctx context.Context, _ *mcp.CallToolRequest, input capture.QueryTasksRequest) (*mcp.CallToolResult, CaptureResult, error) {
+	task := capture.Request{
+		QueryTasksRequest: &input,
+	}
+	job, err := s.queue.Enqueue(ctx, task)
+	if err != nil {
+		return nil, CaptureResult{}, fmt.Errorf("queue search tasks: %w", err)
+	}
+	result, err := s.waitForResult(ctx, job.ID, s.config.WaitForResult)
+	if err != nil {
+		return nil, CaptureResult{}, err
+	}
+	return nil, result, nil
+}
+
+func (s *service) createProject(ctx context.Context, _ *mcp.CallToolRequest, input capture.CreateProjectRequest) (*mcp.CallToolResult, CaptureResult, error) {
+	if err := input.Validate(); err != nil {
+		return nil, CaptureResult{}, fmt.Errorf("invalid create project request: %w", err)
+	}
+	task := capture.Request{
+		CreateProjectRequest: &input,
+	}
+	job, err := s.queue.Enqueue(ctx, task)
+	if err != nil {
+		return nil, CaptureResult{}, fmt.Errorf("queue create project: %w", err)
+	}
+	result, err := s.waitForResult(ctx, job.ID, s.config.WaitForResult)
+	if err != nil {
+		return nil, CaptureResult{}, err
+	}
+	return nil, result, nil
+}
+
+func (s *service) updateTask(ctx context.Context, _ *mcp.CallToolRequest, input capture.UpdateTaskRequest) (*mcp.CallToolResult, CaptureResult, error) {
+	if err := input.Validate(); err != nil {
+		return nil, CaptureResult{}, fmt.Errorf("invalid update task request: %w", err)
+	}
+	task := capture.Request{
+		UpdateTaskRequest: &input,
+	}
+	job, err := s.queue.Enqueue(ctx, task)
+	if err != nil {
+		return nil, CaptureResult{}, fmt.Errorf("queue update task: %w", err)
+	}
+	result, err := s.waitForResult(ctx, job.ID, s.config.WaitForResult)
+	if err != nil {
+		return nil, CaptureResult{}, err
+	}
+	return nil, result, nil
+}
+
 func (s *service) waitForResult(ctx context.Context, jobID string, duration time.Duration) (CaptureResult, error) {
 	deadline := time.NewTimer(duration)
 	defer deadline.Stop()
@@ -180,6 +418,13 @@ func (s *service) waitForResult(ctx context.Context, jobID string, duration time
 
 func captureResult(job queue.Job) CaptureResult {
 	result := CaptureResult{RequestID: job.ID, ThingsID: job.ThingsID, Warnings: job.Warnings}
+	if job.ThingsID != "" && (strings.HasPrefix(job.ThingsID, "[") || strings.HasPrefix(job.ThingsID, "{")) {
+		var d any
+		if err := json.Unmarshal([]byte(job.ThingsID), &d); err == nil {
+			result.Data = d
+			result.ThingsID = ""
+		}
+	}
 	switch job.State {
 	case queue.StateSucceeded:
 		result.Status = "created"
@@ -218,6 +463,10 @@ func (s *service) workerAPI(response http.ResponseWriter, request *http.Request)
 }
 
 func (s *service) lease(response http.ResponseWriter, request *http.Request) {
+	if _, err := s.queue.ExpireLeases(request.Context(), time.Now(), s.config.MaxAttempts); err != nil {
+		http.Error(response, "expire capture leases", http.StatusInternalServerError)
+		return
+	}
 	deadline := time.NewTimer(s.config.WorkerLongPoll)
 	defer deadline.Stop()
 	ticker := time.NewTicker(s.config.PollInterval)

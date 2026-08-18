@@ -167,3 +167,85 @@ func TestListRecentOrdersAndLimitsJobs(t *testing.T) {
 		t.Fatal("invalid recent job limit was accepted")
 	}
 }
+
+func TestQueueIdempotency(t *testing.T) {
+	t.Parallel()
+
+	store, err := Open(filepath.Join(t.TempDir(), "queue.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	first, err := store.Enqueue(ctx, capture.Request{Title: "Buy milk", IdempotencyKey: "key-123"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.Enqueue(ctx, capture.Request{Title: "Buy milk", IdempotencyKey: "key-123"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ID != second.ID {
+		t.Fatalf("expected identical job ID %q, got %q", first.ID, second.ID)
+	}
+
+	_, err = store.Enqueue(ctx, capture.Request{Title: "Buy tea", IdempotencyKey: "key-123"})
+	if err == nil {
+		t.Fatal("expected conflicting payload with same idempotency key to be rejected")
+	}
+}
+
+func TestQueueExpireLeasesCapsMaxAttempts(t *testing.T) {
+	t.Parallel()
+
+	store, err := Open(filepath.Join(t.TempDir(), "queue.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	job, err := store.Enqueue(ctx, capture.Request{Title: "Crash-prone task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC()
+	// Simulate 3 expired attempts with maxAttempts = 3
+	for i := 0; i < 3; i++ {
+		leased, ok, err := store.Lease(ctx, now, time.Second)
+		if err != nil || !ok {
+			t.Fatalf("lease attempt %d failed: ok=%v err=%v", i, ok, err)
+		}
+		if leased.ID != job.ID {
+			t.Fatalf("unexpected leased ID: %q", leased.ID)
+		}
+		now = now.Add(2 * time.Second)
+	}
+
+	expiredCount, err := store.ExpireLeases(ctx, now, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if expiredCount != 1 {
+		t.Fatalf("expiredCount = %d, want 1", expiredCount)
+	}
+
+	failedJob, err := store.Get(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failedJob.State != StateFailed || failedJob.LastError == "" {
+		t.Fatalf("expected job to be in failed state: %#v", failedJob)
+	}
+
+	// Should no longer be leaseable
+	_, ok, err := store.Lease(ctx, now, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("failed job should not be leaseable")
+	}
+}
