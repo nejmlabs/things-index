@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "operation": "rename-heading",
+  "project": "Example Project",
+  "heading": "Example Heading",
+  "title": "Renamed Heading"
+}

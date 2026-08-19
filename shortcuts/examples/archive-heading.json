@@ -1,0 +1,6 @@
+{
+  "schemaVersion": 1,
+  "operation": "archive-heading",
+  "project": "Example Project",
+  "heading": "Renamed Heading"
+}

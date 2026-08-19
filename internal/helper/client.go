@@ -39,9 +39,20 @@ type Client struct {
 	DBPath    string
 	AuthToken string
 	Timeout   time.Duration
-	Runner    CommandRunner
-	Location  *time.Location
-	Now       func() time.Time
+	// VerifyWindow bounds the SQLite polls that confirm a dispatched Things
+	// mutation actually landed; zero means the 5-second default.
+	VerifyWindow time.Duration
+	Runner       CommandRunner
+	Location     *time.Location
+	Now          func() time.Time
+}
+
+func (c *Client) verifyDeadline() time.Time {
+	window := c.VerifyWindow
+	if window <= 0 {
+		window = 5 * time.Second
+	}
+	return time.Now().Add(window)
 }
 
 type Response struct {
@@ -453,15 +464,83 @@ func validRequestID(value string) bool {
 	return err == nil
 }
 
+// helperShortcutName is the required library name of the bundled Shortcut;
+// the worker intentionally does not guess among renamed copies.
+const helperShortcutName = "ThingsIndex Helper"
+
+type shortcutResponse struct {
+	SchemaVersion int    `json:"schemaVersion"`
+	OK            bool   `json:"ok"`
+	ID            string `json:"id"`
+	Code          string `json:"code"`
+}
+
+// runHelperShortcut performs one JSON exchange with the ThingsIndex Helper
+// shortcut through Apple's shortcuts CLI. Heading mutations have no URL
+// scheme or AppleScript equivalent; the Shortcut's native Things App Intents
+// are the only automation surface that reaches them.
+func runHelperShortcut(ctx context.Context, runner CommandRunner, request map[string]any) (shortcutResponse, error) {
+	payload, err := json.Marshal(request)
+	if err != nil {
+		return shortcutResponse{}, fmt.Errorf("encode helper shortcut request: %w", err)
+	}
+	tempFile, err := os.CreateTemp("", "things-index-shortcut-*.json")
+	if err != nil {
+		return shortcutResponse{}, fmt.Errorf("create helper shortcut input file: %w", err)
+	}
+	tempPath := tempFile.Name()
+	defer os.Remove(tempPath)
+	if _, err := tempFile.Write(payload); err != nil {
+		tempFile.Close()
+		return shortcutResponse{}, fmt.Errorf("write helper shortcut input file: %w", err)
+	}
+	if err := tempFile.Close(); err != nil {
+		return shortcutResponse{}, fmt.Errorf("close helper shortcut input file: %w", err)
+	}
+
+	stdout, stderr, err := runner.Run(ctx, "/usr/bin/shortcuts", []string{
+		"run", helperShortcutName, "--input-path", tempPath, "--output-type", "public.json",
+	})
+	if err != nil {
+		detail := strings.TrimSpace(string(stderr))
+		if detail == "" {
+			detail = err.Error()
+		}
+		return shortcutResponse{}, fmt.Errorf("run the %q shortcut (install it with things-index worker --setup, or open shortcuts/ThingsIndex Helper.shortcut): %s", helperShortcutName, detail)
+	}
+	var response shortcutResponse
+	if err := json.Unmarshal(bytes.TrimSpace(stdout), &response); err != nil {
+		return shortcutResponse{}, fmt.Errorf("decode %q shortcut response %q: %w", helperShortcutName, strings.TrimSpace(string(stdout)), err)
+	}
+	if response.SchemaVersion != 1 {
+		return shortcutResponse{}, fmt.Errorf("unsupported %q shortcut response version %d", helperShortcutName, response.SchemaVersion)
+	}
+	if !response.OK {
+		code := response.Code
+		if code == "" {
+			code = "shortcut_failed"
+		}
+		return shortcutResponse{}, &OperationError{Code: code}
+	}
+	return response, nil
+}
+
+// canonicalTitle returns the exact stored title for a TMTask row so the
+// Shortcut's exact-match queries agree with our case-insensitive lookups.
+func canonicalTitle(ctx context.Context, db *sql.DB, uuid, fallback string) string {
+	var title string
+	if err := db.QueryRowContext(ctx, `SELECT title FROM TMTask WHERE uuid = ?`, uuid).Scan(&title); err == nil && title != "" {
+		return title
+	}
+	return fallback
+}
+
 func (c *Client) CreateHeading(ctx context.Context, project, headingTitle string) (Response, error) {
 	if strings.TrimSpace(project) == "" {
 		return Response{}, errors.New("project name is required")
 	}
 	if strings.TrimSpace(headingTitle) == "" {
 		return Response{}, errors.New("heading title is required")
-	}
-	if c.AuthToken == "" {
-		return Response{}, errors.New("Things authorization token is required for heading operations (set THINGS_INDEX_THINGS_AUTH_TOKEN)")
 	}
 	db, err := c.openDB(ctx)
 	if err != nil {
@@ -492,24 +571,23 @@ func (c *Client) CreateHeading(ctx context.Context, project, headingTitle string
 		wasRunning = true
 	}
 
-	// 3. Construct things:///json URL payload. The update operation targets the
-	// existing project by UUID and appends the heading to its items; without
-	// "operation":"update" Things would create a duplicate project instead.
-	jsonPayload := fmt.Sprintf(`[{"type":"project","operation":"update","id":%q,"attributes":{"items":[{"type":"heading","attributes":{"title":%q}}]}}]`, projectUUID, headingTitle)
-	encodedData := strings.ReplaceAll(url.QueryEscape(jsonPayload), "+", "%20")
-	addURL := fmt.Sprintf("things:///json?data=%s&reveal=false", encodedData)
-	if c.AuthToken != "" {
-		addURL += fmt.Sprintf("&auth-token=%s", url.QueryEscape(c.AuthToken))
+	// 3. Create the heading through the helper Shortcut's native Create
+	// Heading intent. The URL scheme cannot reach existing projects (a
+	// project's items array is create-specific), so the Shortcut is the only
+	// working path.
+	if _, err := runHelperShortcut(ctx, runner, map[string]any{
+		"schemaVersion": 1,
+		"operation":     "create-heading",
+		"project":       canonicalTitle(ctx, db, projectUUID, project),
+		"title":         headingTitle,
+	}); err != nil {
+		return Response{}, err
 	}
 
-	// 4. Dispatch URL
-	if _, _, err := runner.Run(ctx, "/usr/bin/open", []string{"-g", addURL}); err != nil {
-		return Response{}, fmt.Errorf("dispatch Things add-heading URL: %w", err)
-	}
-
-	// 5. Poll for created heading UUID
+	// 4. Poll for created heading UUID; the Shortcut's claim is only trusted
+	// once the row is visible in the Things database.
 	var headingUUID string
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := c.verifyDeadline()
 	for time.Now().Before(deadline) {
 		row := db.QueryRowContext(ctx, `SELECT uuid FROM TMTask WHERE type = 2 AND LOWER(title) = LOWER(?) AND project = ? AND trashed = 0 ORDER BY creationDate DESC LIMIT 1`, headingTitle, projectUUID)
 		if err := row.Scan(&headingUUID); err == nil && headingUUID != "" {
@@ -535,9 +613,6 @@ func (c *Client) ArchiveHeading(ctx context.Context, project, headingTitle strin
 	}
 	if strings.TrimSpace(headingTitle) == "" {
 		return Response{}, errors.New("heading title is required")
-	}
-	if c.AuthToken == "" {
-		return Response{}, errors.New("Things authorization token is required for archiving headings (set THINGS_INDEX_THINGS_AUTH_TOKEN)")
 	}
 	db, err := c.openDB(ctx)
 	if err != nil {
@@ -572,23 +647,22 @@ func (c *Client) ArchiveHeading(ctx context.Context, project, headingTitle strin
 		wasRunning = true
 	}
 
-	// Headings share the to-do model, so the documented update command with
-	// completed=true archives the heading row into the Logbook.
-	values := url.Values{}
-	values.Set("id", headingUUID)
-	values.Set("completed", "true")
-	values.Set("auth-token", c.AuthToken)
-	values.Set("reveal", "false")
-	updateURL := "things:///update?" + strings.ReplaceAll(values.Encode(), "+", "%20")
-
-	if _, _, err := runner.Run(ctx, "/usr/bin/open", []string{"-g", updateURL}); err != nil {
-		return Response{}, fmt.Errorf("dispatch Things update URL: %w", err)
+	// Complete the heading through the helper Shortcut's Edit Items status
+	// detail; the update URL command is specified for to-dos only and Things
+	// silently ignores it on heading rows.
+	if _, err := runHelperShortcut(ctx, runner, map[string]any{
+		"schemaVersion": 1,
+		"operation":     "archive-heading",
+		"project":       canonicalTitle(ctx, db, projectUUID, project),
+		"heading":       canonicalTitle(ctx, db, headingUUID, headingTitle),
+	}); err != nil {
+		return Response{}, err
 	}
 
-	// Verify the heading actually left the active project; open(1) exits 0
-	// even when Things rejects the command, so success must come from SQLite.
+	// Verify the heading actually left the active project; the Shortcut's
+	// claim is only trusted once the change is visible in SQLite.
 	archived := false
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := c.verifyDeadline()
 	for time.Now().Before(deadline) {
 		var status, trashed int
 		err := db.QueryRowContext(ctx, `SELECT status, trashed FROM TMTask WHERE uuid = ?`, headingUUID).Scan(&status, &trashed)
@@ -619,9 +693,6 @@ func (c *Client) RenameHeading(ctx context.Context, project, oldHeadingTitle, ne
 	}
 	if strings.TrimSpace(newHeadingTitle) == "" {
 		return Response{}, errors.New("new heading title is required")
-	}
-	if c.AuthToken == "" {
-		return Response{}, errors.New("Things authorization token is required for renaming headings (set THINGS_INDEX_THINGS_AUTH_TOKEN)")
 	}
 	db, err := c.openDB(ctx)
 	if err != nil {
@@ -656,23 +727,23 @@ func (c *Client) RenameHeading(ctx context.Context, project, oldHeadingTitle, ne
 		wasRunning = true
 	}
 
-	// Headings share the to-do model, so the documented update command renames
-	// the heading row by UUID.
-	values := url.Values{}
-	values.Set("id", headingUUID)
-	values.Set("title", newHeadingTitle)
-	values.Set("auth-token", c.AuthToken)
-	values.Set("reveal", "false")
-	updateURL := "things:///update?" + strings.ReplaceAll(values.Encode(), "+", "%20")
-
-	if _, _, err := runner.Run(ctx, "/usr/bin/open", []string{"-g", updateURL}); err != nil {
-		return Response{}, fmt.Errorf("dispatch Things update URL: %w", err)
+	// Rename the heading through the helper Shortcut's Edit Items title
+	// detail; the update URL command is specified for to-dos only and Things
+	// silently ignores it on heading rows.
+	if _, err := runHelperShortcut(ctx, runner, map[string]any{
+		"schemaVersion": 1,
+		"operation":     "rename-heading",
+		"project":       canonicalTitle(ctx, db, projectUUID, project),
+		"heading":       canonicalTitle(ctx, db, headingUUID, oldHeadingTitle),
+		"title":         newHeadingTitle,
+	}); err != nil {
+		return Response{}, err
 	}
 
-	// Verify the rename took effect; open(1) exits 0 even when Things rejects
-	// the command, so success must come from SQLite.
+	// Verify the rename took effect; the Shortcut's claim is only trusted
+	// once the change is visible in SQLite.
 	renamed := false
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := c.verifyDeadline()
 	for time.Now().Before(deadline) {
 		var currentTitle string
 		err := db.QueryRowContext(ctx, `SELECT title FROM TMTask WHERE uuid = ? AND trashed = 0`, headingUUID).Scan(&currentTitle)
@@ -1054,7 +1125,7 @@ func (c *Client) CreateProject(ctx context.Context, req capture.CreateProjectReq
 	}
 
 	var projectUUID string
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := c.verifyDeadline()
 	for time.Now().Before(deadline) {
 		row := db.QueryRowContext(ctx, `SELECT uuid FROM TMTask WHERE type = 1 AND LOWER(title) = LOWER(?) AND trashed = 0 ORDER BY creationDate DESC LIMIT 1`, req.Title)
 		if err := row.Scan(&projectUUID); err == nil && projectUUID != "" {

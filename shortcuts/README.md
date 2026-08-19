@@ -85,7 +85,10 @@ Return this dictionary:
   "capabilities": [
     "capture-task-v5",
     "find-capture-v1",
-    "finalise-capture-v1"
+    "finalise-capture-v1",
+    "create-heading-v1",
+    "rename-heading-v1",
+    "archive-heading-v1"
   ]
 }
 ```
@@ -193,6 +196,52 @@ Return:
 ```json
 {"schemaVersion":1,"ok":true}
 ```
+
+### `create-heading`
+
+```json
+{"schemaVersion":1,"operation":"create-heading","project":"Shopping","title":"Groceries"}
+```
+
+Resolve exactly one Project whose full title equals `project`
+(`destination_not_found` / `destination_ambiguous` otherwise). Then look for an
+existing heading with that exact title and the project's ID, limit `2`:
+
+- two matches: return `heading_ambiguous`;
+- one match: return its ID with `ok: true` — creation is idempotent, so worker
+  retries never duplicate headings; or
+- no matches: use Things' native `Create Heading` action with the direct
+  project query result, then re-resolve the heading by title and parent ID
+  (`create_failed` when it did not appear).
+
+Return:
+
+```json
+{"schemaVersion":1,"ok":true,"id":"things-heading-id"}
+```
+
+### `rename-heading`
+
+```json
+{"schemaVersion":1,"operation":"rename-heading","project":"Shopping","heading":"Groceries","title":"Weekly Groceries"}
+```
+
+Resolve the project, then exactly one heading with that full title and the
+project's ID (`heading_not_found` / `heading_ambiguous`). Use `Edit Items` to
+set its Title. The worker verifies the rename against the Things database
+before reporting success, so a silently ignored edit still fails honestly.
+Return the heading's ID as for `create-heading`.
+
+### `archive-heading`
+
+```json
+{"schemaVersion":1,"operation":"archive-heading","project":"Shopping","heading":"Groceries"}
+```
+
+Resolve the project and heading as for `rename-heading`, then use `Edit Items`
+to set Status to the literal `completed` value (Status, like Start, is a
+non-resolvable enumeration). The worker verifies the status change in the
+database. Return the heading's ID as for `create-heading`.
 
 ## Errors
 

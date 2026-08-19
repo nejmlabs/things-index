@@ -45,7 +45,7 @@ if @operation == "ping" {
         "WFContentItemLimitEnabled": true,
         "WFContentItemLimitNumber": 1
     })
-    output('{"schemaVersion":1,"ok":true,"capabilities":["capture-task-v5","find-capture-v1","finalise-capture-v1"]}')
+    output('{"schemaVersion":1,"ok":true,"capabilities":["capture-task-v5","find-capture-v1","finalise-capture-v1","create-heading-v1","rename-heading-v1","archive-heading-v1"]}')
 }
 
 // Find a pending capture by its exact, worker-generated temporary title. The
@@ -111,12 +111,23 @@ if @operation == "find-capture" {
         "WFVariableName": "matches",
         "WFSerializationType": "WFTextTokenAttachment"
     })
+    // Zero matches is the routine recovery result. Set Dictionary Value
+    // errors on an empty variable, so answer the empty case with literal
+    // JSON before building the dictionary response.
+    @matchCount = count(@matches)
+    if @matchCount == 0 {
+        output('{"schemaVersion":1,"ok":true,"ids":[]}')
+    }
     @ids = []
     for match in @matches {
         @matchId = "{@match['id']}"
         if @matchId {
             @ids += @matchId
         }
+    }
+    @idCount = count(@ids)
+    if @idCount == 0 {
+        output('{"schemaVersion":1,"ok":true,"ids":[]}')
     }
     @response = {"schemaVersion": 1, "ok": true}
     @responseWithIds = rawAction("is.workflow.actions.setvalueforkey", {
@@ -722,6 +733,575 @@ if @operation == "finalise-capture" {
         "title": "{@finalTitle}"
     })
     output('{"schemaVersion":1,"ok":true}')
+}
+
+// Create a heading inside an existing project. The Things URL scheme cannot
+// do this (a project's items array is create-specific), but the native
+// Create Heading App Intent takes an existing project entity. The operation
+// is idempotent: an existing heading with the requested title is reused, so
+// worker retries never duplicate headings.
+if @operation == "create-heading" {
+    @chProjectName = "{@request['project']}"
+    @chTitle = "{@request['title']}"
+    if !@chProjectName {
+        output('{"schemaVersion":1,"ok":false,"code":"invalid_request"}')
+    }
+    if !@chTitle {
+        output('{"schemaVersion":1,"ok":false,"code":"invalid_request"}')
+    }
+
+    @chProjects: array
+    rawAction("com.culturedcode.ThingsMac.TAIItemEntity", {
+        "UUID": "D5D174B5-39D3-4413-ABAD-15D4E3EA52D0",
+        "CustomOutputName": "ThingsIndex CH Projects",
+        "AppIntentDescriptor": {
+            "ActionRequiresAppInstallation": true,
+            "AppIntentIdentifier": "TAIItemEntity",
+            "BundleIdentifier": "com.culturedcode.ThingsMac",
+            "Name": "Things",
+            "TeamIdentifier": "JLMPQHK86H"
+        },
+        "WFContentItemFilter": {
+            "Value": {
+                "WFActionParameterFilterPrefix": 1,
+                "WFActionParameterFilterTemplates": [{
+                    "Operator": 4,
+                    "Property": "type",
+                    "Removable": true,
+                    "Values": {
+                        "Enumeration": {
+                            "Value": {
+                                "identifier": "project",
+                                "title": {"key": "Project"},
+                                "value": "project"
+                            },
+                            "WFSerializationType": "WFLinkDynamicOptionSubstitutableState"
+                        },
+                        "Unit": 4
+                    }
+                }, {
+                    "Operator": 4,
+                    "Property": "title",
+                    "Removable": true,
+                    "Values": {"String": "{@chProjectName}", "Unit": 4}
+                }],
+                "WFContentPredicateBoundedDate": false
+            },
+            "WFSerializationType": "WFContentPredicateTableTemplate"
+        },
+        "WFContentItemInputParameter": "Library",
+        "WFContentItemLimitEnabled": true,
+        "WFContentItemLimitNumber": 2
+    })
+    rawAction("is.workflow.actions.setvariable", {
+        "WFInput": {
+            "Value": {
+                "OutputName": "ThingsIndex CH Projects",
+                "OutputUUID": "D5D174B5-39D3-4413-ABAD-15D4E3EA52D0",
+                "Type": "ActionOutput"
+            },
+            "WFSerializationType": "WFTextTokenAttachment"
+        },
+        "WFVariableName": "chProjects",
+        "WFSerializationType": "WFTextTokenAttachment"
+    })
+    @chProjectCount = count(@chProjects)
+    if @chProjectCount == 0 {
+        output('{"schemaVersion":1,"ok":false,"code":"destination_not_found"}')
+    }
+    if @chProjectCount != 1 {
+        output('{"schemaVersion":1,"ok":false,"code":"destination_ambiguous"}')
+    }
+    for chProjectItem in @chProjects {
+        @chProjectId = "{@chProjectItem['id']}"
+    }
+
+    @chExisting: array
+    rawAction("com.culturedcode.ThingsMac.TAIItemEntity", {
+        "UUID": "090A59C5-6AEA-44D2-861E-C7FC36DDBB22",
+        "CustomOutputName": "ThingsIndex CH Existing",
+        "AppIntentDescriptor": {
+            "ActionRequiresAppInstallation": true,
+            "AppIntentIdentifier": "TAIItemEntity",
+            "BundleIdentifier": "com.culturedcode.ThingsMac",
+            "Name": "Things",
+            "TeamIdentifier": "JLMPQHK86H"
+        },
+        "WFContentItemFilter": {
+            "Value": {
+                "WFActionParameterFilterPrefix": 1,
+                "WFActionParameterFilterTemplates": [{
+                    "Operator": 4,
+                    "Property": "type",
+                    "Removable": true,
+                    "Values": {
+                        "Enumeration": {
+                            "Value": {
+                                "identifier": "heading",
+                                "title": {"key": "Heading"},
+                                "value": "heading"
+                            },
+                            "WFSerializationType": "WFLinkDynamicOptionSubstitutableState"
+                        },
+                        "Unit": 4
+                    }
+                }, {
+                    "Operator": 4,
+                    "Property": "title",
+                    "Removable": true,
+                    "Values": {"String": "{@chTitle}", "Unit": 4}
+                }, {
+                    "Operator": 4,
+                    "Property": "parentID",
+                    "Removable": true,
+                    "Values": {"String": "{@chProjectId}", "Unit": 4}
+                }],
+                "WFContentPredicateBoundedDate": false
+            },
+            "WFSerializationType": "WFContentPredicateTableTemplate"
+        },
+        "WFContentItemInputParameter": "Library",
+        "WFContentItemLimitEnabled": true,
+        "WFContentItemLimitNumber": 2
+    })
+    rawAction("is.workflow.actions.setvariable", {
+        "WFInput": {
+            "Value": {
+                "OutputName": "ThingsIndex CH Existing",
+                "OutputUUID": "090A59C5-6AEA-44D2-861E-C7FC36DDBB22",
+                "Type": "ActionOutput"
+            },
+            "WFSerializationType": "WFTextTokenAttachment"
+        },
+        "WFVariableName": "chExisting",
+        "WFSerializationType": "WFTextTokenAttachment"
+    })
+    @chExistingCount = count(@chExisting)
+    if @chExistingCount > 1 {
+        output('{"schemaVersion":1,"ok":false,"code":"heading_ambiguous"}')
+    }
+    if @chExistingCount == 1 {
+        @chHeadingId = ""
+        for chExistingItem in @chExisting {
+            @chHeadingId = "{@chExistingItem['id']}"
+        }
+        @chReuseResponse = {"schemaVersion": 1, "ok": true, "id": "{@chHeadingId}"}
+        @chReuseResponseText = getText(@chReuseResponse)
+        output(@chReuseResponseText)
+    }
+
+    rawAction("com.culturedcode.ThingsMac.TAIAddHeading", {
+        "UUID": "44C16FF3-9AD3-47DF-BFF0-84214AC928FA",
+        "AppIntentDescriptor": {"AppIntentIdentifier": "TAIAddHeading", "BundleIdentifier": "com.culturedcode.ThingsMac", "Name": "Things", "TeamIdentifier": "JLMPQHK86H"},
+        "ShowWhenRun": false, "title": "{@chTitle}",
+        "project": "${@chProjects}"
+    })
+
+    // Resolve the created heading by title and parent, mirroring how fresh
+    // captures re-resolve by pending title instead of trusting Create output.
+    @chCreated: array
+    rawAction("com.culturedcode.ThingsMac.TAIItemEntity", {
+        "UUID": "27F37990-387A-43E7-8F9D-70B47009F092",
+        "CustomOutputName": "ThingsIndex CH Created",
+        "AppIntentDescriptor": {
+            "ActionRequiresAppInstallation": true,
+            "AppIntentIdentifier": "TAIItemEntity",
+            "BundleIdentifier": "com.culturedcode.ThingsMac",
+            "Name": "Things",
+            "TeamIdentifier": "JLMPQHK86H"
+        },
+        "WFContentItemFilter": {
+            "Value": {
+                "WFActionParameterFilterPrefix": 1,
+                "WFActionParameterFilterTemplates": [{
+                    "Operator": 4,
+                    "Property": "type",
+                    "Removable": true,
+                    "Values": {
+                        "Enumeration": {
+                            "Value": {
+                                "identifier": "heading",
+                                "title": {"key": "Heading"},
+                                "value": "heading"
+                            },
+                            "WFSerializationType": "WFLinkDynamicOptionSubstitutableState"
+                        },
+                        "Unit": 4
+                    }
+                }, {
+                    "Operator": 4,
+                    "Property": "title",
+                    "Removable": true,
+                    "Values": {"String": "{@chTitle}", "Unit": 4}
+                }, {
+                    "Operator": 4,
+                    "Property": "parentID",
+                    "Removable": true,
+                    "Values": {"String": "{@chProjectId}", "Unit": 4}
+                }],
+                "WFContentPredicateBoundedDate": false
+            },
+            "WFSerializationType": "WFContentPredicateTableTemplate"
+        },
+        "WFContentItemInputParameter": "Library",
+        "WFContentItemLimitEnabled": true,
+        "WFContentItemLimitNumber": 2
+    })
+    rawAction("is.workflow.actions.setvariable", {
+        "WFInput": {
+            "Value": {
+                "OutputName": "ThingsIndex CH Created",
+                "OutputUUID": "27F37990-387A-43E7-8F9D-70B47009F092",
+                "Type": "ActionOutput"
+            },
+            "WFSerializationType": "WFTextTokenAttachment"
+        },
+        "WFVariableName": "chCreated",
+        "WFSerializationType": "WFTextTokenAttachment"
+    })
+    @chCreatedCount = count(@chCreated)
+    if @chCreatedCount == 0 {
+        output('{"schemaVersion":1,"ok":false,"code":"create_failed"}')
+    }
+    if @chCreatedCount != 1 {
+        output('{"schemaVersion":1,"ok":false,"code":"heading_ambiguous"}')
+    }
+    @chHeadingId = ""
+    for chCreatedItem in @chCreated {
+        @chHeadingId = "{@chCreatedItem['id']}"
+    }
+    if !@chHeadingId {
+        output('{"schemaVersion":1,"ok":false,"code":"create_failed"}')
+    }
+    @chResponse = {"schemaVersion": 1, "ok": true, "id": "{@chHeadingId}"}
+    @chResponseText = getText(@chResponse)
+    output(@chResponseText)
+}
+
+// Rename an existing heading via the native Edit Items title detail. The
+// worker verifies the rename against the Things database before reporting
+// success, so a silently ignored edit still fails honestly.
+if @operation == "rename-heading" {
+    @rhProjectName = "{@request['project']}"
+    @rhHeadingName = "{@request['heading']}"
+    @finalTitle = "{@request['title']}"
+    if !@rhProjectName {
+        output('{"schemaVersion":1,"ok":false,"code":"invalid_request"}')
+    }
+    if !@rhHeadingName {
+        output('{"schemaVersion":1,"ok":false,"code":"invalid_request"}')
+    }
+    if !@finalTitle {
+        output('{"schemaVersion":1,"ok":false,"code":"invalid_request"}')
+    }
+
+    @rhProjects: array
+    rawAction("com.culturedcode.ThingsMac.TAIItemEntity", {
+        "UUID": "48D4BC17-AD5C-47F9-9B1B-D411B3DC19AA",
+        "CustomOutputName": "ThingsIndex RH Projects",
+        "AppIntentDescriptor": {
+            "ActionRequiresAppInstallation": true,
+            "AppIntentIdentifier": "TAIItemEntity",
+            "BundleIdentifier": "com.culturedcode.ThingsMac",
+            "Name": "Things",
+            "TeamIdentifier": "JLMPQHK86H"
+        },
+        "WFContentItemFilter": {
+            "Value": {
+                "WFActionParameterFilterPrefix": 1,
+                "WFActionParameterFilterTemplates": [{
+                    "Operator": 4,
+                    "Property": "type",
+                    "Removable": true,
+                    "Values": {
+                        "Enumeration": {
+                            "Value": {
+                                "identifier": "project",
+                                "title": {"key": "Project"},
+                                "value": "project"
+                            },
+                            "WFSerializationType": "WFLinkDynamicOptionSubstitutableState"
+                        },
+                        "Unit": 4
+                    }
+                }, {
+                    "Operator": 4,
+                    "Property": "title",
+                    "Removable": true,
+                    "Values": {"String": "{@rhProjectName}", "Unit": 4}
+                }],
+                "WFContentPredicateBoundedDate": false
+            },
+            "WFSerializationType": "WFContentPredicateTableTemplate"
+        },
+        "WFContentItemInputParameter": "Library",
+        "WFContentItemLimitEnabled": true,
+        "WFContentItemLimitNumber": 2
+    })
+    rawAction("is.workflow.actions.setvariable", {
+        "WFInput": {
+            "Value": {
+                "OutputName": "ThingsIndex RH Projects",
+                "OutputUUID": "48D4BC17-AD5C-47F9-9B1B-D411B3DC19AA",
+                "Type": "ActionOutput"
+            },
+            "WFSerializationType": "WFTextTokenAttachment"
+        },
+        "WFVariableName": "rhProjects",
+        "WFSerializationType": "WFTextTokenAttachment"
+    })
+    @rhProjectCount = count(@rhProjects)
+    if @rhProjectCount == 0 {
+        output('{"schemaVersion":1,"ok":false,"code":"destination_not_found"}')
+    }
+    if @rhProjectCount != 1 {
+        output('{"schemaVersion":1,"ok":false,"code":"destination_ambiguous"}')
+    }
+    for rhProjectItem in @rhProjects {
+        @rhProjectId = "{@rhProjectItem['id']}"
+    }
+
+    @rhHeadings: array
+    rawAction("com.culturedcode.ThingsMac.TAIItemEntity", {
+        "UUID": "7D1E54FF-DDE4-4845-B24F-0264B8486AEF",
+        "CustomOutputName": "ThingsIndex RH Headings",
+        "AppIntentDescriptor": {
+            "ActionRequiresAppInstallation": true,
+            "AppIntentIdentifier": "TAIItemEntity",
+            "BundleIdentifier": "com.culturedcode.ThingsMac",
+            "Name": "Things",
+            "TeamIdentifier": "JLMPQHK86H"
+        },
+        "WFContentItemFilter": {
+            "Value": {
+                "WFActionParameterFilterPrefix": 1,
+                "WFActionParameterFilterTemplates": [{
+                    "Operator": 4,
+                    "Property": "type",
+                    "Removable": true,
+                    "Values": {
+                        "Enumeration": {
+                            "Value": {
+                                "identifier": "heading",
+                                "title": {"key": "Heading"},
+                                "value": "heading"
+                            },
+                            "WFSerializationType": "WFLinkDynamicOptionSubstitutableState"
+                        },
+                        "Unit": 4
+                    }
+                }, {
+                    "Operator": 4,
+                    "Property": "title",
+                    "Removable": true,
+                    "Values": {"String": "{@rhHeadingName}", "Unit": 4}
+                }, {
+                    "Operator": 4,
+                    "Property": "parentID",
+                    "Removable": true,
+                    "Values": {"String": "{@rhProjectId}", "Unit": 4}
+                }],
+                "WFContentPredicateBoundedDate": false
+            },
+            "WFSerializationType": "WFContentPredicateTableTemplate"
+        },
+        "WFContentItemInputParameter": "Library",
+        "WFContentItemLimitEnabled": true,
+        "WFContentItemLimitNumber": 2
+    })
+    rawAction("is.workflow.actions.setvariable", {
+        "WFInput": {
+            "Value": {
+                "OutputName": "ThingsIndex RH Headings",
+                "OutputUUID": "7D1E54FF-DDE4-4845-B24F-0264B8486AEF",
+                "Type": "ActionOutput"
+            },
+            "WFSerializationType": "WFTextTokenAttachment"
+        },
+        "WFVariableName": "rhHeadings",
+        "WFSerializationType": "WFTextTokenAttachment"
+    })
+    @rhHeadingCount = count(@rhHeadings)
+    if @rhHeadingCount == 0 {
+        output('{"schemaVersion":1,"ok":false,"code":"heading_not_found"}')
+    }
+    if @rhHeadingCount != 1 {
+        output('{"schemaVersion":1,"ok":false,"code":"heading_ambiguous"}')
+    }
+    @rhHeadingId = ""
+    for rhHeadingItem in @rhHeadings {
+        @rhHeadingId = "{@rhHeadingItem['id']}"
+    }
+
+    rawAction("com.culturedcode.ThingsMac.TAIEditItems", {
+        "UUID": "7202E99E-98D3-4290-917E-F87C6BAFDEDC",
+        "AppIntentDescriptor": {"AppIntentIdentifier": "TAIEditItems", "BundleIdentifier": "com.culturedcode.ThingsMac", "Name": "Things", "TeamIdentifier": "JLMPQHK86H"},
+        "ShowWhenRun": false, "detail": "title", "items": "${@rhHeadings}", "titleAction": "set", "title": "{@finalTitle}"
+    })
+    @rhResponse = {"schemaVersion": 1, "ok": true, "id": "{@rhHeadingId}"}
+    @rhResponseText = getText(@rhResponse)
+    output(@rhResponseText)
+}
+
+// Archive a heading by completing it via the native Edit Items status
+// detail. Status is a non-resolvable enumeration like Start, so the value
+// stays a literal. The worker verifies the status change in the database.
+if @operation == "archive-heading" {
+    @ahProjectName = "{@request['project']}"
+    @ahHeadingName = "{@request['heading']}"
+    if !@ahProjectName {
+        output('{"schemaVersion":1,"ok":false,"code":"invalid_request"}')
+    }
+    if !@ahHeadingName {
+        output('{"schemaVersion":1,"ok":false,"code":"invalid_request"}')
+    }
+
+    @ahProjects: array
+    rawAction("com.culturedcode.ThingsMac.TAIItemEntity", {
+        "UUID": "8A97E2DE-1E48-4B20-B73D-88E4F339382B",
+        "CustomOutputName": "ThingsIndex AH Projects",
+        "AppIntentDescriptor": {
+            "ActionRequiresAppInstallation": true,
+            "AppIntentIdentifier": "TAIItemEntity",
+            "BundleIdentifier": "com.culturedcode.ThingsMac",
+            "Name": "Things",
+            "TeamIdentifier": "JLMPQHK86H"
+        },
+        "WFContentItemFilter": {
+            "Value": {
+                "WFActionParameterFilterPrefix": 1,
+                "WFActionParameterFilterTemplates": [{
+                    "Operator": 4,
+                    "Property": "type",
+                    "Removable": true,
+                    "Values": {
+                        "Enumeration": {
+                            "Value": {
+                                "identifier": "project",
+                                "title": {"key": "Project"},
+                                "value": "project"
+                            },
+                            "WFSerializationType": "WFLinkDynamicOptionSubstitutableState"
+                        },
+                        "Unit": 4
+                    }
+                }, {
+                    "Operator": 4,
+                    "Property": "title",
+                    "Removable": true,
+                    "Values": {"String": "{@ahProjectName}", "Unit": 4}
+                }],
+                "WFContentPredicateBoundedDate": false
+            },
+            "WFSerializationType": "WFContentPredicateTableTemplate"
+        },
+        "WFContentItemInputParameter": "Library",
+        "WFContentItemLimitEnabled": true,
+        "WFContentItemLimitNumber": 2
+    })
+    rawAction("is.workflow.actions.setvariable", {
+        "WFInput": {
+            "Value": {
+                "OutputName": "ThingsIndex AH Projects",
+                "OutputUUID": "8A97E2DE-1E48-4B20-B73D-88E4F339382B",
+                "Type": "ActionOutput"
+            },
+            "WFSerializationType": "WFTextTokenAttachment"
+        },
+        "WFVariableName": "ahProjects",
+        "WFSerializationType": "WFTextTokenAttachment"
+    })
+    @ahProjectCount = count(@ahProjects)
+    if @ahProjectCount == 0 {
+        output('{"schemaVersion":1,"ok":false,"code":"destination_not_found"}')
+    }
+    if @ahProjectCount != 1 {
+        output('{"schemaVersion":1,"ok":false,"code":"destination_ambiguous"}')
+    }
+    for ahProjectItem in @ahProjects {
+        @ahProjectId = "{@ahProjectItem['id']}"
+    }
+
+    @ahHeadings: array
+    rawAction("com.culturedcode.ThingsMac.TAIItemEntity", {
+        "UUID": "B90BDC0A-6C67-4D54-80F7-FEE9473254C5",
+        "CustomOutputName": "ThingsIndex AH Headings",
+        "AppIntentDescriptor": {
+            "ActionRequiresAppInstallation": true,
+            "AppIntentIdentifier": "TAIItemEntity",
+            "BundleIdentifier": "com.culturedcode.ThingsMac",
+            "Name": "Things",
+            "TeamIdentifier": "JLMPQHK86H"
+        },
+        "WFContentItemFilter": {
+            "Value": {
+                "WFActionParameterFilterPrefix": 1,
+                "WFActionParameterFilterTemplates": [{
+                    "Operator": 4,
+                    "Property": "type",
+                    "Removable": true,
+                    "Values": {
+                        "Enumeration": {
+                            "Value": {
+                                "identifier": "heading",
+                                "title": {"key": "Heading"},
+                                "value": "heading"
+                            },
+                            "WFSerializationType": "WFLinkDynamicOptionSubstitutableState"
+                        },
+                        "Unit": 4
+                    }
+                }, {
+                    "Operator": 4,
+                    "Property": "title",
+                    "Removable": true,
+                    "Values": {"String": "{@ahHeadingName}", "Unit": 4}
+                }, {
+                    "Operator": 4,
+                    "Property": "parentID",
+                    "Removable": true,
+                    "Values": {"String": "{@ahProjectId}", "Unit": 4}
+                }],
+                "WFContentPredicateBoundedDate": false
+            },
+            "WFSerializationType": "WFContentPredicateTableTemplate"
+        },
+        "WFContentItemInputParameter": "Library",
+        "WFContentItemLimitEnabled": true,
+        "WFContentItemLimitNumber": 2
+    })
+    rawAction("is.workflow.actions.setvariable", {
+        "WFInput": {
+            "Value": {
+                "OutputName": "ThingsIndex AH Headings",
+                "OutputUUID": "B90BDC0A-6C67-4D54-80F7-FEE9473254C5",
+                "Type": "ActionOutput"
+            },
+            "WFSerializationType": "WFTextTokenAttachment"
+        },
+        "WFVariableName": "ahHeadings",
+        "WFSerializationType": "WFTextTokenAttachment"
+    })
+    @ahHeadingCount = count(@ahHeadings)
+    if @ahHeadingCount == 0 {
+        output('{"schemaVersion":1,"ok":false,"code":"heading_not_found"}')
+    }
+    if @ahHeadingCount != 1 {
+        output('{"schemaVersion":1,"ok":false,"code":"heading_ambiguous"}')
+    }
+    @ahHeadingId = ""
+    for ahHeadingItem in @ahHeadings {
+        @ahHeadingId = "{@ahHeadingItem['id']}"
+    }
+
+    rawAction("com.culturedcode.ThingsMac.TAIEditItems", {
+        "UUID": "B0E414DE-656F-440F-B9C1-5288E82A1662",
+        "AppIntentDescriptor": {"AppIntentIdentifier": "TAIEditItems", "BundleIdentifier": "com.culturedcode.ThingsMac", "Name": "Things", "TeamIdentifier": "JLMPQHK86H"},
+        "ShowWhenRun": false, "detail": "status", "items": "${@ahHeadings}", "statusAction": "set", "status": "completed"
+    })
+    @ahResponse = {"schemaVersion": 1, "ok": true, "id": "{@ahHeadingId}"}
+    @ahResponseText = getText(@ahResponse)
+    output(@ahResponseText)
 }
 
 output('{"schemaVersion":1,"ok":false,"code":"invalid_request"}')

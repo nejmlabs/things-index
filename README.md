@@ -57,9 +57,9 @@ For 24/7 homelab infrastructure where the MCP server runs on Linux and leases jo
 | `capture_things_task` | Write | Create a task in Inbox, Project, Area, or under a Heading with notes, tags, checklists, deadlines, and reminders. |
 | `create_things_project` | Write | Create a new project inside an Area with notes, tags, start schedule, and deadline. |
 | `update_things_task` | Write | Update an open task’s title or notes, reschedule it, or add deadlines, tags, and checklists (deadline/tags/checklist/non-today schedules need the Things auth token). |
-| `create_things_heading` | Write | Create a new section heading inside a project (requires the Things auth token). |
-| `rename_things_heading` | Write | Rename an existing section heading inside a project (requires the Things auth token; verified via SQLite before reporting success). |
-| `archive_things_heading` | Write | Archive a section heading from an active project (requires the Things auth token; verified via SQLite before reporting success). |
+| `create_things_heading` | Write | Create a new section heading inside an existing project (runs the bundled ThingsIndex Helper shortcut; idempotent, verified via SQLite before reporting success). |
+| `rename_things_heading` | Write | Rename an existing section heading inside a project (runs the bundled ThingsIndex Helper shortcut; verified via SQLite before reporting success). |
+| `archive_things_heading` | Write | Archive a section heading from an active project (runs the bundled ThingsIndex Helper shortcut; verified via SQLite before reporting success). |
 | `archive_things_task` | Write | Archive a task: mark `completed` (Logbook), `canceled` (Logbook), or move to `trash`. |
 | `archive_things_project` | Write | Archive an entire project: mark `completed` or `canceled`. |
 | `things_capture_status` | Read | Check async status of any queued operation via `request_id` (server mode only; stdio mode captures synchronously). |
@@ -67,7 +67,7 @@ For 24/7 homelab infrastructure where the MCP server runs on Linux and leases jo
 ---
 
 ## 🔒 Key Guarantees
-* **Zero-Prompt Execution**: Uses the official Things URL Scheme (`things:///add`, `add-project`, `update`) & read-only SQLite preflights. Task/project archiving falls back to AppleScript, which triggers macOS's one-time Automation permission grant on first use.
+* **Zero-Prompt Execution**: Uses the official Things URL Scheme (`things:///add`, `add-project`, `update`) & read-only SQLite preflights. Task/project archiving falls back to AppleScript, which triggers macOS's one-time Automation permission grant on first use. Heading operations run Things' native App Intents through the bundled signed **ThingsIndex Helper** shortcut — the only automation surface that reaches headings — after its one-time install and privacy grant (see `shortcuts/README.md`).
 * **Zero Foreground Steal**: Suppresses window focus and automatically quits Things 3 (no Dock dot) if it was closed before capture.
 * **Strictly Read-Only SQLite (`_query_only=1`)**: Never performs raw SQL writes to Cultured Code's database; Cultured Code's official engine handles writing and Things Cloud sync.
 * **Durable Queue**: In server mode, If the Mac is asleep or rebooting, tasks wait safely in the server queue and process immediately on wakeup.

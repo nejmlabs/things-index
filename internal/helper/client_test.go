@@ -3,8 +3,10 @@ package helper
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -329,5 +331,246 @@ func TestClientFinaliseCapture(t *testing.T) {
 	var opErr *OperationError
 	if !errors.As(err, &opErr) || opErr.Code != "finalise_not_found" {
 		t.Fatalf("expected finalise_not_found, got %v", err)
+	}
+}
+
+// scriptedRunner returns canned stdout per executable, so tests can exercise
+// the JSON exchange with the ThingsIndex Helper shortcut.
+type scriptedRunner struct {
+	calls   [][]string
+	handler func(executable string, args []string) ([]byte, []byte, error)
+}
+
+func (s *scriptedRunner) Run(_ context.Context, executable string, args []string) ([]byte, []byte, error) {
+	s.calls = append(s.calls, append([]string{executable}, args...))
+	if s.handler != nil {
+		return s.handler(executable, args)
+	}
+	return nil, nil, nil
+}
+
+func readShortcutInput(t *testing.T, args []string) map[string]any {
+	t.Helper()
+	if len(args) < 6 || args[0] != "run" || args[1] != helperShortcutName || args[2] != "--input-path" || args[4] != "--output-type" || args[5] != "public.json" {
+		t.Fatalf("unexpected shortcuts arguments: %v", args)
+	}
+	data, err := os.ReadFile(args[3])
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := map[string]any{}
+	if err := json.Unmarshal(data, &request); err != nil {
+		t.Fatal(err)
+	}
+	return request
+}
+
+func headingTestClient(t *testing.T, runner CommandRunner) (*Client, *sql.DB) {
+	t.Helper()
+	dbPath := setupTestThingsDB(t)
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if _, err := db.Exec(`INSERT INTO TMTask (uuid, type, title) VALUES ('proj-1', 1, 'Shopping')`); err != nil {
+		t.Fatal(err)
+	}
+	client := &Client{DBPath: dbPath, Runner: runner, VerifyWindow: 300 * time.Millisecond}
+	return client, db
+}
+
+func TestCreateHeadingRunsHelperShortcut(t *testing.T) {
+	t.Parallel()
+
+	var runner *scriptedRunner
+	var db *sql.DB
+	runner = &scriptedRunner{handler: func(executable string, args []string) ([]byte, []byte, error) {
+		switch executable {
+		case "/usr/bin/pgrep":
+			return nil, nil, nil // Things is running, so no quit follows
+		case "/usr/bin/shortcuts":
+			request := readShortcutInput(t, args)
+			if request["operation"] != "create-heading" || request["project"] != "Shopping" || request["title"] != "Groceries" {
+				t.Fatalf("unexpected shortcut request: %v", request)
+			}
+			if _, err := db.Exec(`INSERT INTO TMTask (uuid, type, title, project, creationDate) VALUES ('head-1', 2, 'Groceries', 'proj-1', 1)`); err != nil {
+				return nil, nil, err
+			}
+			return []byte(`{"schemaVersion":1,"ok":true,"id":"head-1"}`), nil, nil
+		}
+		t.Fatalf("unexpected executable %s", executable)
+		return nil, nil, nil
+	}}
+	client, database := headingTestClient(t, runner)
+	db = database
+
+	resp, err := client.CreateHeading(context.Background(), "shopping", "Groceries")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.OK || resp.ID != "head-1" {
+		t.Fatalf("unexpected response: %+v", resp)
+	}
+
+	// A retry reuses the existing heading without touching Shortcuts again.
+	shortcutCalls := len(runner.calls)
+	resp, err = client.CreateHeading(context.Background(), "Shopping", "groceries")
+	if err != nil || resp.ID != "head-1" {
+		t.Fatalf("idempotent retry: resp=%+v err=%v", resp, err)
+	}
+	if len(runner.calls) != shortcutCalls {
+		t.Fatalf("retry ran %d extra commands", len(runner.calls)-shortcutCalls)
+	}
+}
+
+func TestCreateHeadingFailsHonestlyWhenDatabaseUnchanged(t *testing.T) {
+	t.Parallel()
+
+	runner := &scriptedRunner{handler: func(executable string, args []string) ([]byte, []byte, error) {
+		if executable == "/usr/bin/shortcuts" {
+			// The shortcut claims success but nothing lands in the database.
+			return []byte(`{"schemaVersion":1,"ok":true,"id":"ghost"}`), nil, nil
+		}
+		return nil, nil, nil
+	}}
+	client, _ := headingTestClient(t, runner)
+
+	_, err := client.CreateHeading(context.Background(), "Shopping", "Groceries")
+	var opErr *OperationError
+	if !errors.As(err, &opErr) || opErr.Code != "create_failed" {
+		t.Fatalf("expected create_failed, got %v", err)
+	}
+}
+
+func TestRenameHeadingRunsHelperShortcut(t *testing.T) {
+	t.Parallel()
+
+	var runner *scriptedRunner
+	var db *sql.DB
+	runner = &scriptedRunner{handler: func(executable string, args []string) ([]byte, []byte, error) {
+		switch executable {
+		case "/usr/bin/pgrep":
+			return nil, nil, nil
+		case "/usr/bin/shortcuts":
+			request := readShortcutInput(t, args)
+			// Canonical stored titles are sent even when the caller used
+			// different letter case.
+			if request["operation"] != "rename-heading" || request["project"] != "Shopping" || request["heading"] != "Alpha" || request["title"] != "Beta" {
+				t.Fatalf("unexpected shortcut request: %v", request)
+			}
+			if _, err := db.Exec(`UPDATE TMTask SET title = 'Beta' WHERE uuid = 'head-1'`); err != nil {
+				return nil, nil, err
+			}
+			return []byte(`{"schemaVersion":1,"ok":true,"id":"head-1"}`), nil, nil
+		}
+		t.Fatalf("unexpected executable %s", executable)
+		return nil, nil, nil
+	}}
+	client, database := headingTestClient(t, runner)
+	db = database
+	if _, err := db.Exec(`INSERT INTO TMTask (uuid, type, title, project) VALUES ('head-1', 2, 'Alpha', 'proj-1')`); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := client.RenameHeading(context.Background(), "shopping", "alpha", "Beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.OK || resp.ID != "head-1" {
+		t.Fatalf("unexpected response: %+v", resp)
+	}
+}
+
+func TestRenameHeadingFailsHonestlyWhenDatabaseUnchanged(t *testing.T) {
+	t.Parallel()
+
+	runner := &scriptedRunner{handler: func(executable string, args []string) ([]byte, []byte, error) {
+		if executable == "/usr/bin/shortcuts" {
+			return []byte(`{"schemaVersion":1,"ok":true,"id":"head-1"}`), nil, nil
+		}
+		return nil, nil, nil
+	}}
+	client, db := headingTestClient(t, runner)
+	if _, err := db.Exec(`INSERT INTO TMTask (uuid, type, title, project) VALUES ('head-1', 2, 'Alpha', 'proj-1')`); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := client.RenameHeading(context.Background(), "Shopping", "Alpha", "Beta")
+	var opErr *OperationError
+	if !errors.As(err, &opErr) || opErr.Code != "rename_failed" {
+		t.Fatalf("expected rename_failed, got %v", err)
+	}
+}
+
+func TestArchiveHeadingRunsHelperShortcut(t *testing.T) {
+	t.Parallel()
+
+	var runner *scriptedRunner
+	var db *sql.DB
+	runner = &scriptedRunner{handler: func(executable string, args []string) ([]byte, []byte, error) {
+		switch executable {
+		case "/usr/bin/pgrep":
+			return nil, nil, nil
+		case "/usr/bin/shortcuts":
+			request := readShortcutInput(t, args)
+			if request["operation"] != "archive-heading" || request["project"] != "Shopping" || request["heading"] != "Alpha" {
+				t.Fatalf("unexpected shortcut request: %v", request)
+			}
+			if _, err := db.Exec(`UPDATE TMTask SET status = 3 WHERE uuid = 'head-1'`); err != nil {
+				return nil, nil, err
+			}
+			return []byte(`{"schemaVersion":1,"ok":true,"id":"head-1"}`), nil, nil
+		}
+		t.Fatalf("unexpected executable %s", executable)
+		return nil, nil, nil
+	}}
+	client, database := headingTestClient(t, runner)
+	db = database
+	if _, err := db.Exec(`INSERT INTO TMTask (uuid, type, title, project) VALUES ('head-1', 2, 'Alpha', 'proj-1')`); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := client.ArchiveHeading(context.Background(), "Shopping", "Alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.OK || resp.ID != "head-1" {
+		t.Fatalf("unexpected response: %+v", resp)
+	}
+}
+
+func TestHeadingOperationsSurfaceShortcutErrors(t *testing.T) {
+	t.Parallel()
+
+	runner := &scriptedRunner{handler: func(executable string, args []string) ([]byte, []byte, error) {
+		if executable == "/usr/bin/shortcuts" {
+			return []byte(`{"schemaVersion":1,"ok":false,"code":"heading_ambiguous"}`), nil, nil
+		}
+		return nil, nil, nil
+	}}
+	client, _ := headingTestClient(t, runner)
+
+	_, err := client.CreateHeading(context.Background(), "Shopping", "Groceries")
+	var opErr *OperationError
+	if !errors.As(err, &opErr) || opErr.Code != "heading_ambiguous" {
+		t.Fatalf("expected heading_ambiguous passthrough, got %v", err)
+	}
+}
+
+func TestHeadingOperationsExplainMissingShortcut(t *testing.T) {
+	t.Parallel()
+
+	runner := &scriptedRunner{handler: func(executable string, args []string) ([]byte, []byte, error) {
+		if executable == "/usr/bin/shortcuts" {
+			return nil, []byte(`shortcut "ThingsIndex Helper" does not exist`), errors.New("exit status 1")
+		}
+		return nil, nil, nil
+	}}
+	client, _ := headingTestClient(t, runner)
+
+	_, err := client.CreateHeading(context.Background(), "Shopping", "Groceries")
+	if err == nil || !strings.Contains(err.Error(), "worker --setup") {
+		t.Fatalf("expected install remediation in error, got %v", err)
 	}
 }

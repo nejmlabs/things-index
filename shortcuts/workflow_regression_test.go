@@ -224,6 +224,7 @@ func TestHelperSourceUsesExplicitEditDetails(t *testing.T) {
 		"notes":        "notesAction",
 		"checklist":    "checklistAction",
 		"title":        "titleAction",
+		"status":       "statusAction",
 	}
 	for detail, actionKey := range want {
 		found := false
@@ -256,7 +257,10 @@ func TestHelperSourceSelectsRetryAndFreshTasksWithoutEntityIDRequery(t *testing.
 	source := helperSource(t)
 	targets := make(map[string]bool)
 	for index, action := range rawActionBodies(t, source, editItemsAction) {
-		if strings.Contains(action, `"detail": "title"`) {
+		// Title edits (finalise, rename-heading) and status edits
+		// (archive-heading) target their own resolved entities, not the
+		// capture selected-task variable.
+		if strings.Contains(action, `"detail": "title"`) || strings.Contains(action, `"detail": "status"`) {
 			continue
 		}
 		target := sourceAttachedVariable(action, "items")
@@ -547,6 +551,7 @@ func validateEditActions(t *testing.T, actions []workflowAction) {
 		"notes":        {"notesAction", "notes", "notes"},
 		"checklist":    {"checklistAction", "checklist", "checklist"},
 		"title":        {"titleAction", "title", "finalTitle"},
+		"status":       {"statusAction", "status", ""},
 	}
 	found := make(map[string]bool)
 	startEnums := make(map[string]bool)
@@ -649,7 +654,7 @@ func validateDictionaryReads(t *testing.T, actions []workflowAction) {
 	t.Helper()
 
 	protocolKeys := map[string]bool{
-		"schemaVersion": true, "operation": true, "requestId": true, "task": true,
+		"schemaVersion": true, "operation": true, "requestId": true, "task": true, "project": true,
 		"title": true, "notes": true, "destination": true, "kind": true, "name": true, "heading": true,
 		"start": true, "startDate": true, "evening": true, "reminderTime": true, "deadline": true,
 		"startDayOffset": true, "reminderMinuteOffset": true, "deadlineDayOffset": true,
@@ -721,7 +726,7 @@ func validateSelectedTaskProvenance(t *testing.T, actions []workflowAction) {
 			continue
 		}
 		detail, _ := action.Parameters["detail"].(string)
-		if detail == "" || detail == "title" {
+		if detail == "" || detail == "title" || detail == "status" {
 			continue
 		}
 		name := attachedVariable(action.Parameters["items"])
