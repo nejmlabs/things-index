@@ -60,6 +60,12 @@ func Run(ctx context.Context) error {
 	}
 	log.Printf("Things 3 database OK")
 
+	if runtime.GOOS == "darwin" {
+		if err := ensureAutomationConsent(ctx, captureAdapter); err != nil {
+			return err
+		}
+	}
+
 	log.Printf("Connecting to server at %s...", serverURL)
 	serverClient, err := worker.NewClient(worker.ClientConfig{
 		BaseURL: serverURL,
@@ -150,6 +156,47 @@ func StateDirectory() (string, error) {
 		return filepath.Join(home, "Library", "Application Support", "ThingsIndex"), nil
 	}
 	return filepath.Join(home, ".local", "state", "things-index"), nil
+}
+
+// AutomationConsentMarkerPath returns the file recording that this worker has
+// already earned its Things 3 automation consent. Setup deletes it before
+// starting the daemon so a fresh install — or a rebuilt binary, which resets
+// TCC — re-runs the consent preflight as the daemon itself.
+func AutomationConsentMarkerPath() (string, error) {
+	stateDirectory, err := StateDirectory()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(stateDirectory, "automation-consent-granted"), nil
+}
+
+// ensureAutomationConsent runs the one-time Apple Events preflight against
+// Things 3. macOS attributes the consent to this process (under launchd the
+// daemon is its own TCC responsible process), so the setup wizard cannot earn
+// the grant on the worker's behalf — it only tells the user to expect the
+// dialog this raises.
+func ensureAutomationConsent(ctx context.Context, captureAdapter *helper.Client) error {
+	marker, err := AutomationConsentMarkerPath()
+	if err != nil {
+		return fmt.Errorf("resolve automation consent marker: %w", err)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		return nil
+	}
+	log.Printf("Requesting Things 3 automation consent (approve the macOS dialog)...")
+	preflightCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	if err := captureAdapter.AutomationPreflight(preflightCtx); err != nil {
+		return fmt.Errorf("automation preflight: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(marker), 0o700); err != nil {
+		return fmt.Errorf("create state directory: %w", err)
+	}
+	if err := os.WriteFile(marker, nil, 0o600); err != nil {
+		return fmt.Errorf("record automation consent: %w", err)
+	}
+	log.Printf("Things 3 automation consent granted")
+	return nil
 }
 
 func configuredJournalRetention() (time.Duration, error) {

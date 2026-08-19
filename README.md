@@ -41,9 +41,11 @@ For 24/7 homelab infrastructure where the MCP server runs on Linux and leases jo
    things-index worker --setup
    ```
    * Verifies the server connection **and** the worker token before installing anything.
-   * Optionally stores your Things URL-scheme auth token to unlock deadline/tag/checklist updates.
+   * Validates your optional Things auth token with a disposable test task (the token unlocks deadline/tag/checklist updates).
    * Auto-detects the Things 3 SQLite database and verifies read-only connectivity.
+   * Installs the bundled **ThingsIndex Helper** shortcut and settles its one-time privacy dialogs.
    * Installs a launchd LaunchAgent that starts at login, auto-restarts the worker if it crashes, and logs to `~/Library/Logs/ThingsIndex/`.
+   * Walks you through the two one-time macOS permission dialogs (data access + Things automation) so background operation stays prompt-free.
 
 ---
 

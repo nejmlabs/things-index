@@ -1,26 +1,28 @@
 # ThingsIndex Helper Shortcut
 
-`ThingsIndex Helper` is the only supported macOS capture adapter. The worker
-invokes it with Apple's built-in `shortcuts` command and exchanges versioned
-JSON files. No AppleScript or Things URL authorization token is used.
+`ThingsIndex Helper` is the worker's adapter for Things heading operations —
+create, rename, and archive run through the Shortcut's native Things App
+Intents because no URL-scheme or AppleScript surface reaches headings. The
+worker invokes it with Apple's built-in `shortcuts` command and exchanges
+versioned JSON files. (Captures use the Things URL scheme directly; the
+capture operations specified below remain implemented in the Shortcut, but
+the worker currently calls only `ping` and the three heading operations.)
 
 The Shortcut requires Things 3.17 or newer and macOS 14 or newer. It must be
-installed for the same logged-in user that runs `things-index-worker`.
+installed for the same logged-in user that runs the worker.
 
 ## Install
 
-The supported onboarding path is the worker's local setup GUI:
+The supported onboarding path is the worker setup wizard:
 
 ```sh
-things-index-worker --setup
+things-index worker --setup
 ```
 
-It opens a loopback-only page with **Install Shortcut**, **Verify Access**,
-**Test Capture**, and **Finish Setup** controls. The capture test creates one
-clearly labelled disposable Inbox task and verifies both Create and Edit before
-Finish is enabled. The page runs only for onboarding and exits after the test
-succeeds. The signed Shortcut is embedded in the worker, so this does not
-require another download or network request.
+The wizard installs the Shortcut from the copy embedded in the binary (no
+extra download or network request), waits for your one **Add Shortcut**
+click, then runs the `ping` operation once so the Shortcut's privacy dialogs
+are settled before the background worker ever needs it.
 
 On first use, macOS can present separate privacy dialogs for external
 dictionary input and for Things actions. Choose **Always Allow** during this
@@ -270,10 +272,10 @@ output, unsupported versions, and `ok: false` results.
 ## First-run verification
 
 The `ping` operation performs one harmless lookup for an impossible Things ID;
-it does not create or edit anything. The setup GUI's **Verify Access** button
-performs this check. Its subsequent **Test Capture** step creates and finalises
-one labelled disposable Inbox task so all routine action permissions are
-settled during onboarding.
+it does not create or edit anything. The setup wizard runs this check
+automatically right after installing the Shortcut, so its privacy grants are
+settled during deliberate onboarding rather than during the first background
+heading operation.
 
 For manual verification, run it once from Terminal and approve the Shortcut's
 Things access during this deliberate setup run:

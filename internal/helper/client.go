@@ -532,6 +532,54 @@ func runHelperShortcut(ctx context.Context, runner CommandRunner, request map[st
 	return response, nil
 }
 
+// PingHelperShortcut runs the bundled Shortcut's harmless ping operation (it
+// looks up one impossible Things ID) so setup can settle the Shortcut's
+// one-time privacy dialogs before the background worker needs it. Shortcut
+// privacy grants persist per shortcut, not per invoking process, so a grant
+// earned here covers later daemon runs.
+func (c *Client) PingHelperShortcut(ctx context.Context) error {
+	runner := c.Runner
+	if runner == nil {
+		runner = ExecRunner{}
+	}
+	_, err := runHelperShortcut(ctx, runner, map[string]any{
+		"schemaVersion": 1,
+		"operation":     "ping",
+	})
+	return err
+}
+
+// AutomationPreflight sends one benign Apple Event to Things 3 (a read-only
+// list count) so macOS raises the Automation consent dialog during a
+// deliberate setup moment instead of during the first background archive.
+// TCC attributes the grant to the calling process, so the worker daemon must
+// run this itself; a wizard-run preflight would only grant the terminal.
+func (c *Client) AutomationPreflight(ctx context.Context) error {
+	runner := c.Runner
+	if runner == nil {
+		runner = ExecRunner{}
+	}
+	wasRunning := false
+	if _, _, err := runner.Run(ctx, "/usr/bin/pgrep", []string{"-x", "Things3"}); err == nil {
+		wasRunning = true
+	} else {
+		// Launch hidden first so the Apple Event below does not surface a
+		// Things window.
+		_, _, _ = runner.Run(ctx, "/usr/bin/open", []string{"-g", "-j", "-a", "/Applications/Things3.app"})
+	}
+	// Counting lists is answered by the running app, unlike properties such
+	// as name or version that AppleScript resolves from the bundle without
+	// ever sending an Apple Event (which would not raise the consent dialog).
+	if _, _, err := runner.Run(ctx, "/usr/bin/osascript", []string{"-e", `tell application "Things3" to count of lists`}); err != nil {
+		return fmt.Errorf("Things 3 automation consent is missing or was denied (System Settings > Privacy & Security > Automation): %w", err)
+	}
+	if !wasRunning {
+		time.Sleep(100 * time.Millisecond)
+		_, _, _ = runner.Run(ctx, "/usr/bin/osascript", []string{"-e", `tell application "Things3" to quit`})
+	}
+	return nil
+}
+
 // canonicalTitle returns the exact stored title for a TMTask row so the
 // Shortcut's exact-match queries agree with our case-insensitive lookups.
 func canonicalTitle(ctx context.Context, db *sql.DB, uuid, fallback string) string {

@@ -765,6 +765,78 @@ func TestHeadingOperationsSurfaceShortcutErrors(t *testing.T) {
 	}
 }
 
+func TestPingHelperShortcut(t *testing.T) {
+	t.Parallel()
+
+	runner := &scriptedRunner{handler: func(executable string, args []string) ([]byte, []byte, error) {
+		if executable != "/usr/bin/shortcuts" {
+			t.Fatalf("unexpected executable %s", executable)
+		}
+		request := readShortcutInput(t, args)
+		if request["operation"] != "ping" || request["schemaVersion"] != float64(1) {
+			t.Fatalf("unexpected ping request: %v", request)
+		}
+		// The real ping response carries a capabilities array the client must
+		// tolerate without error.
+		return []byte(`{"schemaVersion":1,"ok":true,"capabilities":["create-heading-v1"]}`), nil, nil
+	}}
+
+	client := &Client{Runner: runner}
+	if err := client.PingHelperShortcut(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("expected exactly one shortcuts run, got %v", runner.calls)
+	}
+}
+
+func TestAutomationPreflight(t *testing.T) {
+	t.Parallel()
+
+	var runner *scriptedRunner
+	runner = &scriptedRunner{handler: func(executable string, args []string) ([]byte, []byte, error) {
+		switch executable {
+		case "/usr/bin/pgrep":
+			return nil, nil, errors.New("not running")
+		case "/usr/bin/open", "/usr/bin/osascript":
+			return nil, nil, nil
+		}
+		t.Fatalf("unexpected executable %s", executable)
+		return nil, nil, nil
+	}}
+
+	client := &Client{Runner: runner}
+	if err := client.AutomationPreflight(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Things was not running: expect launch, the consent-raising Apple Event,
+	// and the quit that restores the no-Dock-icon state.
+	if len(runner.calls) != 4 {
+		t.Fatalf("unexpected command sequence: %v", runner.calls)
+	}
+	if runner.calls[1][0] != "/usr/bin/open" || !strings.Contains(strings.Join(runner.calls[2], " "), "count of lists") ||
+		!strings.Contains(strings.Join(runner.calls[3], " "), "quit") {
+		t.Fatalf("unexpected command sequence: %v", runner.calls)
+	}
+}
+
+func TestAutomationPreflightSurfacesDenial(t *testing.T) {
+	t.Parallel()
+
+	runner := &scriptedRunner{handler: func(executable string, args []string) ([]byte, []byte, error) {
+		if executable == "/usr/bin/osascript" {
+			return nil, nil, errors.New("execution error: Not authorized to send Apple events to Things3. (-1743)")
+		}
+		return nil, nil, nil
+	}}
+
+	client := &Client{Runner: runner}
+	err := client.AutomationPreflight(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "Automation") {
+		t.Fatalf("expected consent-denial guidance, got %v", err)
+	}
+}
+
 func TestHeadingOperationsExplainMissingShortcut(t *testing.T) {
 	t.Parallel()
 

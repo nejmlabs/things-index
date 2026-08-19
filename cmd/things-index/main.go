@@ -30,6 +30,7 @@ import (
 	"github.com/nejmlabs/things-index/internal/serverapp"
 	"github.com/nejmlabs/things-index/internal/worker"
 	"github.com/nejmlabs/things-index/internal/workerapp"
+	shortcutasset "github.com/nejmlabs/things-index/shortcuts"
 )
 
 const version = "0.2.0"
@@ -687,7 +688,67 @@ func runWorkerSetup() error {
 	}
 	fmt.Println("  ✓ Things 3 database query verified (Read-Only OK)")
 
-	// 8. Install Background Launcher Script (carries the secrets, hence 0700)
+	// 8. Validate the Things auth token by creating and finalising one
+	// disposable task through the URL scheme; a bad token fails here
+	// (finalise_unverified) instead of raising Things error dialogs during
+	// background operation. Things is pre-launched hidden so the capture path
+	// never reaches its quit-on-exit AppleScript — that automation dialog
+	// must belong to the daemon, not this terminal.
+	if thingsAuthToken != "" {
+		fmt.Println("• Validating the Things auth token with a disposable test task...")
+		_ = exec.Command("/usr/bin/open", "-g", "-j", "-a", "/Applications/Things3.app").Run()
+		for attempt := 0; attempt < 20; attempt++ {
+			if exec.Command("/usr/bin/pgrep", "-x", "Things3").Run() == nil {
+				break
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+		time.Sleep(time.Second)
+
+		verifier := helper.NewClient(thingsAuthToken)
+		verifier.DBPath = thingsDB
+		testCtx, cancelTest := context.WithTimeout(context.Background(), 45*time.Second)
+		defer cancelTest()
+		const testTitle = "ThingsIndex setup test — safe to delete"
+		testID := randomHex(16)
+		_, err := verifier.Capture(testCtx, testID, capture.Request{
+			Title: testTitle,
+			Notes: "Created by things-index worker --setup to validate the Things auth token.",
+		})
+		if err != nil {
+			// A slow first launch can outlast the capture poll; reconcile the
+			// pending task the same way the worker does before giving up.
+			time.Sleep(3 * time.Second)
+			if ids, findErr := verifier.FindCapture(testCtx, testID); findErr == nil && len(ids) == 1 {
+				err = verifier.FinaliseCapture(testCtx, ids[0], testTitle)
+			}
+		}
+		if err != nil {
+			return fmt.Errorf("the Things auth token failed validation (copy it from Things > Settings > General > Enable Things URLs > Manage): %w", err)
+		}
+		fmt.Printf("  ✓ Token verified; delete the Inbox task %q when convenient.\n", testTitle)
+	}
+
+	// 9. Install the bundled ThingsIndex Helper shortcut — heading operations
+	// run through it, and Apple's CLI cannot install shortcuts silently, so
+	// this needs one click in the Shortcuts app.
+	if err := installHelperShortcut(); err != nil {
+		return err
+	}
+
+	// 10. Settle the Shortcut's one-time privacy dialogs now via its harmless
+	// ping; the grants are stored per shortcut, so they cover the daemon's
+	// runs too.
+	fmt.Println("• Verifying the helper shortcut (choose “Always Allow” on any privacy dialogs)...")
+	shortcutCtx, cancelShortcut := context.WithTimeout(context.Background(), 3*time.Minute)
+	err = captureAdapter.PingHelperShortcut(shortcutCtx)
+	cancelShortcut()
+	if err != nil {
+		return fmt.Errorf("the helper shortcut did not answer its ping (approve its privacy dialogs and rerun the wizard): %w", err)
+	}
+	fmt.Println("  ✓ Helper shortcut verified; its privacy grants are settled.")
+
+	// 11. Install Background Launcher Script (carries the secrets, hence 0700)
 	home, _ := os.UserHomeDir()
 	binDir := filepath.Join(home, ".local", "bin")
 	_ = os.MkdirAll(binDir, 0o755)
@@ -704,7 +765,7 @@ func runWorkerSetup() error {
 	}
 	fmt.Printf("  ✓ Created launcher script: %s\n", launcherScript)
 
-	// 9. Install the LaunchAgent: starts at login, KeepAlive restarts the
+	// 12. Install the LaunchAgent: starts at login, KeepAlive restarts the
 	// worker if it ever crashes, and logs land in ~/Library/Logs/ThingsIndex.
 	logDir := filepath.Join(home, "Library", "Logs", "ThingsIndex")
 	_ = os.MkdirAll(logDir, 0o755)
@@ -718,9 +779,17 @@ func runWorkerSetup() error {
 	}
 	fmt.Printf("  ✓ Created LaunchAgent: %s\n", plistPath)
 
-	// 10. Replace any previous install (LaunchAgent or the cron+screen
-	// mechanism earlier wizard versions used) and start the agent.
+	// 13. Replace any previous install (LaunchAgent or the cron+screen
+	// mechanism earlier wizard versions used) and start the agent. Deleting
+	// the consent marker forces the daemon to re-run its automation
+	// preflight, so the Things 3 grant lands on this (possibly rebuilt)
+	// binary rather than being assumed from an older install.
+	if markerPath, err := workerapp.AutomationConsentMarkerPath(); err == nil {
+		_ = os.Remove(markerPath)
+	}
 	fmt.Println("• Starting background worker via launchd...")
+	fmt.Println("  macOS will show up to two permission dialogs for “things-index” —")
+	fmt.Println("  “access data from other apps” and “control Things3”. Approve both.")
 	domainTarget := fmt.Sprintf("gui/%d", os.Getuid())
 	_ = exec.Command("launchctl", "bootout", domainTarget+"/"+workerLaunchAgentLabel).Run()
 	_ = exec.Command("/bin/sh", "-c", `(crontab -l 2>/dev/null | grep -v "things-worker") | crontab - 2>/dev/null || true`).Run()
@@ -730,22 +799,38 @@ func runWorkerSetup() error {
 		return fmt.Errorf("start LaunchAgent in %s: %w: %s", domainTarget, err, strings.TrimSpace(string(output)))
 	}
 
-	// 11. Confirm the worker is actually running before declaring success.
-	// macOS pgrep excludes this wizard (an ancestor), so only the daemon
-	// matches.
+	// 14. Confirm the worker is running AND has recorded its automation
+	// consent before declaring success. macOS pgrep excludes this wizard (an
+	// ancestor), so only the daemon matches.
+	fmt.Println("• Waiting for the worker to start and record its automation consent...")
+	markerPath, markerErr := workerapp.AutomationConsentMarkerPath()
 	running := false
-	for attempt := 0; attempt < 10; attempt++ {
-		time.Sleep(500 * time.Millisecond)
-		if exec.Command("/usr/bin/pgrep", "-f", "things-index worker").Run() == nil {
-			running = true
+	consented := false
+	deadline := time.Now().Add(3 * time.Minute)
+	for time.Now().Before(deadline) {
+		time.Sleep(2 * time.Second)
+		running = exec.Command("/usr/bin/pgrep", "-f", "things-index worker").Run() == nil
+		if markerErr == nil {
+			if _, err := os.Stat(markerPath); err == nil {
+				consented = true
+			}
+		}
+		if running && consented {
 			break
 		}
 	}
 
 	fmt.Println()
-	if !running {
+	if !running || !consented {
 		fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-		fmt.Println("  ⚠️  Setup finished, but the worker has not been seen running yet.")
+		fmt.Println("  ⚠️  Setup finished, but the worker is not fully confirmed yet.")
+		if !running {
+			fmt.Println("  • The worker process has not been seen running.")
+		}
+		if !consented {
+			fmt.Println("  • Things 3 automation consent has not been recorded — approve")
+			fmt.Println("    the “control Things3” dialog if it is still on screen.")
+		}
 		fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 		fmt.Printf("  • Check logs:   %s\n", filepath.Join(logDir, "worker-error.log"))
 		fmt.Printf("  • Check status: launchctl print %s/%s\n", domainTarget, workerLaunchAgentLabel)
@@ -759,11 +844,55 @@ func runWorkerSetup() error {
 	fmt.Printf("  • Things Database: %s\n", thingsDB)
 	fmt.Printf("  • LaunchAgent:     %s (starts at login, auto-restarts)\n", workerLaunchAgentLabel)
 	fmt.Printf("  • Logs:            %s\n", logDir)
+	fmt.Println("  • Permissions:     data access, Things automation, and Shortcut")
+	fmt.Println("                     privacy grants are all settled.")
 	fmt.Println("────────────────────────────────────────────────────────────")
 	fmt.Println("  The worker is now actively listening in the background")
 	fmt.Println("  and processes jobs prompt-free.")
 	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 	return nil
+}
+
+// installHelperShortcut puts the embedded signed shortcut into the user's
+// library. Apple's shortcuts CLI cannot install (only run/list/view/sign), so
+// this opens the import dialog and waits for the user's one Add click.
+func installHelperShortcut() error {
+	if helperShortcutInstalled() {
+		fmt.Printf("  ✓ %q shortcut already installed.\n", helper.HelperShortcutName)
+		return nil
+	}
+	fmt.Println("• Installing the ThingsIndex Helper shortcut...")
+	tempFile, err := os.CreateTemp("", "ThingsIndex Helper-*.shortcut")
+	if err != nil {
+		return fmt.Errorf("stage helper shortcut: %w", err)
+	}
+	tempPath := tempFile.Name()
+	defer os.Remove(tempPath)
+	if _, err := tempFile.Write(shortcutasset.Helper()); err != nil {
+		tempFile.Close()
+		return fmt.Errorf("write helper shortcut: %w", err)
+	}
+	if err := tempFile.Close(); err != nil {
+		return fmt.Errorf("close helper shortcut: %w", err)
+	}
+	if err := exec.Command("/usr/bin/open", tempPath).Run(); err != nil {
+		return fmt.Errorf("open helper shortcut in Shortcuts: %w", err)
+	}
+	fmt.Println("  Shortcuts opened an import dialog — click “Add Shortcut”. Waiting...")
+	deadline := time.Now().Add(3 * time.Minute)
+	for time.Now().Before(deadline) {
+		if helperShortcutInstalled() {
+			fmt.Printf("  ✓ %q shortcut installed.\n", helper.HelperShortcutName)
+			return nil
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return fmt.Errorf("the %q shortcut did not appear within 3 minutes; click “Add Shortcut” in the Shortcuts app and rerun the wizard", helper.HelperShortcutName)
+}
+
+func helperShortcutInstalled() bool {
+	output, err := exec.Command("/usr/bin/shortcuts", "list").Output()
+	return err == nil && slices.Contains(strings.Split(string(output), "\n"), helper.HelperShortcutName)
 }
 
 // buildLauncherScript renders the launcher launchd runs. It carries the
@@ -856,8 +985,7 @@ func runUninstall() error {
 		// CLI has no delete command, TCC automation grants have no safe
 		// per-app reset, and the binary is the program running right now.
 		var manual []string
-		if output, err := exec.Command("/usr/bin/shortcuts", "list").Output(); err == nil &&
-			slices.Contains(strings.Split(string(output), "\n"), helper.HelperShortcutName) {
+		if helperShortcutInstalled() {
 			manual = append(manual, fmt.Sprintf("Delete %q in the Shortcuts app — Apple's shortcuts CLI cannot remove shortcuts.", helper.HelperShortcutName))
 		}
 		manual = append(manual, "If you granted automation access to Things 3, revoke it under System Settings > Privacy & Security > Automation.")

@@ -1,11 +1,15 @@
 package workerapp
 
 import (
+	"context"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/nejmlabs/things-index/internal/helper"
 )
 
 func TestConfiguredJournalRetention(t *testing.T) {
@@ -60,5 +64,43 @@ func TestJournalPathOverride(t *testing.T) {
 	}
 	if path != "/tmp/custom-journal.sqlite" {
 		t.Fatalf("journal path = %s", path)
+	}
+}
+
+type consentRunner struct{ calls int }
+
+func (r *consentRunner) Run(context.Context, string, []string) ([]byte, []byte, error) {
+	r.calls++
+	return nil, nil, nil
+}
+
+func TestEnsureAutomationConsentRunsOnce(t *testing.T) {
+	t.Setenv("THINGS_INDEX_STATE_DIR", t.TempDir())
+
+	runner := &consentRunner{}
+	captureAdapter := &helper.Client{Runner: runner}
+
+	if err := ensureAutomationConsent(context.Background(), captureAdapter); err != nil {
+		t.Fatal(err)
+	}
+	// pgrep reports Things running, so the preflight is pgrep + one Apple
+	// Event with no launch or quit.
+	if runner.calls != 2 {
+		t.Fatalf("preflight ran %d commands, want 2", runner.calls)
+	}
+	marker, err := AutomationConsentMarkerPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("consent marker was not recorded: %v", err)
+	}
+
+	// The recorded marker suppresses any further preflight.
+	if err := ensureAutomationConsent(context.Background(), captureAdapter); err != nil {
+		t.Fatal(err)
+	}
+	if runner.calls != 2 {
+		t.Fatalf("preflight re-ran despite marker: %d commands", runner.calls)
 	}
 }
