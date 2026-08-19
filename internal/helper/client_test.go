@@ -558,7 +558,7 @@ func (s *scriptedRunner) Run(_ context.Context, executable string, args []string
 
 func readShortcutInput(t *testing.T, args []string) map[string]any {
 	t.Helper()
-	if len(args) < 6 || args[0] != "run" || args[1] != helperShortcutName || args[2] != "--input-path" || args[4] != "--output-type" || args[5] != "public.json" {
+	if len(args) < 6 || args[0] != "run" || args[1] != HelperShortcutName || args[2] != "--input-path" || args[4] != "--output-type" || args[5] != "public.json" {
 		t.Fatalf("unexpected shortcuts arguments: %v", args)
 	}
 	data, err := os.ReadFile(args[3])

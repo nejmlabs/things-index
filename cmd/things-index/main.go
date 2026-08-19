@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -851,9 +852,27 @@ func runUninstall() error {
 		fmt.Println("• Removing Logs...")
 		_ = os.RemoveAll(filepath.Join(home, "Library", "Logs", "ThingsIndex"))
 
+		// The pieces an uninstaller cannot remove itself: Apple's shortcuts
+		// CLI has no delete command, TCC automation grants have no safe
+		// per-app reset, and the binary is the program running right now.
+		var manual []string
+		if output, err := exec.Command("/usr/bin/shortcuts", "list").Output(); err == nil &&
+			slices.Contains(strings.Split(string(output), "\n"), helper.HelperShortcutName) {
+			manual = append(manual, fmt.Sprintf("Delete %q in the Shortcuts app — Apple's shortcuts CLI cannot remove shortcuts.", helper.HelperShortcutName))
+		}
+		manual = append(manual, "If you granted automation access to Things 3, revoke it under System Settings > Privacy & Security > Automation.")
+		if exePath, err := os.Executable(); err == nil {
+			manual = append(manual, "Delete this binary when done: rm "+shellQuote(exePath))
+		}
+
 		fmt.Println()
 		fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-		fmt.Println("  ✓ ThingsIndex has been completely removed from this Mac.")
+		fmt.Println("  ✓ ThingsIndex has been removed from this Mac.")
+		fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+		fmt.Println("  Final manual steps for a zero-trace machine:")
+		for _, step := range manual {
+			fmt.Printf("  • %s\n", step)
+		}
 		fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 		return nil
 	}
@@ -872,6 +891,9 @@ func runUninstall() error {
 	fmt.Println()
 	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 	fmt.Println("  ✓ ThingsIndex Server has been completely removed.")
+	if exePath, err := os.Executable(); err == nil {
+		fmt.Printf("  • Delete this binary when done: rm %s\n", shellQuote(exePath))
+	}
 	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 	return nil
 }

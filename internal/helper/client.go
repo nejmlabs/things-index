@@ -471,9 +471,9 @@ func macEpochSeconds(t time.Time) float64 {
 	return t.UTC().Sub(time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC)).Seconds()
 }
 
-// helperShortcutName is the required library name of the bundled Shortcut;
+// HelperShortcutName is the required library name of the bundled Shortcut;
 // the worker intentionally does not guess among renamed copies.
-const helperShortcutName = "ThingsIndex Helper"
+const HelperShortcutName = "ThingsIndex Helper"
 
 type shortcutResponse struct {
 	SchemaVersion int    `json:"schemaVersion"`
@@ -506,21 +506,21 @@ func runHelperShortcut(ctx context.Context, runner CommandRunner, request map[st
 	}
 
 	stdout, stderr, err := runner.Run(ctx, "/usr/bin/shortcuts", []string{
-		"run", helperShortcutName, "--input-path", tempPath, "--output-type", "public.json",
+		"run", HelperShortcutName, "--input-path", tempPath, "--output-type", "public.json",
 	})
 	if err != nil {
 		detail := strings.TrimSpace(string(stderr))
 		if detail == "" {
 			detail = err.Error()
 		}
-		return shortcutResponse{}, fmt.Errorf("run the %q shortcut (install it with things-index worker --setup, or open shortcuts/ThingsIndex Helper.shortcut): %s", helperShortcutName, detail)
+		return shortcutResponse{}, fmt.Errorf("run the %q shortcut (install it with things-index worker --setup, or open shortcuts/ThingsIndex Helper.shortcut): %s", HelperShortcutName, detail)
 	}
 	var response shortcutResponse
 	if err := json.Unmarshal(bytes.TrimSpace(stdout), &response); err != nil {
-		return shortcutResponse{}, fmt.Errorf("decode %q shortcut response %q: %w", helperShortcutName, strings.TrimSpace(string(stdout)), err)
+		return shortcutResponse{}, fmt.Errorf("decode %q shortcut response %q: %w", HelperShortcutName, strings.TrimSpace(string(stdout)), err)
 	}
 	if response.SchemaVersion != 1 {
-		return shortcutResponse{}, fmt.Errorf("unsupported %q shortcut response version %d", helperShortcutName, response.SchemaVersion)
+		return shortcutResponse{}, fmt.Errorf("unsupported %q shortcut response version %d", HelperShortcutName, response.SchemaVersion)
 	}
 	if !response.OK {
 		code := response.Code
