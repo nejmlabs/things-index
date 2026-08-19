@@ -71,6 +71,30 @@ func isLiteralLoopback(host string) bool {
 	return err == nil && address.IsLoopback()
 }
 
+// ErrUnauthorized reports that the server rejected the worker token.
+var ErrUnauthorized = errors.New("the server rejected the worker token")
+
+// Ping verifies connectivity and the worker token against the server's
+// authenticated worker API without touching the queue.
+func (c *Client) Ping(ctx context.Context) error {
+	request, err := c.newRequest(ctx, http.MethodGet, "/worker/v1/ping", nil)
+	if err != nil {
+		return err
+	}
+	response, err := c.httpClient.Do(request)
+	if err != nil {
+		return fmt.Errorf("ping worker API: %w", err)
+	}
+	defer response.Body.Close()
+	switch response.StatusCode {
+	case http.StatusNoContent, http.StatusOK:
+		return nil
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return ErrUnauthorized
+	}
+	return responseError("ping worker API", response)
+}
+
 // Lease waits for the server to assign a job. A nil lease means the long poll
 // completed normally without work.
 func (c *Client) Lease(ctx context.Context) (*Lease, error) {

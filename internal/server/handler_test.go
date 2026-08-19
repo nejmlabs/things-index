@@ -121,6 +121,42 @@ func TestBearerTokensAreSeparated(t *testing.T) {
 	}
 }
 
+func TestWorkerPing(t *testing.T) {
+	store, err := queue.Open(filepath.Join(t.TempDir(), "queue.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	handler, err := NewHandler(store, Config{PublicToken: testPublicToken, WorkerToken: testWorkerToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/worker/v1/ping", nil)
+	request.Header.Set("Authorization", "Bearer "+testWorkerToken)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("worker ping status = %d, want %d", response.Code, http.StatusNoContent)
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "/worker/v1/ping", nil)
+	request.Header.Set("Authorization", "Bearer "+testPublicToken)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("public token pinged worker API: status %d", response.Code)
+	}
+
+	request = httptest.NewRequest(http.MethodPost, "/worker/v1/ping", nil)
+	request.Header.Set("Authorization", "Bearer "+testWorkerToken)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST ping status = %d, want %d", response.Code, http.StatusMethodNotAllowed)
+	}
+}
+
 func TestNewHandlerRejectsWeakOrSharedTokens(t *testing.T) {
 	store, err := queue.Open(filepath.Join(t.TempDir(), "queue.db"))
 	if err != nil {

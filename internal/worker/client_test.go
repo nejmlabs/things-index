@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -43,6 +44,37 @@ func TestDefaultClientDoesNotFollowRedirects(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "https://other.example.com/worker/v1/lease", nil)
 	if err := client.httpClient.CheckRedirect(request, nil); !errors.Is(err, http.ErrUseLastResponse) {
 		t.Fatalf("redirect policy returned %v", err)
+	}
+}
+
+func TestClientPing(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/worker/v1/ping" || request.Method != http.MethodGet {
+			http.NotFound(response, request)
+			return
+		}
+		if request.Header.Get("Authorization") != "Bearer "+clientTestToken {
+			http.Error(response, "unauthorised", http.StatusUnauthorized)
+			return
+		}
+		response.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client, err := NewClient(ClientConfig{BaseURL: server.URL, Token: clientTestToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Ping(context.Background()); err != nil {
+		t.Fatalf("ping with valid token: %v", err)
+	}
+
+	badClient, err := NewClient(ClientConfig{BaseURL: server.URL, Token: "wrong-token-000000000000000000000"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := badClient.Ping(context.Background()); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("ping with wrong token = %v, want ErrUnauthorized", err)
 	}
 }
 

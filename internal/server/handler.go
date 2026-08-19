@@ -438,6 +438,17 @@ func captureResult(job queue.Job) CaptureResult {
 }
 
 func (s *service) workerAPI(response http.ResponseWriter, request *http.Request) {
+	// The setup wizard uses this authenticated no-op to verify the worker
+	// token before installing anything; bearerAuth has already run.
+	if request.URL.Path == "/worker/v1/ping" {
+		if request.Method != http.MethodGet {
+			response.Header().Set("Allow", http.MethodGet)
+			http.Error(response, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		response.WriteHeader(http.StatusNoContent)
+		return
+	}
 	if request.Method != http.MethodPost {
 		response.Header().Set("Allow", http.MethodPost)
 		http.Error(response, "method not allowed", http.StatusMethodNotAllowed)

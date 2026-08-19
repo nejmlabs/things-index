@@ -40,9 +40,10 @@ For 24/7 homelab infrastructure where the MCP server runs on Linux and leases jo
    ```bash
    things-index worker --setup
    ```
-   * Auto-detects Things 3 SQLite database.
-   * Verifies read-only connectivity.
-   * Installs and starts the background daemon automatically with `@reboot` persistence.
+   * Verifies the server connection **and** the worker token before installing anything.
+   * Optionally stores your Things URL-scheme auth token to unlock deadline/tag/checklist updates.
+   * Auto-detects the Things 3 SQLite database and verifies read-only connectivity.
+   * Installs a launchd LaunchAgent that starts at login, auto-restarts the worker if it crashes, and logs to `~/Library/Logs/ThingsIndex/`.
 
 ---
 

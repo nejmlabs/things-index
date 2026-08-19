@@ -565,6 +565,10 @@ func runDedicatedWorker() error {
 	return workerapp.Run(ctx)
 }
 
+// workerLaunchAgentLabel matches the plist name the uninstaller removes and
+// the deploy/launchd example documents.
+const workerLaunchAgentLabel = "com.nejmlabs.things-index-worker"
+
 func runWorkerSetup() error {
 	if runtime.GOOS != "darwin" {
 		return errors.New("the Mac worker setup wizard must be run on macOS")
@@ -603,7 +607,8 @@ func runWorkerSetup() error {
 	// 3. Validate the URL/token against the same rules the worker daemon
 	// enforces at startup, so the wizard cannot bless a configuration the
 	// installed worker will refuse.
-	if _, err := worker.NewClient(worker.ClientConfig{BaseURL: serverURL, Token: workerToken}); err != nil {
+	serverClient, err := worker.NewClient(worker.ClientConfig{BaseURL: serverURL, Token: workerToken})
+	if err != nil {
 		fmt.Println()
 		fmt.Println("  ✗ This server URL cannot be used by the worker daemon:")
 		fmt.Printf("    %v\n", err)
@@ -616,19 +621,54 @@ func runWorkerSetup() error {
 		return errors.New("worker setup aborted: server URL rejected")
 	}
 
-	// 4. Test Server Connection
+	// 4. Verify the connection and the token against the authenticated worker
+	// API, so a mistyped token fails here instead of invisibly at boot.
 	fmt.Printf("• Checking server connection to %s...\n", serverURL)
-	httpClient := &http.Client{Timeout: 5 * time.Second}
-	healthURL := strings.TrimRight(serverURL, "/") + "/healthz"
-	resp, err := httpClient.Get(healthURL)
-	if err != nil {
-		fmt.Printf("  ⚠️  Could not reach %s: %v (Continuing anyway)\n", healthURL, err)
-	} else {
-		_ = resp.Body.Close()
-		fmt.Println("  ✓ Server connection OK!")
+	pingCtx, cancelPing := context.WithTimeout(context.Background(), 5*time.Second)
+	pingErr := serverClient.Ping(pingCtx)
+	cancelPing()
+	switch {
+	case pingErr == nil:
+		fmt.Println("  ✓ Server connection and worker token verified!")
+	case errors.Is(pingErr, worker.ErrUnauthorized):
+		return errors.New("the server rejected this worker token; copy THINGS_INDEX_WORKER_TOKEN from the server's configuration and run the wizard again")
+	default:
+		// Fall back to the unauthenticated health endpoint: an older server
+		// build has no ping route, and an offline server should not block
+		// setup — queued jobs simply wait for it to come back.
+		httpClient := &http.Client{Timeout: 5 * time.Second}
+		healthURL := strings.TrimRight(serverURL, "/") + "/healthz"
+		if resp, healthErr := httpClient.Get(healthURL); healthErr == nil {
+			_ = resp.Body.Close()
+			fmt.Println("  ⚠️  Server reachable, but it could not verify the worker token (older server build?). Continuing.")
+		} else {
+			fmt.Printf("  ⚠️  Could not reach the server: %v (Continuing anyway)\n", pingErr)
+		}
 	}
 
-	// 5. Auto-detect Things 3 SQLite Database
+	// 5. Optional Things URL-scheme auth token, which unlocks the update
+	// operations the URL scheme gates behind it.
+	defaultThingsToken := os.Getenv("THINGS_INDEX_THINGS_AUTH_TOKEN")
+	thingsTokenPrompt := "• Things auth token (optional, unlocks deadline/tag/checklist updates)"
+	if defaultThingsToken != "" {
+		thingsTokenPrompt += " [detected in environment]"
+	}
+	fmt.Print(thingsTokenPrompt + ": ")
+	thingsTokenInput, _ := reader.ReadString('\n')
+	thingsAuthToken := strings.TrimSpace(thingsTokenInput)
+	if thingsAuthToken == "" {
+		thingsAuthToken = defaultThingsToken
+	}
+	if strings.ContainsAny(thingsAuthToken, " \t") {
+		return errors.New("the Things auth token must not contain whitespace; copy it from Things > Settings > General > Enable Things URLs > Manage")
+	}
+	if thingsAuthToken == "" {
+		fmt.Println("  • Skipped. update_things_task stays limited to title/notes/today;")
+		fmt.Println("    rerun the wizard anytime with the token from Things > Settings >")
+		fmt.Println("    General > Enable Things URLs > Manage to unlock the rest.")
+	}
+
+	// 6. Auto-detect Things 3 SQLite Database
 	fmt.Println("• Detecting Things 3 SQLite database...")
 	thingsDB, err := helper.FindThingsDatabase()
 	if err != nil {
@@ -636,7 +676,7 @@ func runWorkerSetup() error {
 	}
 	fmt.Printf("  ✓ Found database: %s\n", thingsDB)
 
-	// 6. Test Things 3 Access
+	// 7. Test Things 3 Access
 	captureAdapter := helper.NewClient("")
 	captureAdapter.DBPath = thingsDB
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -646,7 +686,7 @@ func runWorkerSetup() error {
 	}
 	fmt.Println("  ✓ Things 3 database query verified (Read-Only OK)")
 
-	// 7. Install Background Launcher Script
+	// 8. Install Background Launcher Script (carries the secrets, hence 0700)
 	home, _ := os.UserHomeDir()
 	binDir := filepath.Join(home, ".local", "bin")
 	_ = os.MkdirAll(binDir, 0o755)
@@ -657,45 +697,128 @@ func runWorkerSetup() error {
 	}
 
 	launcherScript := filepath.Join(binDir, "run-things-worker.sh")
-	scriptContent := fmt.Sprintf(`#!/bin/zsh -l
-export HOME=%s
-export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.local/bin"
-export THINGS_INDEX_SERVER_URL=%s
-export THINGS_INDEX_WORKER_TOKEN=%s
-export THINGS_INDEX_JOURNAL_PATH="$HOME/Library/Application Support/ThingsIndex/journal.sqlite"
-export THINGS_INDEX_THINGS_DB_PATH=%s
-
-exec %s worker
-`, shellQuote(home), shellQuote(serverURL), shellQuote(workerToken), shellQuote(thingsDB), shellQuote(exePath))
-
+	scriptContent := buildLauncherScript(home, serverURL, workerToken, thingsDB, thingsAuthToken, exePath)
 	if err := os.WriteFile(launcherScript, []byte(scriptContent), 0o700); err != nil {
 		return fmt.Errorf("write launcher script: %w", err)
 	}
 	fmt.Printf("  ✓ Created launcher script: %s\n", launcherScript)
 
-	// 8. Install @reboot crontab persistence & start background session
-	fmt.Println("• Configuring background persistence...")
-	cronLine := "@reboot /usr/bin/screen -dmS things-worker " + shellQuote(launcherScript)
-	cronCmd := fmt.Sprintf(`(crontab -l 2>/dev/null | grep -v "things-worker"; echo %s) | crontab -`, shellQuote(cronLine))
-	_ = exec.Command("/bin/sh", "-c", cronCmd).Run()
+	// 9. Install the LaunchAgent: starts at login, KeepAlive restarts the
+	// worker if it ever crashes, and logs land in ~/Library/Logs/ThingsIndex.
+	logDir := filepath.Join(home, "Library", "Logs", "ThingsIndex")
+	_ = os.MkdirAll(logDir, 0o755)
+	agentsDir := filepath.Join(home, "Library", "LaunchAgents")
+	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
+		return fmt.Errorf("create LaunchAgents directory: %w", err)
+	}
+	plistPath := filepath.Join(agentsDir, workerLaunchAgentLabel+".plist")
+	if err := os.WriteFile(plistPath, []byte(buildLaunchAgentPlist(launcherScript, logDir)), 0o644); err != nil {
+		return fmt.Errorf("write LaunchAgent: %w", err)
+	}
+	fmt.Printf("  ✓ Created LaunchAgent: %s\n", plistPath)
 
-	// Restart screen session
-	restartCmd := fmt.Sprintf(`pkill -f "things-index worker" 2>/dev/null || true; screen -wipe 2>/dev/null || true; screen -dmS things-worker %s`, shellQuote(launcherScript))
-	_ = exec.Command("/bin/sh", "-c", restartCmd).Run()
+	// 10. Replace any previous install (LaunchAgent or the cron+screen
+	// mechanism earlier wizard versions used) and start the agent.
+	fmt.Println("• Starting background worker via launchd...")
+	domainTarget := fmt.Sprintf("gui/%d", os.Getuid())
+	_ = exec.Command("launchctl", "bootout", domainTarget+"/"+workerLaunchAgentLabel).Run()
+	_ = exec.Command("/bin/sh", "-c", `(crontab -l 2>/dev/null | grep -v "things-worker") | crontab - 2>/dev/null || true`).Run()
+	_ = exec.Command("/bin/sh", "-c", `screen -S things-worker -X quit 2>/dev/null || true`).Run()
+	_ = exec.Command("/bin/sh", "-c", `pkill -f "things-index worker" 2>/dev/null || true`).Run()
+	if output, err := exec.Command("launchctl", "bootstrap", domainTarget, plistPath).CombinedOutput(); err != nil {
+		return fmt.Errorf("start LaunchAgent in %s: %w: %s", domainTarget, err, strings.TrimSpace(string(output)))
+	}
+
+	// 11. Confirm the worker is actually running before declaring success.
+	// macOS pgrep excludes this wizard (an ancestor), so only the daemon
+	// matches.
+	running := false
+	for attempt := 0; attempt < 10; attempt++ {
+		time.Sleep(500 * time.Millisecond)
+		if exec.Command("/usr/bin/pgrep", "-f", "things-index worker").Run() == nil {
+			running = true
+			break
+		}
+	}
 
 	fmt.Println()
+	if !running {
+		fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+		fmt.Println("  ⚠️  Setup finished, but the worker has not been seen running yet.")
+		fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+		fmt.Printf("  • Check logs:   %s\n", filepath.Join(logDir, "worker-error.log"))
+		fmt.Printf("  • Check status: launchctl print %s/%s\n", domainTarget, workerLaunchAgentLabel)
+		fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+		return nil
+	}
 	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 	fmt.Println("  🎉 ThingsIndex Mac Worker Successfully Configured & Active!")
 	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-	fmt.Printf("  • Server Target:      %s\n", serverURL)
-	fmt.Printf("  • Things Database:    %s\n", thingsDB)
-	fmt.Printf("  • Background Session: screen -ls | grep things-worker\n")
+	fmt.Printf("  • Server Target:   %s\n", serverURL)
+	fmt.Printf("  • Things Database: %s\n", thingsDB)
+	fmt.Printf("  • LaunchAgent:     %s (starts at login, auto-restarts)\n", workerLaunchAgentLabel)
+	fmt.Printf("  • Logs:            %s\n", logDir)
 	fmt.Println("────────────────────────────────────────────────────────────")
-	fmt.Println("  The worker is now actively listening in the background.")
-	fmt.Println("  It will automatically start on boot and process jobs prompt-free.")
+	fmt.Println("  The worker is now actively listening in the background")
+	fmt.Println("  and processes jobs prompt-free.")
 	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 	return nil
 }
+
+// buildLauncherScript renders the launcher launchd runs. It carries the
+// worker's secrets, so callers must write it with mode 0700.
+func buildLauncherScript(home, serverURL, workerToken, thingsDB, thingsAuthToken, exePath string) string {
+	var builder strings.Builder
+	builder.WriteString("#!/bin/zsh -l\n")
+	fmt.Fprintf(&builder, "export HOME=%s\n", shellQuote(home))
+	builder.WriteString(`export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.local/bin"` + "\n")
+	fmt.Fprintf(&builder, "export THINGS_INDEX_SERVER_URL=%s\n", shellQuote(serverURL))
+	fmt.Fprintf(&builder, "export THINGS_INDEX_WORKER_TOKEN=%s\n", shellQuote(workerToken))
+	builder.WriteString(`export THINGS_INDEX_JOURNAL_PATH="$HOME/Library/Application Support/ThingsIndex/journal.sqlite"` + "\n")
+	fmt.Fprintf(&builder, "export THINGS_INDEX_THINGS_DB_PATH=%s\n", shellQuote(thingsDB))
+	if thingsAuthToken != "" {
+		fmt.Fprintf(&builder, "export THINGS_INDEX_THINGS_AUTH_TOKEN=%s\n", shellQuote(thingsAuthToken))
+	}
+	builder.WriteString("\n")
+	fmt.Fprintf(&builder, "exec %s worker\n", shellQuote(exePath))
+	return builder.String()
+}
+
+// buildLaunchAgentPlist renders the LaunchAgent. It intentionally contains no
+// secrets — those live in the 0700 launcher script it points at.
+func buildLaunchAgentPlist(launcherScript, logDir string) string {
+	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>%s</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>%s</string>
+    </array>
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>StandardOutPath</key>
+    <string>%s</string>
+    <key>StandardErrorPath</key>
+    <string>%s</string>
+</dict>
+</plist>
+`, workerLaunchAgentLabel, xmlEscape(launcherScript), xmlEscape(filepath.Join(logDir, "worker.log")), xmlEscape(filepath.Join(logDir, "worker-error.log")))
+}
+
+var xmlEscaper = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;", "'", "&apos;")
+
+func xmlEscape(value string) string { return xmlEscaper.Replace(value) }
 
 func runUninstall() error {
 	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -781,7 +904,7 @@ Commands:
   stdio           Run as a direct stdio MCP server for Claude Desktop / Cursor
   server          Run headless server queue (for Linux / Docker / Proxmox)
   worker          Run dedicated background worker connecting to a remote server
-  worker --setup  Interactive Mac worker setup wizard (auto-detects DB & configures daemon)
+  worker --setup  Interactive Mac worker setup wizard (verifies server & token, installs launchd agent)
   config          Print ready-to-paste Claude Desktop stdio JSON configuration
   uninstall       Stop and cleanly remove all daemons, databases, crontab, and scripts
   version         Print things-index version
