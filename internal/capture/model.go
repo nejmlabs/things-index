@@ -44,7 +44,7 @@ const (
 type Schedule struct {
 	Start      StartKind `json:"start,omitempty" jsonschema:"When the task starts: anytime, someday, or on_date."`
 	Date       string    `json:"date,omitempty" jsonschema:"Start date in YYYY-MM-DD form; required for on_date."`
-	Evening    bool      `json:"evening,omitempty" jsonschema:"Place a task starting today in This Evening."`
+	Evening    bool      `json:"evening,omitempty" jsonschema:"Place the task in This Evening when its start date is today; for any other date the task is scheduled for that date instead."`
 	ReminderAt string    `json:"reminder_at,omitempty" jsonschema:"Reminder timestamp with timezone in RFC3339 form."`
 }
 

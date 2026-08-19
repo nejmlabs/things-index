@@ -16,7 +16,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -29,6 +28,7 @@ import (
 	"github.com/nejmlabs/things-index/internal/server"
 	"github.com/nejmlabs/things-index/internal/serverapp"
 	"github.com/nejmlabs/things-index/internal/worker"
+	"github.com/nejmlabs/things-index/internal/workerapp"
 )
 
 const version = "0.2.0"
@@ -562,95 +562,7 @@ func runDedicatedServer() error {
 func runDedicatedWorker() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-
-	serverURL := os.Getenv("THINGS_INDEX_SERVER_URL")
-	workerToken := os.Getenv("THINGS_INDEX_WORKER_TOKEN")
-	if serverURL == "" || workerToken == "" {
-		return errors.New("THINGS_INDEX_SERVER_URL and THINGS_INDEX_WORKER_TOKEN are required. Run 'things-index worker --setup' for interactive setup.")
-	}
-
-	stateDir := os.Getenv("THINGS_INDEX_STATE_DIR")
-	if stateDir == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return err
-		}
-		stateDir = filepath.Join(home, "Library", "Application Support", "ThingsIndex")
-	}
-	_ = os.MkdirAll(stateDir, 0o700)
-
-	journalPath := os.Getenv("THINGS_INDEX_JOURNAL_PATH")
-	if journalPath == "" {
-		journalPath = filepath.Join(stateDir, "journal.sqlite")
-	}
-
-	journalStore, err := journal.Open(journalPath)
-	if err != nil {
-		return fmt.Errorf("open journal: %w", err)
-	}
-	defer journalStore.Close()
-
-	captureAdapter := helper.NewClient(os.Getenv("THINGS_INDEX_THINGS_AUTH_TOKEN"))
-	if thingsDB := os.Getenv("THINGS_INDEX_THINGS_DB_PATH"); thingsDB != "" {
-		captureAdapter.DBPath = thingsDB
-	}
-	if err := captureAdapter.Ping(ctx); err != nil {
-		return fmt.Errorf("connect to Things 3 database: %w", err)
-	}
-
-	serverClient, err := worker.NewClient(worker.ClientConfig{
-		BaseURL: serverURL,
-		Token:   workerToken,
-	})
-	if err != nil {
-		return fmt.Errorf("create server client: %w", err)
-	}
-
-	retentionDays := 14
-	if daysStr := os.Getenv("THINGS_INDEX_JOURNAL_RETENTION_DAYS"); daysStr != "" {
-		if d, err := strconv.Atoi(daysStr); err == nil && d > 0 {
-			retentionDays = d
-		}
-	}
-	cutoffDuration := time.Duration(retentionDays) * 24 * time.Hour
-
-	processor := &worker.Processor{Helper: captureAdapter, Journal: journalStore}
-
-	log.Printf("ThingsIndex Worker active (polling %s)...", serverURL)
-	for ctx.Err() == nil {
-		lease, err := serverClient.Lease(ctx)
-		if err != nil {
-			select {
-			case <-time.After(2 * time.Second):
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-			continue
-		}
-		if lease == nil {
-			continue
-		}
-		log.Printf("Received leased job: %s (attempts: %d)", lease.ID, lease.Attempts)
-
-		outcome, processErr := processor.Process(ctx, lease.Job)
-		var reportErr error
-		if processErr != nil {
-			log.Printf("Job %s failed: %v", lease.ID, processErr)
-			reportErr = serverClient.Fail(ctx, *lease, processErr, worker.IsRetryable(processErr))
-		} else {
-			log.Printf("Job %s succeeded (things_id=%s)", lease.ID, outcome.ThingsID)
-			reportErr = serverClient.Complete(ctx, *lease, outcome)
-		}
-		if reportErr != nil {
-			log.Printf("report job %s: %v", lease.ID, reportErr)
-			continue
-		}
-		if processErr == nil && worker.UsesJournal(lease.Job.Task) {
-			_ = journalStore.MarkReported(ctx, lease.ID)
-		}
-		_, _ = journalStore.PruneReported(ctx, time.Now().Add(-cutoffDuration))
-	}
-	return ctx.Err()
+	return workerapp.Run(ctx)
 }
 
 func runWorkerSetup() error {

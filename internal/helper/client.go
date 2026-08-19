@@ -279,7 +279,7 @@ func (c *Client) Capture(ctx context.Context, requestID string, task capture.Req
 	minCreationDate := beforeDispatch.UTC().Sub(macEpoch).Seconds()
 
 	pendingTitle := fmt.Sprintf("ThingsIndex pending [%s]", requestID)
-	addURL := buildAddURL(pendingTitle, task, appliedTags, c.AuthToken, location)
+	addURL := buildAddURL(pendingTitle, task, appliedTags, c.AuthToken, location, time.Now())
 
 	// 4. Dispatch URL via open -g -j (do not bring forward, launch hidden)
 	if _, _, err := runner.Run(ctx, "/usr/bin/open", []string{"-g", "-j", "-a", "/Applications/Things3.app", addURL}); err != nil {
@@ -384,7 +384,7 @@ func (c *Client) FinaliseCapture(ctx context.Context, id, title string) error {
 	return nil
 }
 
-func buildAddURL(pendingTitle string, task capture.Request, appliedTags []string, authToken string, location *time.Location) string {
+func buildAddURL(pendingTitle string, task capture.Request, appliedTags []string, authToken string, location *time.Location, now time.Time) string {
 	values := url.Values{}
 	values.Set("title", pendingTitle)
 	if task.Notes != "" {
@@ -398,34 +398,27 @@ func buildAddURL(pendingTitle string, task capture.Request, appliedTags []string
 		}
 	}
 	if task.Schedule != nil {
-		if task.Schedule.Evening {
-			// Things treats "evening" as today's This Evening list; a reminder
-			// time can ride along as evening@HH:MM.
-			if task.Schedule.ReminderAt != "" {
-				if reminderTime, err := time.Parse(time.RFC3339, task.Schedule.ReminderAt); err == nil {
-					localReminder := reminderTime.In(location)
-					values.Set("when", "evening@"+localReminder.Format("15:04"))
-				} else {
-					values.Set("when", "evening")
-				}
-			} else {
-				values.Set("when", "evening")
-			}
+		var when string
+		if task.Schedule.Evening && task.Schedule.Date == now.In(location).Format("2006-01-02") {
+			// Things can only place a task in This Evening for today; for any
+			// other start date fall through to on_date handling so the date
+			// (and reminder) are preserved instead of silently rescheduling
+			// the task to today.
+			when = "evening"
 		} else if task.Schedule.Start == capture.StartOnDate {
-			if task.Schedule.ReminderAt != "" {
-				if reminderTime, err := time.Parse(time.RFC3339, task.Schedule.ReminderAt); err == nil {
-					localReminder := reminderTime.In(location)
-					values.Set("when", task.Schedule.Date+"@"+localReminder.Format("15:04"))
-				} else {
-					values.Set("when", task.Schedule.Date)
-				}
-			} else {
-				values.Set("when", task.Schedule.Date)
-			}
+			when = task.Schedule.Date
 		} else if task.Schedule.Start == capture.StartSomeday {
-			values.Set("when", "someday")
+			when = "someday"
 		} else if task.Schedule.Start == capture.StartAnytime {
-			values.Set("when", "anytime")
+			when = "anytime"
+		}
+		if when != "" {
+			if task.Schedule.Start == capture.StartOnDate && task.Schedule.ReminderAt != "" {
+				if reminderTime, err := time.Parse(time.RFC3339, task.Schedule.ReminderAt); err == nil {
+					when += "@" + reminderTime.In(location).Format("15:04")
+				}
+			}
+			values.Set("when", when)
 		}
 	}
 	if task.Deadline != "" {

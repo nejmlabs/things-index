@@ -28,7 +28,7 @@ For 24/7 homelab infrastructure where the MCP server runs on Linux and leases jo
 1. **Deploy Server on Linux / Proxmox**:
    * **Proxmox VE 1-Click LXC Installer**:
      ```bash
-     bash -c "$(wget -qLO - https://raw.githubusercontent.com/nejmlabs/ThingsIndex/main/deploy/proxmox-install.sh)"
+     bash -c "$(wget -qLO - https://raw.githubusercontent.com/nejmlabs/things-index/main/deploy/proxmox-install.sh)"
      ```
    * **Docker Compose** (the server refuses to start without tokens):
      ```bash

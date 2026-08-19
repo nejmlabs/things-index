@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ThingsIndex - Automated Proxmox VE LXC Provisioning Script
-# Run on Proxmox Host: bash -c "$(wget -qLO - https://raw.githubusercontent.com/nejmlabs/ThingsIndex/main/deploy/proxmox-install.sh)"
+# Run on Proxmox Host: bash -c "$(wget -qLO - https://raw.githubusercontent.com/nejmlabs/things-index/main/deploy/proxmox-install.sh)"
 
 set -euo pipefail
 
@@ -70,8 +70,8 @@ ARCH=$(dpkg --print-architecture)
 curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${ARCH}.tar.gz" | tar -C /usr/local -xz
 
 # Clone and build ThingsIndex
-git clone https://github.com/nejmlabs/ThingsIndex.git /root/ThingsIndex
-cd /root/ThingsIndex
+git clone https://github.com/nejmlabs/things-index.git /root/things-index
+cd /root/things-index
 /usr/local/go/bin/go build -o /usr/local/bin/things-index-server ./cmd/things-index-server
 
 # Create dedicated system user

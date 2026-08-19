@@ -95,7 +95,7 @@ func TestBuildAddURL(t *testing.T) {
 		Checklist: []string{"Item 1", "Item 2"},
 	}
 
-	rawURL := buildAddURL("ThingsIndex pending [123]", task, []string{"Errand"}, "secret-token", location)
+	rawURL := buildAddURL("ThingsIndex pending [123]", task, []string{"Errand"}, "secret-token", location, time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC))
 	if !strings.HasPrefix(rawURL, "things:///add?") {
 		t.Fatalf("unexpected URL prefix: %s", rawURL)
 	}
@@ -135,6 +135,40 @@ func TestBuildAddURL(t *testing.T) {
 	}
 	if query.Get("reveal") != "false" {
 		t.Errorf("reveal = %q", query.Get("reveal"))
+	}
+}
+
+func TestBuildAddURLEvening(t *testing.T) {
+	t.Parallel()
+
+	location := time.FixedZone("BST", 3600)
+	now := time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC) // 2026-08-18 in BST
+	newTask := func(date string) capture.Request {
+		return capture.Request{
+			Title: "Water plants",
+			Schedule: &capture.Schedule{
+				Start:      capture.StartOnDate,
+				Date:       date,
+				Evening:    true,
+				ReminderAt: date + "T17:30:00Z", // 18:30 in BST
+			},
+		}
+	}
+
+	todayURL, err := url.Parse(buildAddURL("t", newTask("2026-08-18"), nil, "", location, now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := todayURL.Query().Get("when"); got != "evening@18:30" {
+		t.Errorf("when for today = %q, want evening@18:30", got)
+	}
+
+	futureURL, err := url.Parse(buildAddURL("t", newTask("2026-08-25"), nil, "", location, now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := futureURL.Query().Get("when"); got != "2026-08-25@18:30" {
+		t.Errorf("when for future date = %q, want 2026-08-25@18:30", got)
 	}
 }
 
