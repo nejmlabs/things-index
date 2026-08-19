@@ -30,7 +30,9 @@ func IsRetryable(err error) bool {
 	}
 	var operationError *helper.OperationError
 	if errors.As(err, &operationError) {
-		return operationError.Code == "create_failed" || operationError.Code == "finalise_not_found"
+		return operationError.Code == "create_failed" ||
+			operationError.Code == "finalise_not_found" ||
+			operationError.Code == "finalise_unverified"
 	}
 	return true
 }

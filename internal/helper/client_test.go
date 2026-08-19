@@ -55,7 +55,8 @@ func setupTestThingsDB(t *testing.T) string {
 			project TEXT DEFAULT '',
 			area TEXT DEFAULT '',
 			heading TEXT DEFAULT '',
-			creationDate REAL
+			creationDate REAL,
+			userModificationDate REAL DEFAULT 0
 		)`,
 		`CREATE TABLE TMArea (
 			uuid TEXT PRIMARY KEY,
@@ -331,6 +332,212 @@ func TestClientFinaliseCapture(t *testing.T) {
 	var opErr *OperationError
 	if !errors.As(err, &opErr) || opErr.Code != "finalise_not_found" {
 		t.Fatalf("expected finalise_not_found, got %v", err)
+	}
+}
+
+func TestClientFinaliseCaptureFailsWhenRenameNeverLands(t *testing.T) {
+	t.Parallel()
+
+	dbPath := setupTestThingsDB(t)
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(`INSERT INTO TMTask (uuid, type, title) VALUES ('task-1', 0, 'ThingsIndex pending [123]')`); err != nil {
+		t.Fatal(err)
+	}
+
+	// The dispatch succeeds (open exits 0) but Things never applies the
+	// rename, as happens with a revoked auth token.
+	client := &Client{
+		DBPath:       dbPath,
+		AuthToken:    "token-123",
+		Runner:       &mockRunner{},
+		VerifyWindow: 300 * time.Millisecond,
+	}
+
+	err = client.FinaliseCapture(context.Background(), "task-1", "Final Title")
+	var opErr *OperationError
+	if !errors.As(err, &opErr) || opErr.Code != "finalise_unverified" {
+		t.Fatalf("expected finalise_unverified, got %v", err)
+	}
+}
+
+func TestUpdateTaskVerifiesAppliedChanges(t *testing.T) {
+	t.Parallel()
+
+	dbPath := setupTestThingsDB(t)
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(`INSERT INTO TMTask (uuid, type, title, userModificationDate) VALUES ('task-1', 0, 'Old title', 100)`); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := &mockRunner{
+		onRun: func(executable string, args []string) error {
+			switch executable {
+			case "/usr/bin/pgrep":
+				return nil // Things is running, so no quit follows
+			case "/usr/bin/open":
+				_, execErr := db.Exec(`UPDATE TMTask SET title = 'New title', userModificationDate = 200 WHERE uuid = 'task-1'`)
+				return execErr
+			default:
+				t.Fatalf("unexpected executable: %s", executable)
+				return nil
+			}
+		},
+	}
+
+	client := &Client{
+		DBPath:       dbPath,
+		AuthToken:    "token-123",
+		Runner:       runner,
+		VerifyWindow: 300 * time.Millisecond,
+	}
+
+	resp, err := client.UpdateTask(context.Background(), capture.UpdateTaskRequest{
+		ID:       "task-1",
+		NewTitle: "New title",
+		When:     "today",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.OK || resp.ID != "task-1" {
+		t.Fatalf("unexpected response: %+v", resp)
+	}
+	if len(runner.lastArgs) != 2 || !strings.Contains(runner.lastArgs[1], "when=today") {
+		t.Fatalf("dispatched URL missing when=today: %v", runner.lastArgs)
+	}
+}
+
+func TestUpdateTaskFailsHonestlyWhenDatabaseUnchanged(t *testing.T) {
+	t.Parallel()
+
+	dbPath := setupTestThingsDB(t)
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(`INSERT INTO TMTask (uuid, type, title, userModificationDate) VALUES ('task-1', 0, 'Old title', 100)`); err != nil {
+		t.Fatal(err)
+	}
+
+	// open exits 0 but Things never applies the update.
+	client := &Client{
+		DBPath:       dbPath,
+		AuthToken:    "token-123",
+		Runner:       &mockRunner{},
+		VerifyWindow: 300 * time.Millisecond,
+	}
+
+	_, err = client.UpdateTask(context.Background(), capture.UpdateTaskRequest{
+		ID:       "task-1",
+		NewTitle: "New title",
+	})
+	var opErr *OperationError
+	if !errors.As(err, &opErr) || opErr.Code != "update_unverified" {
+		t.Fatalf("expected update_unverified, got %v", err)
+	}
+}
+
+func TestCreateProjectReusesExistingActiveProject(t *testing.T) {
+	t.Parallel()
+
+	dbPath := setupTestThingsDB(t)
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(`INSERT INTO TMTask (uuid, type, title, creationDate) VALUES ('proj-1', 1, 'Shopping', 1)`); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := &scriptedRunner{}
+	client := &Client{DBPath: dbPath, Runner: runner, VerifyWindow: 300 * time.Millisecond}
+
+	resp, err := client.CreateProject(context.Background(), capture.CreateProjectRequest{Title: "shopping"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.OK || resp.ID != "proj-1" {
+		t.Fatalf("unexpected response: %+v", resp)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("expected no dispatch for an existing project, ran %v", runner.calls)
+	}
+}
+
+func TestCreateProjectIgnoresArchivedSameTitleProject(t *testing.T) {
+	t.Parallel()
+
+	dbPath := setupTestThingsDB(t)
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// A completed project with the same title must be matched neither by the
+	// reuse pre-check nor by the post-dispatch poll.
+	if _, err := db.Exec(`INSERT INTO TMTask (uuid, type, title, status, creationDate) VALUES ('proj-old', 1, 'Shopping', 3, 1)`); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := &mockRunner{
+		onRun: func(executable string, args []string) error {
+			if executable == "/usr/bin/open" {
+				macEpoch := time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC)
+				nowEpoch := time.Now().UTC().Sub(macEpoch).Seconds()
+				_, execErr := db.Exec(`INSERT INTO TMTask (uuid, type, title, creationDate) VALUES ('proj-new', 1, 'Shopping', ?)`, nowEpoch)
+				return execErr
+			}
+			return nil
+		},
+	}
+	client := &Client{DBPath: dbPath, Runner: runner, VerifyWindow: 300 * time.Millisecond}
+
+	resp, err := client.CreateProject(context.Background(), capture.CreateProjectRequest{Title: "Shopping"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.ID != "proj-new" {
+		t.Fatalf("poll matched the wrong project: %+v", resp)
+	}
+}
+
+func TestCreateProjectFailsWhenNothingAppears(t *testing.T) {
+	t.Parallel()
+
+	dbPath := setupTestThingsDB(t)
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(`INSERT INTO TMTask (uuid, type, title, status, creationDate) VALUES ('proj-old', 1, 'Shopping', 3, 1)`); err != nil {
+		t.Fatal(err)
+	}
+
+	// open exits 0 but no new project ever lands; the stale archived project
+	// must not satisfy the poll.
+	client := &Client{DBPath: dbPath, Runner: &mockRunner{}, VerifyWindow: 300 * time.Millisecond}
+
+	_, err = client.CreateProject(context.Background(), capture.CreateProjectRequest{Title: "Shopping"})
+	var opErr *OperationError
+	if !errors.As(err, &opErr) || opErr.Code != "create_failed" {
+		t.Fatalf("expected create_failed, got %v", err)
 	}
 }
 

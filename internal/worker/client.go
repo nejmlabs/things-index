@@ -14,7 +14,10 @@ import (
 	"time"
 )
 
-const maxResponseBytes = 64 << 10
+// maxResponseBytes must comfortably exceed the server's 64KB request cap:
+// queued tasks are re-marshaled with Go's JSON HTML escaping, which inflates
+// '<', '>', and '&' six-fold before the payload reaches the lease response.
+const maxResponseBytes = 512 << 10
 
 // Lease is a capture job temporarily assigned to this worker.
 type Lease struct {

@@ -285,9 +285,7 @@ func (c *Client) Capture(ctx context.Context, requestID string, task capture.Req
 	// 3. Construct Things URL with the pending marker title. The marker is what
 	// lets FindCapture reconcile an uncertain outcome after a crash or retry
 	// without creating a duplicate; FinaliseCapture renames it afterwards.
-	beforeDispatch := time.Now().Add(-1 * time.Second)
-	macEpoch := time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC)
-	minCreationDate := beforeDispatch.UTC().Sub(macEpoch).Seconds()
+	minCreationDate := macEpochSeconds(time.Now().Add(-1 * time.Second))
 
 	pendingTitle := fmt.Sprintf("ThingsIndex pending [%s]", requestID)
 	addURL := buildAddURL(pendingTitle, task, appliedTags, c.AuthToken, location, time.Now())
@@ -384,7 +382,10 @@ func (c *Client) FinaliseCapture(ctx context.Context, id, title string) error {
 		}
 	}
 
-	deadline := time.Now().Add(2 * time.Second)
+	// open exits 0 even when Things rejects the update (for example on a
+	// revoked auth token), so an unverified rename must fail loudly; the
+	// caller's retry reconciles through the pending marker title.
+	deadline := c.verifyDeadline()
 	for time.Now().Before(deadline) {
 		var updatedTitle string
 		if err := db.QueryRowContext(ctx, `SELECT title FROM TMTask WHERE uuid = ? AND trashed = 0`, id).Scan(&updatedTitle); err == nil && updatedTitle == title {
@@ -392,7 +393,7 @@ func (c *Client) FinaliseCapture(ctx context.Context, id, title string) error {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	return nil
+	return &OperationError{Code: "finalise_unverified"}
 }
 
 func buildAddURL(pendingTitle string, task capture.Request, appliedTags []string, authToken string, location *time.Location, now time.Time) string {
@@ -462,6 +463,12 @@ func validRequestID(value string) bool {
 	}
 	_, err := hex.DecodeString(value)
 	return err == nil
+}
+
+// macEpochSeconds converts t to seconds since Things' Cocoa reference date
+// (2001-01-01 UTC), the encoding TMTask.creationDate uses.
+func macEpochSeconds(t time.Time) float64 {
+	return t.UTC().Sub(time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC)).Seconds()
 }
 
 // helperShortcutName is the required library name of the bundled Shortcut;
@@ -1086,6 +1093,18 @@ func (c *Client) CreateProject(ctx context.Context, req capture.CreateProjectReq
 	}
 	defer db.Close()
 
+	// Reuse an existing active project with the same title (mirroring
+	// CreateHeading), so a retry after a slow Things launch reconciles with
+	// the project the first dispatch created instead of duplicating it.
+	var existingUUID string
+	err = db.QueryRowContext(ctx, `SELECT uuid FROM TMTask WHERE type = 1 AND LOWER(title) = LOWER(?) AND trashed = 0 AND status = 0 ORDER BY creationDate DESC LIMIT 1`, req.Title).Scan(&existingUUID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return Response{}, fmt.Errorf("query existing project: %w", err)
+	}
+	if existingUUID != "" {
+		return Response{OK: true, ID: existingUUID}, nil
+	}
+
 	values := url.Values{}
 	values.Set("title", req.Title)
 	values.Set("reveal", "false")
@@ -1120,14 +1139,18 @@ func (c *Client) CreateProject(ctx context.Context, req capture.CreateProjectReq
 		wasRunning = true
 	}
 
+	minCreationDate := macEpochSeconds(time.Now().Add(-1 * time.Second))
+
 	if _, _, err := runner.Run(ctx, "/usr/bin/open", []string{"-g", addURL}); err != nil {
 		return Response{}, fmt.Errorf("dispatch add-project URL: %w", err)
 	}
 
+	// The creationDate floor keeps the poll from matching an archived
+	// same-title project and reporting its UUID as the created one.
 	var projectUUID string
 	deadline := c.verifyDeadline()
 	for time.Now().Before(deadline) {
-		row := db.QueryRowContext(ctx, `SELECT uuid FROM TMTask WHERE type = 1 AND LOWER(title) = LOWER(?) AND trashed = 0 ORDER BY creationDate DESC LIMIT 1`, req.Title)
+		row := db.QueryRowContext(ctx, `SELECT uuid FROM TMTask WHERE type = 1 AND LOWER(title) = LOWER(?) AND creationDate >= ? AND trashed = 0 ORDER BY creationDate DESC LIMIT 1`, req.Title, minCreationDate)
 		if err := row.Scan(&projectUUID); err == nil && projectUUID != "" {
 			break
 		}
@@ -1193,6 +1216,18 @@ func (c *Client) UpdateTask(ctx context.Context, req capture.UpdateTaskRequest) 
 		return Response{}, errors.New("updating deadline, tags, checklist, or non-today schedules requires the Things authorization token (set THINGS_INDEX_THINGS_AUTH_TOKEN)")
 	}
 
+	// Snapshot the row before dispatching so the verification poll below can
+	// tell whether Things actually applied the update; open exits 0 even when
+	// Things rejects the URL (for example on a revoked auth token).
+	var beforeMod float64
+	err = db.QueryRowContext(ctx, `SELECT COALESCE(userModificationDate, 0) FROM TMTask WHERE uuid = ? AND trashed = 0`, taskUUID).Scan(&beforeMod)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Response{}, &OperationError{Code: "task_not_found"}
+		}
+		return Response{}, fmt.Errorf("read task before update: %w", err)
+	}
+
 	runner := c.Runner
 	if runner == nil {
 		runner = ExecRunner{}
@@ -1254,10 +1289,38 @@ func (c *Client) UpdateTask(ctx context.Context, req capture.UpdateTaskRequest) 
 		}
 	}
 
+	// Verify the update landed before reporting success: title and notes are
+	// compared directly; when, deadline, tag, and checklist changes are only
+	// observable through the row's modification stamp.
+	needsStamp := req.When != "" || req.Deadline != "" || len(req.AddTags) > 0 || len(req.AddChecklist) > 0
+	verified := false
+	deadline := c.verifyDeadline()
+	for time.Now().Before(deadline) {
+		var title, notes string
+		var mod float64
+		if err := db.QueryRowContext(ctx, `SELECT title, COALESCE(notes, ''), COALESCE(userModificationDate, 0) FROM TMTask WHERE uuid = ? AND trashed = 0`, taskUUID).Scan(&title, &notes, &mod); err == nil {
+			titleOK := req.NewTitle == "" || title == req.NewTitle
+			notesOK := true
+			if req.Notes != "" {
+				notesOK = notes == req.Notes
+			} else if req.AppendNotes != "" {
+				notesOK = strings.Contains(notes, req.AppendNotes)
+			}
+			if titleOK && notesOK && (!needsStamp || mod > beforeMod) {
+				verified = true
+				break
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
 	if !wasRunning {
 		time.Sleep(50 * time.Millisecond)
 		_, _, _ = runner.Run(ctx, "/usr/bin/osascript", []string{"-e", `tell application "Things3" to quit`})
 	}
 
+	if !verified {
+		return Response{}, &OperationError{Code: "update_unverified"}
+	}
 	return Response{OK: true, ID: taskUUID}, nil
 }

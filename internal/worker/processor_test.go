@@ -197,6 +197,12 @@ func TestIsRetryable(t *testing.T) {
 	if !IsRetryable(&helper.OperationError{Code: "finalise_not_found"}) {
 		t.Fatal("finalise_not_found should be retryable")
 	}
+	if !IsRetryable(&helper.OperationError{Code: "finalise_unverified"}) {
+		t.Fatal("finalise_unverified should be retryable")
+	}
+	if IsRetryable(&helper.OperationError{Code: "update_unverified"}) {
+		t.Fatal("update_unverified must not retry; a second dispatch could double-apply notes")
+	}
 	if IsRetryable(&helper.OperationError{Code: "invalid_request"}) {
 		t.Fatal("invalid_request should not be retryable")
 	}
