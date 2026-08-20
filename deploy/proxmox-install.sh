@@ -18,14 +18,17 @@ BRIDGE="vmbr0"
 
 echo "• Allocating Container ID: ${CT_ID}"
 
-# 2. Use an existing Debian 12/13 template, or download the newest one
-TEMPLATE=$(pveam list local | grep -E "debian-13|debian-12" | head -n 1 | awk '{print $1}' || true)
+# 2. Use an existing Debian 12/13 standard template matching the host
+#    architecture, or download the newest one. The arch filter matters: a
+#    stray template for another architecture must never be picked.
+HOST_ARCH=$(dpkg --print-architecture)
+TEMPLATE=$(pveam list local | awk '{print $1}' | grep -E 'debian-1[23]-standard' | grep "_${HOST_ARCH}" | sort -V | tail -n 1 || true)
 if [ -z "${TEMPLATE}" ]; then
-    echo "• Downloading latest Debian standard template..."
+    echo "• Downloading latest Debian standard template (${HOST_ARCH})..."
     pveam update
-    TEMPLATE_NAME=$(pveam available --section system | awk '{print $2}' | grep -E '^debian-1[23]-standard' | sort -V | tail -n 1 || true)
+    TEMPLATE_NAME=$(pveam available --section system | awk '{print $2}' | grep -E '^debian-1[23]-standard' | grep "_${HOST_ARCH}" | sort -V | tail -n 1 || true)
     if [ -z "${TEMPLATE_NAME}" ]; then
-        echo "✗ No Debian 12/13 standard template found in the pveam index" >&2
+        echo "✗ No Debian 12/13 standard template for ${HOST_ARCH} found in the pveam index" >&2
         exit 1
     fi
     pveam download local "${TEMPLATE_NAME}"
@@ -34,13 +37,24 @@ fi
 
 echo "• Using template: ${TEMPLATE}"
 
-# 3. Create Container
+# 3. Pick a storage pool that can hold container root disks; the default
+#    'local' directory storage often cannot, so relying on pct's default
+#    fails with "storage 'local' does not support container directories".
+STORAGE=$(pvesm status --content rootdir 2>/dev/null | awk 'NR>1 && $3 == "active" {print $1; exit}')
+if [ -z "${STORAGE}" ]; then
+    echo "✗ No active storage supports container disks (rootdir); enable one under Datacenter > Storage" >&2
+    exit 1
+fi
+echo "• Using container storage: ${STORAGE}"
+
+# 4. Create Container
 echo "• Creating unprivileged LXC container..."
 pct create "${CT_ID}" "${TEMPLATE}" \
     --hostname "${CT_NAME}" \
     --cores "${CT_CORES}" \
     --memory "${CT_RAM}" \
     --swap 0 \
+    --rootfs "${STORAGE}:${CT_DISK}" \
     --features nesting=1 \
     --net0 "name=eth0,bridge=${BRIDGE},ip=dhcp" \
     --unprivileged 1 \
@@ -50,12 +64,12 @@ pct create "${CT_ID}" "${TEMPLATE}" \
 echo "• Waiting for container network..."
 sleep 5
 
-# 4. Generate Tokens
+# 5. Generate Tokens
 PUB_TOKEN=$(openssl rand -hex 32)
 WRK_TOKEN=$(openssl rand -hex 32)
 DSH_TOKEN=$(openssl rand -hex 32)
 
-# 5. Install Dependencies & Build inside LXC
+# 6. Install Dependencies & Build inside LXC
 #    (single-quoted so nothing from the host - especially tokens - lands in argv)
 echo "• Installing dependencies and building (this downloads the Go toolchain)..."
 pct exec "${CT_ID}" -- bash -c '
@@ -80,7 +94,7 @@ mkdir -p /etc/things-index /var/lib/things-index
 chown -R things-index:things-index /var/lib/things-index
 '
 
-# 6. Push server configuration into the container as a file, so tokens never
+# 7. Push server configuration into the container as a file, so tokens never
 #    appear on a command line visible in the host process list.
 ENV_FILE=$(mktemp)
 chmod 600 "${ENV_FILE}"
@@ -95,7 +109,7 @@ EOF
 pct push "${CT_ID}" "${ENV_FILE}" /etc/things-index/server.env --perms 600 --user 0 --group 0
 rm -f "${ENV_FILE}"
 
-# 7. Install systemd service & firewall
+# 8. Install systemd service & firewall
 pct exec "${CT_ID}" -- bash -c '
 set -euo pipefail
 cat << EOF > /etc/systemd/system/things-index-server.service
