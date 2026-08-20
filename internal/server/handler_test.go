@@ -316,15 +316,17 @@ func TestToolSchemasUseSingleTypes(t *testing.T) {
 		}
 	}
 	for _, tool := range tools.Tools {
-		raw, err := json.Marshal(tool.InputSchema)
-		if err != nil {
-			t.Fatal(err)
+		for _, schema := range []any{tool.InputSchema, tool.OutputSchema} {
+			raw, err := json.Marshal(schema)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var decoded any
+			if err := json.Unmarshal(raw, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			walk(tool.Name, decoded)
 		}
-		var decoded any
-		if err := json.Unmarshal(raw, &decoded); err != nil {
-			t.Fatal(err)
-		}
-		walk(tool.Name, decoded)
 	}
 }
 
@@ -355,5 +357,44 @@ func TestPlainJSONAcceptHeaderServed(t *testing.T) {
 		if recorder.Code != http.StatusOK {
 			t.Errorf("Accept %q: got status %d, body %s", accept, recorder.Code, recorder.Body.String())
 		}
+	}
+}
+
+// Clients that open the standalone GET event stream (Pebble Index does,
+// immediately after initialize) must get a live stream, not the stateless
+// handler's 405 - they treat that as a broken server and restart the
+// handshake.
+func TestStandaloneSSEStreamServed(t *testing.T) {
+	store, err := queue.Open(filepath.Join(t.TempDir(), "queue.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	handler, err := NewHandler(store, Config{PublicToken: testPublicToken, WorkerToken: testWorkerToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/mcp", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+testPublicToken)
+	request.Header.Set("Accept", "application/json,text/event-stream")
+	response, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("got status %d, want 200", response.StatusCode)
+	}
+	if contentType := response.Header.Get("Content-Type"); !strings.Contains(contentType, "text/event-stream") {
+		t.Fatalf("got content type %q, want text/event-stream", contentType)
 	}
 }

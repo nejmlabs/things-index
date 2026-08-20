@@ -158,7 +158,7 @@ func NewHandler(store Queue, config Config) (http.Handler, error) {
 	}
 
 	mux := http.NewServeMux()
-	mux.Handle("/mcp", securityHeaders(bearerAuth(config.PublicToken, originProtection.Handler(lenientAccept(mcpHandler)))))
+	mux.Handle("/mcp", securityHeaders(bearerAuth(config.PublicToken, originProtection.Handler(standaloneSSE(lenientAccept(mcpHandler))))))
 	mux.Handle("/worker/", securityHeaders(bearerAuth(config.WorkerToken, http.HandlerFunc(service.workerAPI))))
 	if config.DashboardToken != "" {
 		dashboard := newDashboardHandler(store, config.DashboardLimit)
@@ -188,6 +188,42 @@ func lenientAccept(next http.Handler) http.Handler {
 	})
 }
 
+// standaloneSSE serves the client-initiated GET event stream that the SDK's
+// stateless mode rejects with 405. Clients like Pebble Index open this stream
+// right after initialize and treat its failure as a broken server (observed
+// live: three full handshake retries). The server never pushes messages in
+// stateless mode, so an empty keep-alive stream satisfies them.
+func standaloneSSE(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet || !strings.Contains(request.Header.Get("Accept"), "text/event-stream") {
+			next.ServeHTTP(response, request)
+			return
+		}
+		flusher, ok := response.(http.Flusher)
+		if !ok {
+			next.ServeHTTP(response, request)
+			return
+		}
+		response.Header().Set("Content-Type", "text/event-stream")
+		response.Header().Set("Cache-Control", "no-cache, no-transform")
+		response.WriteHeader(http.StatusOK)
+		flusher.Flush()
+		keepAlive := time.NewTicker(25 * time.Second)
+		defer keepAlive.Stop()
+		for {
+			select {
+			case <-request.Context().Done():
+				return
+			case <-keepAlive.C:
+				if _, err := io.WriteString(response, ": keep-alive\n\n"); err != nil {
+					return
+				}
+				flusher.Flush()
+			}
+		}
+	})
+}
+
 // addTool registers a tool with an explicitly normalized input schema.
 // jsonschema-go infers optional pointer and slice fields as type
 // ["null","object"]/["null","array"]; several MCP client runtimes only accept
@@ -196,12 +232,18 @@ func lenientAccept(next http.Handler) http.Handler {
 // "invalid tool call" for every use). Optionality is already conveyed by the
 // field's absence from "required", so the null member carries no information.
 func addTool[In, Out any](server *mcp.Server, tool *mcp.Tool, handler mcp.ToolHandlerFor[In, Out]) {
-	schema, err := jsonschema.For[In](nil)
+	inputSchema, err := jsonschema.For[In](nil)
 	if err != nil {
 		panic(fmt.Sprintf("infer input schema for %s: %v", tool.Name, err))
 	}
-	stripNullTypes(schema)
-	tool.InputSchema = schema
+	stripNullTypes(inputSchema)
+	tool.InputSchema = inputSchema
+	outputSchema, err := jsonschema.For[Out](nil)
+	if err != nil {
+		panic(fmt.Sprintf("infer output schema for %s: %v", tool.Name, err))
+	}
+	stripNullTypes(outputSchema)
+	tool.OutputSchema = outputSchema
 	mcp.AddTool(server, tool, handler)
 }
 
