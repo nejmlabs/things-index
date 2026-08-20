@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# ThingsIndex — one-command Mac worker install:
+# ThingsIndex - one-command Mac worker install:
 #
 #   bash -c "$(curl -fsSL https://raw.githubusercontent.com/nejmlabs/things-index/main/deploy/mac-worker-install.sh)"
 #
 # Downloads the latest released universal binary (Apple Silicon + Intel) to
 # ~/.local/bin, verifies its GitHub build-provenance attestation when the gh
-# CLI is available, and launches the interactive setup wizard. Pass
-# --no-setup to install the binary only.
+# CLI is available, and launches the interactive setup wizard. To install the
+# binary only, pass --no-setup after a placeholder argv[0]:
+#
+#   bash -c "$(curl -fsSL .../mac-worker-install.sh)" install --no-setup
+
 set -euo pipefail
 
 REPO="nejmlabs/things-index"
@@ -25,6 +28,7 @@ echo "  ⬇️  ThingsIndex Mac Worker Installer"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 mkdir -p "${BIN_DIR}"
+trap 'rm -f "${BINARY}.download"' EXIT
 echo "• Downloading the latest things-index release..."
 curl -fL --progress-bar -o "${BINARY}.download" \
     "https://github.com/${REPO}/releases/latest/download/${ASSET}"
@@ -41,8 +45,8 @@ else
     echo "    To verify by hand later: gh attestation verify ${BINARY} --repo ${REPO}"
 fi
 
+chmod 0755 "${BINARY}.download"
 mv "${BINARY}.download" "${BINARY}"
-chmod 0755 "${BINARY}"
 echo "  ✓ Installed ${BINARY} ($("${BINARY}" version))"
 
 case ":${PATH}:" in

@@ -36,6 +36,7 @@ CT_CORES="1"
 CT_DISK="4"
 BRIDGE="vmbr0"
 PROXY_IP="${THINGS_INDEX_PROXY_IP:-}"
+REPO="nejmlabs/things-index"
 
 echo "• Allocating Container ID: ${CT_ID}"
 
@@ -83,7 +84,12 @@ pct create "${CT_ID}" "${TEMPLATE}" \
     --start 1
 
 echo "• Waiting for container network..."
-sleep 5
+for _ in $(seq 1 15); do
+    if pct exec "${CT_ID}" -- ip -4 addr show eth0 2>/dev/null | grep -q "inet "; then
+        break
+    fi
+    sleep 2
+done
 
 # 5. Generate Tokens
 PUB_TOKEN=$(openssl rand -hex 32)
@@ -102,18 +108,24 @@ apt-get install -y -qq curl git ufw sqlite3 ca-certificates build-essential > /d
 # Debian ships a Go too old for this module; install the official toolchain.
 GO_VERSION=1.26.0
 ARCH=$(dpkg --print-architecture)
-curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${ARCH}.tar.gz" | tar -C /usr/local -xz
+GO_TARBALL="go${GO_VERSION}.linux-${ARCH}.tar.gz"
+curl -fsSL -o "/tmp/${GO_TARBALL}" "https://go.dev/dl/${GO_TARBALL}"
+# The .sha256 sidecar lives on the download host, not go.dev/dl.
+echo "$(curl -fsSL "https://dl.google.com/go/${GO_TARBALL}.sha256")  /tmp/${GO_TARBALL}" | sha256sum -c - > /dev/null
+tar -C /usr/local -xzf "/tmp/${GO_TARBALL}"
+rm -f "/tmp/${GO_TARBALL}"
 
 # Clone and build ThingsIndex
-git clone https://github.com/nejmlabs/things-index.git /root/things-index
+git clone "https://github.com/${1}.git" /root/things-index
 cd /root/things-index
 /usr/local/go/bin/go build -o /usr/local/bin/things-index-server ./cmd/things-index-server
 
 # Create dedicated system user
-useradd -r -s /bin/false -d /var/lib/things-index things-index || true
+id -u things-index > /dev/null 2>&1 || useradd -r -s /bin/false -d /var/lib/things-index things-index
 mkdir -p /etc/things-index /var/lib/things-index
 chown -R things-index:things-index /var/lib/things-index
-'
+' build "${REPO}"
+# ^ "build" fills $0 of the quoted block so the repo slug arrives as $1.
 
 # The build is done; drop the container back to its runtime memory footprint.
 echo "• Reducing container memory to ${CT_RAM}MB for runtime..."
@@ -123,6 +135,7 @@ pct set "${CT_ID}" --memory "${CT_RAM}"
 #    appear on a command line visible in the host process list.
 ENV_FILE=$(mktemp)
 chmod 600 "${ENV_FILE}"
+trap 'rm -f "${ENV_FILE}"' EXIT
 cat << EOF > "${ENV_FILE}"
 THINGS_INDEX_LISTEN_ADDR=0.0.0.0:8080
 THINGS_INDEX_ALLOW_UNSPECIFIED_BIND=1
@@ -174,7 +187,22 @@ echo y | ufw enable
 # ^ "firewall" fills $0 of the quoted block so the proxy IP arrives as $1;
 #   passing it as an argument keeps the host value out of the script text.
 
-IP=$(pct exec "${CT_ID}" -- ip -4 addr show eth0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1)
+# A missing DHCP lease must not abort the install here: everything is built
+# and running by now, and the summary below is the only copy of the tokens
+# outside the container. Poll briefly, then fall back to a placeholder.
+IP=""
+for _ in $(seq 1 15); do
+    IP=$(pct exec "${CT_ID}" -- ip -4 addr show eth0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1 || true)
+    if [ -n "${IP}" ]; then
+        break
+    fi
+    sleep 2
+done
+if [ -z "${IP}" ]; then
+    IP="<container-ip>"
+    echo "⚠ Could not read the container's DHCP address; the summary uses a placeholder."
+    echo "  Find it later with: pct exec ${CT_ID} -- ip -4 addr show eth0"
+fi
 
 if [ -n "${PROXY_IP}" ]; then
     FIREWALL_NOTE="  • Firewall:          port 8080 restricted to ${PROXY_IP}"
