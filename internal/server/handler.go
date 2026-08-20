@@ -158,7 +158,7 @@ func NewHandler(store Queue, config Config) (http.Handler, error) {
 	}
 
 	mux := http.NewServeMux()
-	mux.Handle("/mcp", securityHeaders(bearerAuth(config.PublicToken, originProtection.Handler(mcpHandler))))
+	mux.Handle("/mcp", securityHeaders(bearerAuth(config.PublicToken, originProtection.Handler(lenientAccept(mcpHandler)))))
 	mux.Handle("/worker/", securityHeaders(bearerAuth(config.WorkerToken, http.HandlerFunc(service.workerAPI))))
 	if config.DashboardToken != "" {
 		dashboard := newDashboardHandler(store, config.DashboardLimit)
@@ -169,6 +169,23 @@ func NewHandler(store Queue, config Config) (http.Handler, error) {
 		_, _ = io.WriteString(response, `{"status":"ok"}`+"\n")
 	})
 	return mux, nil
+}
+
+// lenientAccept rewrites Accept headers the MCP SDK would reject with a 400.
+// The spec says clients send both "application/json" and "text/event-stream",
+// but common HTTP stacks default to "application/json" alone or omit the
+// header entirely (observed live with Pebble Index); such clients wanted a
+// JSON response, which the server produces anyway (JSONResponse mode), so
+// upgrading their Accept to the compliant pair only enables the exchange.
+func lenientAccept(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		accept := request.Header.Get("Accept")
+		if !strings.Contains(accept, "*/*") &&
+			(!strings.Contains(accept, "application/json") || !strings.Contains(accept, "text/event-stream")) {
+			request.Header.Set("Accept", "application/json, text/event-stream")
+		}
+		next.ServeHTTP(response, request)
+	})
 }
 
 // addTool registers a tool with an explicitly normalized input schema.

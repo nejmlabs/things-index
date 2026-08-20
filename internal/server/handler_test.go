@@ -327,3 +327,33 @@ func TestToolSchemasUseSingleTypes(t *testing.T) {
 		walk(tool.Name, decoded)
 	}
 }
+
+// Clients like Pebble Index send "Accept: application/json" without the
+// event-stream type the SDK insists on; the endpoint must serve them anyway.
+func TestPlainJSONAcceptHeaderServed(t *testing.T) {
+	store, err := queue.Open(filepath.Join(t.TempDir(), "queue.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	handler, err := NewHandler(store, Config{PublicToken: testPublicToken, WorkerToken: testWorkerToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, accept := range []string{"application/json", "application/json, text/event-stream", "*/*", ""} {
+		request := httptest.NewRequest(http.MethodPost, "http://things-index.test/mcp",
+			strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`))
+		request.Header.Set("Authorization", "Bearer "+testPublicToken)
+		request.Header.Set("Content-Type", "application/json")
+		if accept != "" {
+			request.Header.Set("Accept", accept)
+		}
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusOK {
+			t.Errorf("Accept %q: got status %d, body %s", accept, recorder.Code, recorder.Body.String())
+		}
+	}
+}
