@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -158,7 +159,7 @@ func NewHandler(store Queue, config Config) (http.Handler, error) {
 	}
 
 	mux := http.NewServeMux()
-	mux.Handle("/mcp", securityHeaders(bearerAuth(config.PublicToken, originProtection.Handler(standaloneSSE(lenientAccept(mcpHandler))))))
+	mux.Handle("/mcp", securityHeaders(bearerAuth(config.PublicToken, originProtection.Handler(standaloneSSE(lenientAccept(stripCacheExtensions(mcpHandler)))))))
 	mux.Handle("/worker/", securityHeaders(bearerAuth(config.WorkerToken, http.HandlerFunc(service.workerAPI))))
 	if config.DashboardToken != "" {
 		dashboard := newDashboardHandler(store, config.DashboardLimit)
@@ -207,6 +208,9 @@ func standaloneSSE(next http.Handler) http.Handler {
 		response.Header().Set("Content-Type", "text/event-stream")
 		response.Header().Set("Cache-Control", "no-cache, no-transform")
 		response.WriteHeader(http.StatusOK)
+		// An immediate comment gives clients a first byte to treat the
+		// stream as established instead of a silent 25-second wait.
+		_, _ = io.WriteString(response, ": connected\n\n")
 		flusher.Flush()
 		keepAlive := time.NewTicker(25 * time.Second)
 		defer keepAlive.Stop()
@@ -223,6 +227,60 @@ func standaloneSSE(next http.Handler) http.Handler {
 		}
 	})
 }
+
+// stripCacheExtensions removes the SDK's draft ttlMs/cacheScope result
+// extension fields, which the SDK always emits and strict client
+// deserializers (kotlinx.serialization rejects unknown keys by default)
+// choke on. Only buffered JSON responses are rewritten; anything else
+// passes through untouched.
+func stripCacheExtensions(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		buffer := &bufferedResponse{header: http.Header{}, status: http.StatusOK}
+		next.ServeHTTP(buffer, request)
+
+		body := buffer.body.Bytes()
+		if strings.Contains(buffer.header.Get("Content-Type"), "application/json") {
+			var envelope map[string]json.RawMessage
+			if err := json.Unmarshal(body, &envelope); err == nil {
+				if rawResult, ok := envelope["result"]; ok {
+					var result map[string]json.RawMessage
+					if err := json.Unmarshal(rawResult, &result); err == nil {
+						_, hadTTL := result["ttlMs"]
+						_, hadScope := result["cacheScope"]
+						if hadTTL || hadScope {
+							delete(result, "ttlMs")
+							delete(result, "cacheScope")
+							if newResult, err := json.Marshal(result); err == nil {
+								envelope["result"] = newResult
+								if newBody, err := json.Marshal(envelope); err == nil {
+									body = newBody
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		for name, values := range buffer.header {
+			for _, value := range values {
+				response.Header().Add(name, value)
+			}
+		}
+		response.Header().Set("Content-Length", fmt.Sprint(len(body)))
+		response.WriteHeader(buffer.status)
+		_, _ = response.Write(body)
+	})
+}
+
+type bufferedResponse struct {
+	header http.Header
+	body   bytes.Buffer
+	status int
+}
+
+func (b *bufferedResponse) Header() http.Header         { return b.header }
+func (b *bufferedResponse) Write(p []byte) (int, error) { return b.body.Write(p) }
+func (b *bufferedResponse) WriteHeader(status int)      { b.status = status }
 
 // addTool registers a tool with an explicitly normalized input schema.
 // jsonschema-go infers optional pointer and slice fields as type

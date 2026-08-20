@@ -398,3 +398,34 @@ func TestStandaloneSSEStreamServed(t *testing.T) {
 		t.Fatalf("got content type %q, want text/event-stream", contentType)
 	}
 }
+
+// The SDK stamps draft ttlMs/cacheScope extension fields onto list results;
+// strict client deserializers reject unknown keys, so they must be stripped.
+func TestResultsCarryNoCacheExtensions(t *testing.T) {
+	store, err := queue.Open(filepath.Join(t.TempDir(), "queue.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	handler, err := NewHandler(store, Config{PublicToken: testPublicToken, WorkerToken: testWorkerToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "http://things-index.test/mcp",
+		strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`))
+	request.Header.Set("Authorization", "Bearer "+testPublicToken)
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status %d, body %s", recorder.Code, recorder.Body.String())
+	}
+	body := recorder.Body.String()
+	if strings.Contains(body, "ttlMs") || strings.Contains(body, "cacheScope") {
+		t.Fatalf("cache extension fields still present: %s", body[:200])
+	}
+	if !strings.Contains(body, "capture_things_task") {
+		t.Fatal("tools missing from rewritten response")
+	}
+}
