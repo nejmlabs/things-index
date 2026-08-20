@@ -1,0 +1,31 @@
+# cloudflared configuration for a locally-managed Cloudflare Tunnel.
+#
+# Copy to /etc/cloudflared/config.yml on the machine running the ThingsIndex
+# server (the LXC or Docker host), after `cloudflared tunnel create things-index`.
+# For a dashboard-managed tunnel, recreate the same public-hostname + path
+# rules under Zero Trust > Networks > Tunnels instead of using this file.
+#
+# The server needs nothing special to sit behind the tunnel: it serves plain
+# HTTP on a loopback/private bind, ignores Host headers, and authenticates
+# with bearer tokens rather than client IPs.
+
+tunnel: REPLACE_WITH_TUNNEL_UUID
+credentials-file: /etc/cloudflared/REPLACE_WITH_TUNNEL_UUID.json
+
+ingress:
+  # Publish ONLY the MCP endpoint. Everything else on the server —
+  # /worker/, /healthz, /dashboard — stays off the public internet.
+  - hostname: things-index.example.com
+    path: ^/mcp$
+    service: http://localhost:8080
+
+  # Optional: let the Mac worker ride the tunnel's HTTPS instead of an SSH
+  # tunnel or reverse proxy (the worker requires HTTPS off loopback). If you
+  # enable this, add a Cloudflare Access service-token policy on this
+  # hostname as a second layer in front of the worker bearer token.
+  # - hostname: things-index-worker.example.com
+  #   path: ^/(worker/.*|healthz)$
+  #   service: http://localhost:8080
+
+  # Everything unmatched is refused.
+  - service: http_status:404

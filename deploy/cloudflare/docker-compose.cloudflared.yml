@@ -1,0 +1,19 @@
+# Cloudflare Tunnel sidecar for the Docker Compose deployment.
+#
+# For a dashboard-managed tunnel: set CLOUDFLARE_TUNNEL_TOKEN in .env, point
+# the tunnel's public hostname at http://things-index-server:8080 with a
+# path rule for /mcp only, then run:
+#
+#   docker compose -f docker-compose.yml \
+#     -f deploy/cloudflare/docker-compose.cloudflared.yml up -d
+
+services:
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: things-index-cloudflared
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      - things-index-server

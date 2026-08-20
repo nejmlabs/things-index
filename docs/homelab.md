@@ -54,11 +54,30 @@ not exist.
 
 Pebble Cloud needs public DNS and HTTPS reachability to the MCP hostname. This
 can use a narrowly scoped inbound route or an outbound tunnel that publishes
-only `/mcp`.
+only `/mcp` — `deploy/cloudflare/` shows a Cloudflare Tunnel configuration
+doing exactly that, with no inbound ports on the LAN at all.
 
 ## Mac worker
 
-Build `things-index-worker` natively on the Mac. Copy and fill in
+The supported path is the setup wizard, run in the logged-in Mac GUI session:
+
+```sh
+things-index worker --setup
+```
+
+It verifies the server URL and worker token against the live server, validates
+the optional Things auth token with one disposable test task, installs the
+bundled ThingsIndex Helper shortcut and settles its privacy dialogs, installs
+the LaunchAgent, and waits for the daemon to record its one-time Things 3
+automation consent. Approve each macOS dialog with **Always Allow** during this
+deliberate setup run.
+
+The worker requires HTTPS because its server is not on loopback; a reverse
+proxy hostname, an SSH tunnel to loopback, or a Cloudflare Tunnel hostname
+(see `deploy/cloudflare/`) all satisfy it.
+
+For a manual install instead of the wizard, build `things-index-worker`
+natively on the Mac and copy and fill in
 `deploy/launchd/com.nejmlabs.things-index-worker.plist.example` with:
 
 ```text
@@ -69,12 +88,8 @@ THINGS_INDEX_THINGS_AUTH_TOKEN=<optional Things URL-scheme auth token>
 THINGS_INDEX_JOURNAL_RETENTION_DAYS=30
 ```
 
-The worker requires HTTPS because its server is not on loopback. Before loading
-the LaunchAgent, run `things-index-worker --setup` in the logged-in Mac GUI
-session. Use **Install Shortcut**, **Verify Access**, and **Test Capture**;
-choose **Always Allow** for the deliberate first-use prompts. Finish only after
-the labelled test task is created and finalised. The setup page then exits.
-Routine captures must not prompt, and the normal worker accepts no inbound
+The daemon runs its automation-consent preflight at first start either way.
+Routine operation must not prompt, and the worker accepts no inbound
 connections.
 
 ## Verification order
