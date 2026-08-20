@@ -60,6 +60,8 @@ func main() {
 		}
 	case "config":
 		err = printConfig()
+	case "update":
+		err = runUpdate(os.Args[2:])
 	case "uninstall", "teardown":
 		err = runUninstall()
 	case "--version", "-v", "version":
@@ -1055,6 +1057,7 @@ Commands:
   worker          Run dedicated background worker connecting to a remote server
   worker --setup  Interactive Mac worker setup wizard (verifies server & token, installs launchd agent)
   config          Print ready-to-paste Claude Desktop stdio JSON configuration
+  update          Replace this binary with the latest release (verifies provenance; --force reinstalls)
   uninstall       Stop and cleanly remove all daemons, databases, crontab, and scripts
   version         Print things-index version
 

@@ -48,6 +48,16 @@ For 24/7 homelab infrastructure where the MCP server runs on Linux and leases jo
    * Installs a launchd LaunchAgent that starts at login, auto-restarts the worker if it crashes, and logs to `~/Library/Logs/ThingsIndex/`.
    * Walks you through the two one-time macOS permission dialogs (data access + Things automation) so background operation stays prompt-free.
 
+3. **Updating** — both halves update with one command:
+   * **Server** (on the Proxmox host — finds the `things-index` container, pulls, rebuilds, restarts):
+     ```bash
+     bash -c "$(wget -qLO - https://raw.githubusercontent.com/nejmlabs/things-index/main/deploy/proxmox-update.sh)"
+     ```
+   * **Mac worker** (self-update: downloads the latest release, verifies its provenance attestation, swaps the binary, restarts the agent):
+     ```bash
+     things-index update
+     ```
+
 ---
 
 ## 🛠️ Complete MCP Tools Directory
