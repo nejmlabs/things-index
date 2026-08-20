@@ -11,6 +11,10 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 # 1. Find Next Available Container ID
 CT_ID=$(pvesh get /cluster/nextid)
 CT_NAME="things-index"
+# The CGO sqlite3 build thrashes/OOMs below ~2GB (gcc on the SQLite
+# amalgamation); the server itself runs fine in 512MB, so the container is
+# created large for the build and shrunk afterwards.
+CT_RAM_BUILD="2048"
 CT_RAM="512"
 CT_CORES="1"
 CT_DISK="4"
@@ -52,7 +56,7 @@ echo "• Creating unprivileged LXC container..."
 pct create "${CT_ID}" "${TEMPLATE}" \
     --hostname "${CT_NAME}" \
     --cores "${CT_CORES}" \
-    --memory "${CT_RAM}" \
+    --memory "${CT_RAM_BUILD}" \
     --swap 0 \
     --rootfs "${STORAGE}:${CT_DISK}" \
     --features nesting=1 \
@@ -93,6 +97,10 @@ useradd -r -s /bin/false -d /var/lib/things-index things-index || true
 mkdir -p /etc/things-index /var/lib/things-index
 chown -R things-index:things-index /var/lib/things-index
 '
+
+# The build is done; drop the container back to its runtime memory footprint.
+echo "• Reducing container memory to ${CT_RAM}MB for runtime..."
+pct set "${CT_ID}" --memory "${CT_RAM}"
 
 # 7. Push server configuration into the container as a file, so tokens never
 #    appear on a command line visible in the host process list.
