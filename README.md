@@ -10,15 +10,12 @@ ThingsIndex is a Model Context Protocol (MCP) server for capturing, reading, sea
 For running directly on a Mac for local Claude Desktop or Cursor:
 
 ```bash
-# 1. Build the binary
-make build
-
-# 2. Get ready-to-paste Claude Desktop / Cursor stdio configuration:
-./bin/things-index config
-
-# 3. Or start a local Streamable HTTP MCP server:
-./bin/things-index start
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/nejmlabs/things-index/main/deploy/mac-install.sh)"
 ```
+
+This downloads the attested universal binary to `~/.local/bin` and ends with a choice: print the ready-to-paste Claude Desktop / Cursor stdio configuration, or start the local Streamable HTTP MCP server right away. Run `things-index install-shortcut` once to enable the heading tools in local mode (the worker wizard does this automatically in homelab mode).
+
+Building from source instead: `make build`, then `./bin/things-index config` or `./bin/things-index start`.
 
 ---
 
@@ -28,7 +25,11 @@ For 24/7 homelab infrastructure where the MCP server runs on Linux and leases jo
 1. **Deploy Server on Linux / Proxmox**:
    * **Proxmox VE 1-Click LXC Installer**:
      ```bash
+     # Open to the LAN (the final banner prints the commands to tighten it later):
      bash -c "$(wget -qLO - https://raw.githubusercontent.com/nejmlabs/things-index/main/deploy/proxmox-install.sh)"
+
+     # Or locked to your reverse proxy from the start (IPv4 or CIDR, validated up front):
+     THINGS_INDEX_PROXY_IP=<proxy-ip> bash -c "$(wget -qLO - https://raw.githubusercontent.com/nejmlabs/things-index/main/deploy/proxmox-install.sh)"
      ```
    * **Docker Compose** (the server refuses to start without tokens):
      ```bash
@@ -36,7 +37,15 @@ For 24/7 homelab infrastructure where the MCP server runs on Linux and leases jo
      docker compose up -d
      ```
 
-2. **Connect the Mac Worker (One Command)**:
+2. **Put HTTPS in front** (the worker refuses plain HTTP off loopback):
+   Any reverse proxy or tunnel satisfying the contract in [`deploy/README.md`](deploy/README.md) works. Two worked examples ship in the repo:
+   * [`deploy/traefik/`](deploy/traefik/) — inbound LAN reverse proxy (fill-in config + checklist).
+   * [`deploy/cloudflare/`](deploy/cloudflare/) — outbound Cloudflare Tunnel runbook: publishes only `/mcp`, no inbound ports on your network.
+   * **Quick test without either**: keep an SSH tunnel open from the Mac (`ssh -N -L 8080:<server-ip>:8080 <user>@<lan-host>`) and use `http://127.0.0.1:8080` in the next step.
+
+   Hostnames also need internal DNS records pointing at the proxy — the full phase-by-phase pathway (server, proxy, DNS, tunnel, worker, verification checklist) is in [`docs/homelab.md`](docs/homelab.md).
+
+3. **Connect the Mac Worker (One Command)**:
    ```bash
    bash -c "$(curl -fsSL https://raw.githubusercontent.com/nejmlabs/things-index/main/deploy/mac-worker-install.sh)"
    ```
@@ -48,7 +57,7 @@ For 24/7 homelab infrastructure where the MCP server runs on Linux and leases jo
    * Installs a launchd LaunchAgent that starts at login, auto-restarts the worker if it crashes, and logs to `~/Library/Logs/ThingsIndex/`.
    * Walks you through the two one-time macOS permission dialogs (data access + Things automation) so background operation stays prompt-free.
 
-3. **Updating** — both halves update with one command:
+4. **Updating** — both halves update with one command:
    * **Server** (on the Proxmox host — finds the `things-index` container, pulls, rebuilds, restarts):
      ```bash
      bash -c "$(wget -qLO - https://raw.githubusercontent.com/nejmlabs/things-index/main/deploy/proxmox-update.sh)"

@@ -11,9 +11,12 @@ because Things automation is available only on macOS. The worker must run in
 the GUI session of the user who owns the Things library. A locked session is
 fine, but the user must log in after a reboot.
 
-Before starting the background worker, run `things-index-worker --setup` in
-that GUI session. Its temporary loopback-only page installs the correctly named
-bundled Shortcut and verifies Things access; it is not another persistent
+Before starting the background worker, run the setup wizard in that GUI
+session: `things-index worker --setup` with the released unified binary — a
+terminal wizard, and the one the Mac one-command installer launches — or
+`things-index-worker --setup` with the source-built dedicated worker binary,
+which opens a temporary loopback-only page instead. Both install the correctly
+named bundled Shortcut and verify Things access; neither is another persistent
 service. macOS may request separate one-time grants for the helper's external
 dictionary input and Things actions. Choose **Always Allow** during setup;
 replacing the Shortcut resets those grants.
