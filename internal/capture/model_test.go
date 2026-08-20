@@ -8,14 +8,14 @@ import (
 func TestRequestValidate(t *testing.T) {
 	t.Parallel()
 
-	valid := Request{
+	valid := Request{TaskFields: TaskFields{
 		Title:       "Buy milk",
 		Destination: &Destination{Kind: DestinationProject, Name: "Shopping", Heading: "Groceries"},
 		Schedule:    &Schedule{Start: StartOnDate, Date: "2026-08-17", ReminderAt: "2026-08-17T08:15:00+01:00"},
 		Deadline:    "2026-08-18",
 		Tags:        []string{"Errand"},
 		Checklist:   []string{"Check fridge"},
-	}
+	}}
 	if err := valid.Validate(); err != nil {
 		t.Fatalf("valid request rejected: %v", err)
 	}
@@ -24,7 +24,7 @@ func TestRequestValidate(t *testing.T) {
 func TestRequestValidateRejectsHeadingOutsideProject(t *testing.T) {
 	t.Parallel()
 
-	request := Request{Title: "Buy milk", Destination: &Destination{Kind: DestinationArea, Name: "Home", Heading: "Groceries"}}
+	request := Request{TaskFields: TaskFields{Title: "Buy milk", Destination: &Destination{Kind: DestinationArea, Name: "Home", Heading: "Groceries"}}}
 	if err := request.Validate(); err == nil {
 		t.Fatal("expected an area heading to be rejected")
 	}
@@ -33,7 +33,7 @@ func TestRequestValidateRejectsHeadingOutsideProject(t *testing.T) {
 func TestRequestValidateRejectsInconsistentSchedule(t *testing.T) {
 	t.Parallel()
 
-	request := Request{Title: "Buy milk", Schedule: &Schedule{Start: StartAnytime, Date: "2026-08-17"}}
+	request := Request{TaskFields: TaskFields{Title: "Buy milk", Schedule: &Schedule{Start: StartAnytime, Date: "2026-08-17"}}}
 	if err := request.Validate(); err == nil {
 		t.Fatal("expected inconsistent schedule to be rejected")
 	}
@@ -42,7 +42,7 @@ func TestRequestValidateRejectsInconsistentSchedule(t *testing.T) {
 func TestRequestValidateRejectsEveningWithoutDate(t *testing.T) {
 	t.Parallel()
 
-	request := Request{Title: "Buy milk", Schedule: &Schedule{Start: StartAnytime, Evening: true}}
+	request := Request{TaskFields: TaskFields{Title: "Buy milk", Schedule: &Schedule{Start: StartAnytime, Evening: true}}}
 	if err := request.Validate(); err == nil {
 		t.Fatal("expected evening without an on-date schedule to be rejected")
 	}
@@ -51,7 +51,7 @@ func TestRequestValidateRejectsEveningWithoutDate(t *testing.T) {
 func TestRequestValidateRejectsMultilineChecklistItem(t *testing.T) {
 	t.Parallel()
 
-	request := Request{Title: "Buy milk", Checklist: []string{"First line\nSecond line"}}
+	request := Request{TaskFields: TaskFields{Title: "Buy milk", Checklist: []string{"First line\nSecond line"}}}
 	if err := request.Validate(); err == nil {
 		t.Fatal("expected a multiline checklist item to be rejected")
 	}
@@ -60,7 +60,7 @@ func TestRequestValidateRejectsMultilineChecklistItem(t *testing.T) {
 func TestRequestHashIsStable(t *testing.T) {
 	t.Parallel()
 
-	request := Request{Title: "Buy milk", Tags: []string{"Errand"}}
+	request := Request{TaskFields: TaskFields{Title: "Buy milk", Tags: []string{"Errand"}}}
 	first, err := request.Hash()
 	if err != nil {
 		t.Fatal(err)
@@ -77,17 +77,17 @@ func TestRequestHashIsStable(t *testing.T) {
 func TestRequestValidateIdempotencyKey(t *testing.T) {
 	t.Parallel()
 
-	valid := Request{Title: "Buy milk", IdempotencyKey: "pebble-event-12345"}
+	valid := Request{TaskFields: TaskFields{Title: "Buy milk", IdempotencyKey: "pebble-event-12345"}}
 	if err := valid.Validate(); err != nil {
 		t.Fatalf("valid idempotency key rejected: %v", err)
 	}
 
-	multiline := Request{Title: "Buy milk", IdempotencyKey: "key\nwith\nnewlines"}
+	multiline := Request{TaskFields: TaskFields{Title: "Buy milk", IdempotencyKey: "key\nwith\nnewlines"}}
 	if err := multiline.Validate(); err == nil {
 		t.Fatal("expected multiline idempotency key to be rejected")
 	}
 
-	tooLong := Request{Title: "Buy milk", IdempotencyKey: strings.Repeat("a", 129)}
+	tooLong := Request{TaskFields: TaskFields{Title: "Buy milk", IdempotencyKey: strings.Repeat("a", 129)}}
 	if err := tooLong.Validate(); err == nil {
 		t.Fatal("expected oversized idempotency key to be rejected")
 	}

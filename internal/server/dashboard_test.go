@@ -86,7 +86,7 @@ func TestDashboardRendersAuthoritativeJobStates(t *testing.T) {
 	if err := store.Fail(ctx, retrying.ID, retrying.LeaseToken, "temporary failure", true); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Enqueue(ctx, capture.Request{Title: "Pending task"}); err != nil {
+	if _, err := store.Enqueue(ctx, capture.Request{TaskFields: capture.TaskFields{Title: "Pending task"}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -147,7 +147,7 @@ func TestDashboardTreatsExpiredLeaseAsRetryPending(t *testing.T) {
 
 func enqueueAndLease(t *testing.T, ctx context.Context, store *queue.Store, title string) queue.Job {
 	t.Helper()
-	queued, err := store.Enqueue(ctx, capture.Request{Title: title})
+	queued, err := store.Enqueue(ctx, capture.Request{TaskFields: capture.TaskFields{Title: title}})
 	if err != nil {
 		t.Fatal(err)
 	}

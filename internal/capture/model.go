@@ -151,15 +151,26 @@ func (u UpdateTaskRequest) Validate() error {
 	return nil
 }
 
+// TaskFields is the user-facing surface of a task capture and the input type
+// of the capture_things_task tool on every server. Keeping it separate from
+// Request means tool schemas built from it never advertise the internal
+// job-envelope fields below, which bloated the advertised schema to 13KB and
+// misled client-side LLMs into generating invalid calls.
+type TaskFields struct {
+	Title          string       `json:"title" jsonschema:"Things task title."`
+	Notes          string       `json:"notes,omitempty" jsonschema:"Optional task notes."`
+	Destination    *Destination `json:"destination,omitempty" jsonschema:"Optional exact destination; omitted tasks go to Inbox."`
+	Schedule       *Schedule    `json:"schedule,omitempty" jsonschema:"Optional Things start date and reminder."`
+	Deadline       string       `json:"deadline,omitempty" jsonschema:"Optional deadline in YYYY-MM-DD form."`
+	Tags           []string     `json:"tags,omitempty" jsonschema:"Existing Things tag names to apply."`
+	Checklist      []string     `json:"checklist,omitempty" jsonschema:"Checklist lines to create."`
+	IdempotencyKey string       `json:"idempotency_key,omitempty" jsonschema:"Optional client-provided idempotency key for safe retries."`
+}
+
+// Request is the internal job envelope: the task fields plus exactly one
+// optional sub-request selecting a non-capture operation.
 type Request struct {
-	Title                 string                 `json:"title,omitempty" jsonschema:"Things task title."`
-	Notes                 string                 `json:"notes,omitempty" jsonschema:"Optional task notes."`
-	Destination           *Destination           `json:"destination,omitempty" jsonschema:"Optional exact destination; omitted tasks go to Inbox."`
-	Schedule              *Schedule              `json:"schedule,omitempty" jsonschema:"Optional Things start date and reminder."`
-	Deadline              string                 `json:"deadline,omitempty" jsonschema:"Optional deadline in YYYY-MM-DD form."`
-	Tags                  []string               `json:"tags,omitempty" jsonschema:"Existing Things tag names to apply."`
-	Checklist             []string               `json:"checklist,omitempty" jsonschema:"Checklist lines to create."`
-	IdempotencyKey        string                 `json:"idempotency_key,omitempty" jsonschema:"Optional client-provided idempotency key for safe retries."`
+	TaskFields
 	HeadingOperation      string                 `json:"heading_operation,omitempty"`
 	HeadingRequest        *HeadingRequest        `json:"heading_request,omitempty"`
 	ArchiveTaskRequest    *ArchiveTaskRequest    `json:"archive_task_request,omitempty"`

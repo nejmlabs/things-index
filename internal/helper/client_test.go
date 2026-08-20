@@ -84,7 +84,7 @@ func TestBuildAddURL(t *testing.T) {
 	t.Parallel()
 
 	location := time.FixedZone("BST", 3600)
-	task := capture.Request{
+	task := capture.Request{TaskFields: capture.TaskFields{
 		Title:       "Buy milk",
 		Notes:       "Glass bottles",
 		Destination: &capture.Destination{Kind: capture.DestinationProject, Name: "Shopping", Heading: "Groceries"},
@@ -96,7 +96,7 @@ func TestBuildAddURL(t *testing.T) {
 		Deadline:  "2026-08-19",
 		Tags:      []string{"Errand"},
 		Checklist: []string{"Item 1", "Item 2"},
-	}
+	}}
 
 	rawURL := buildAddURL("ThingsIndex pending [123]", task, []string{"Errand"}, "secret-token", location, time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC))
 	if !strings.HasPrefix(rawURL, "things:///add?") {
@@ -147,7 +147,7 @@ func TestBuildAddURLEvening(t *testing.T) {
 	location := time.FixedZone("BST", 3600)
 	now := time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC) // 2026-08-18 in BST
 	newTask := func(date string) capture.Request {
-		return capture.Request{
+		return capture.Request{TaskFields: capture.TaskFields{
 			Title: "Water plants",
 			Schedule: &capture.Schedule{
 				Start:      capture.StartOnDate,
@@ -155,7 +155,7 @@ func TestBuildAddURLEvening(t *testing.T) {
 				Evening:    true,
 				ReminderAt: date + "T17:30:00Z", // 18:30 in BST
 			},
-		}
+		}}
 	}
 
 	todayURL, err := url.Parse(buildAddURL("t", newTask("2026-08-18"), nil, "", location, now))
@@ -226,11 +226,11 @@ func TestClientCaptureAndFind(t *testing.T) {
 		Timeout: 5 * time.Second,
 	}
 
-	task := capture.Request{
+	task := capture.Request{TaskFields: capture.TaskFields{
 		Title:       "Buy milk",
 		Destination: &capture.Destination{Kind: capture.DestinationProject, Name: "Shopping"},
 		Tags:        []string{"Errand", "UnknownTag"},
-	}
+	}}
 
 	resp, err := client.Capture(context.Background(), testRequestID, task)
 	if err != nil {
@@ -276,20 +276,20 @@ func TestClientPreflightDestinationErrors(t *testing.T) {
 	}
 
 	// Project not found
-	_, err := client.Capture(context.Background(), testRequestID, capture.Request{
+	_, err := client.Capture(context.Background(), testRequestID, capture.Request{TaskFields: capture.TaskFields{
 		Title:       "Task",
 		Destination: &capture.Destination{Kind: capture.DestinationProject, Name: "NonExistent"},
-	})
+	}})
 	var opErr *OperationError
 	if !errors.As(err, &opErr) || opErr.Code != "destination_not_found" {
 		t.Fatalf("expected destination_not_found, got %v", err)
 	}
 
 	// Area not found
-	_, err = client.Capture(context.Background(), testRequestID, capture.Request{
+	_, err = client.Capture(context.Background(), testRequestID, capture.Request{TaskFields: capture.TaskFields{
 		Title:       "Task",
 		Destination: &capture.Destination{Kind: capture.DestinationArea, Name: "NonExistent"},
-	})
+	}})
 	if !errors.As(err, &opErr) || opErr.Code != "destination_not_found" {
 		t.Fatalf("expected destination_not_found for area, got %v", err)
 	}

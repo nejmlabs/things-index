@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -454,5 +455,202 @@ func TestResultsCarryNoCacheExtensions(t *testing.T) {
 	}
 	if !strings.Contains(body, "capture_things_task") {
 		t.Fatal("tools missing from rewritten response")
+	}
+}
+
+// The rewriter must never buffer the SDK's session-bound SSE stream: with the
+// old buffer-everything implementation this request hung until client
+// timeout because not even response headers were released.
+func TestSessionBoundSSEStreamsPromptly(t *testing.T) {
+	store, err := queue.Open(filepath.Join(t.TempDir(), "queue.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	handler, err := NewHandler(store, Config{PublicToken: testPublicToken, WorkerToken: testWorkerToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	initBody := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}`
+	initRequest, err := http.NewRequest(http.MethodPost, server.URL+"/mcp", strings.NewReader(initBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	initRequest.Header.Set("Authorization", "Bearer "+testPublicToken)
+	initRequest.Header.Set("Content-Type", "application/json")
+	initRequest.Header.Set("Accept", "application/json, text/event-stream")
+	initResponse, err := server.Client().Do(initRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initResponse.Body.Close()
+	session := initResponse.Header.Get("Mcp-Session-Id")
+	if session == "" {
+		t.Fatal("initialize returned no session id")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	streamRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/mcp", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	streamRequest.Header.Set("Authorization", "Bearer "+testPublicToken)
+	streamRequest.Header.Set("Accept", "application/json, text/event-stream")
+	streamRequest.Header.Set("Mcp-Session-Id", session)
+	streamResponse, err := server.Client().Do(streamRequest)
+	if err != nil {
+		t.Fatalf("session-bound GET did not return headers promptly: %v", err)
+	}
+	defer streamResponse.Body.Close()
+	if streamResponse.StatusCode != http.StatusOK {
+		t.Fatalf("status %d, want 200", streamResponse.StatusCode)
+	}
+	if contentType := streamResponse.Header.Get("Content-Type"); !strings.Contains(contentType, "text/event-stream") {
+		t.Fatalf("content type %q, want text/event-stream", contentType)
+	}
+}
+
+// Outer middleware pre-sets some of the same headers the SDK sets; the
+// rewriter must replace rather than append, and JSON statuses must survive.
+func TestResponseHeaderInvariants(t *testing.T) {
+	store, err := queue.Open(filepath.Join(t.TempDir(), "queue.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	handler, err := NewHandler(store, Config{PublicToken: testPublicToken, WorkerToken: testWorkerToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := initializeDirectSession(t, handler, "application/json, text/event-stream")
+
+	post := func(body string, withSession bool) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, "http://things-index.test/mcp", strings.NewReader(body))
+		request.Header.Set("Authorization", "Bearer "+testPublicToken)
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Accept", "application/json, text/event-stream")
+		if withSession {
+			request.Header.Set("Mcp-Session-Id", session)
+		}
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, request)
+		return recorder
+	}
+
+	notification := post(`{"jsonrpc":"2.0","method":"notifications/initialized"}`, true)
+	if notification.Code != http.StatusAccepted {
+		t.Errorf("notification status %d, want 202", notification.Code)
+	}
+	// The SDK grants session-less POSTs an implicit session, so tools/list
+	// without a session id succeeds; a bogus session id must not.
+	sessionless := post(`{"jsonrpc":"2.0","id":2,"method":"tools/list"}`, false)
+	if sessionless.Code != http.StatusOK {
+		t.Errorf("session-less tools/list status %d, want 200", sessionless.Code)
+	}
+	bogusRequest := httptest.NewRequest(http.MethodPost, "http://things-index.test/mcp",
+		strings.NewReader(`{"jsonrpc":"2.0","id":3,"method":"tools/list"}`))
+	bogusRequest.Header.Set("Authorization", "Bearer "+testPublicToken)
+	bogusRequest.Header.Set("Content-Type", "application/json")
+	bogusRequest.Header.Set("Accept", "application/json, text/event-stream")
+	bogusRequest.Header.Set("Mcp-Session-Id", "NOSUCHSESSION")
+	bogus := httptest.NewRecorder()
+	handler.ServeHTTP(bogus, bogusRequest)
+	if bogus.Code < 400 {
+		t.Errorf("bogus session status %d, want an error status", bogus.Code)
+	}
+	for name, recorder := range map[string]*httptest.ResponseRecorder{"202": notification, "200": sessionless, "4xx": bogus} {
+		for _, header := range []string{"Cache-Control", "X-Content-Type-Options", "Referrer-Policy"} {
+			if values := recorder.Header().Values(header); len(values) > 1 {
+				t.Errorf("%s response has duplicate %s: %v", name, header, values)
+			}
+		}
+	}
+}
+
+// capture_things_task must advertise exactly the public task fields — the
+// internal job-envelope sub-requests bloated the schema to 13KB and broke
+// strict clients.
+func TestCaptureToolSchemaIsMinimal(t *testing.T) {
+	store, err := queue.Open(filepath.Join(t.TempDir(), "queue.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	handler, err := NewHandler(store, Config{PublicToken: testPublicToken, WorkerToken: testWorkerToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := initializeDirectSession(t, handler, "application/json, text/event-stream")
+
+	request := httptest.NewRequest(http.MethodPost, "http://things-index.test/mcp",
+		strings.NewReader(`{"jsonrpc":"2.0","id":2,"method":"tools/list"}`))
+	request.Header.Set("Authorization", "Bearer "+testPublicToken)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json, text/event-stream")
+	request.Header.Set("Mcp-Session-Id", session)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+
+	var payload struct {
+		Result struct {
+			Tools []struct {
+				Name        string `json:"name"`
+				InputSchema struct {
+					Properties map[string]json.RawMessage `json:"properties"`
+					Required   []string                   `json:"required"`
+				} `json:"inputSchema"`
+			} `json:"tools"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	for _, tool := range payload.Result.Tools {
+		if tool.Name != "capture_things_task" {
+			continue
+		}
+		want := []string{"checklist", "deadline", "destination", "idempotency_key", "notes", "schedule", "tags", "title"}
+		var got []string
+		for field := range tool.InputSchema.Properties {
+			got = append(got, field)
+		}
+		slices.Sort(got)
+		if !slices.Equal(got, want) {
+			t.Errorf("capture_things_task fields = %v, want %v", got, want)
+		}
+		if !slices.Equal(tool.InputSchema.Required, []string{"title"}) {
+			t.Errorf("required = %v, want [title]", tool.InputSchema.Required)
+		}
+		return
+	}
+	t.Fatal("capture_things_task not found")
+}
+
+// A GET whose Accept asks only for JSON must never be upgraded into a
+// stream request the client did not ask for.
+func TestGETAcceptIsNotRewritten(t *testing.T) {
+	store, err := queue.Open(filepath.Join(t.TempDir(), "queue.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	handler, err := NewHandler(store, Config{PublicToken: testPublicToken, WorkerToken: testWorkerToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "http://things-index.test/mcp", nil)
+	request.Header.Set("Authorization", "Bearer "+testPublicToken)
+	request.Header.Set("Accept", "application/json")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if contentType := recorder.Header().Get("Content-Type"); strings.Contains(contentType, "text/event-stream") {
+		t.Fatalf("JSON-only GET was answered with an event stream")
+	}
+	if recorder.Code < 400 {
+		t.Fatalf("JSON-only GET status %d, want an error status", recorder.Code)
 	}
 }

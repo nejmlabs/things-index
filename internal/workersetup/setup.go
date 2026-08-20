@@ -203,7 +203,7 @@ func (a *application) testCapture(response http.ResponseWriter, request *http.Re
 
 	if a.thingsID == "" {
 		today := time.Now()
-		created, err := a.config.Verifier.Capture(request.Context(), a.testID, capture.Request{
+		created, err := a.config.Verifier.Capture(request.Context(), a.testID, capture.Request{TaskFields: capture.TaskFields{
 			Title: "ThingsIndex setup test — safe to delete",
 			Notes: "Created by the ThingsIndex setup GUI to verify background capture permissions.",
 			Schedule: &capture.Schedule{
@@ -213,7 +213,7 @@ func (a *application) testCapture(response http.ResponseWriter, request *http.Re
 			},
 			Deadline:  today.Add(24 * time.Hour).Format("2006-01-02"),
 			Checklist: []string{"Verify permissions", "Safe to delete"},
-		})
+		}})
 		if err != nil {
 			a.setState("failed", "Capture test could not create a task", err.Error(), true, false)
 			a.render(response)

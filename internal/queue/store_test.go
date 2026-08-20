@@ -18,7 +18,7 @@ func TestQueueLeaseAndComplete(t *testing.T) {
 	}
 	defer store.Close()
 	ctx := context.Background()
-	queued, err := store.Enqueue(ctx, capture.Request{Title: "Buy milk"})
+	queued, err := store.Enqueue(ctx, capture.Request{TaskFields: capture.TaskFields{Title: "Buy milk"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +50,7 @@ func TestQueueReleasesExpiredLease(t *testing.T) {
 	}
 	defer store.Close()
 	ctx := context.Background()
-	if _, err := store.Enqueue(ctx, capture.Request{Title: "Buy milk"}); err != nil {
+	if _, err := store.Enqueue(ctx, capture.Request{TaskFields: capture.TaskFields{Title: "Buy milk"}}); err != nil {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
@@ -77,7 +77,7 @@ func TestPruneTerminalRemovesOnlyExpiredTerminalJobs(t *testing.T) {
 	defer store.Close()
 	ctx := context.Background()
 
-	succeeded, err := store.Enqueue(ctx, capture.Request{Title: "Succeeded"})
+	succeeded, err := store.Enqueue(ctx, capture.Request{TaskFields: capture.TaskFields{Title: "Succeeded"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,7 @@ func TestPruneTerminalRemovesOnlyExpiredTerminalJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	failed, err := store.Enqueue(ctx, capture.Request{Title: "Failed"})
+	failed, err := store.Enqueue(ctx, capture.Request{TaskFields: capture.TaskFields{Title: "Failed"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +101,7 @@ func TestPruneTerminalRemovesOnlyExpiredTerminalJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	queued, err := store.Enqueue(ctx, capture.Request{Title: "Still queued"})
+	queued, err := store.Enqueue(ctx, capture.Request{TaskFields: capture.TaskFields{Title: "Still queued"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +142,7 @@ func TestListRecentOrdersAndLimitsJobs(t *testing.T) {
 
 	var jobs []Job
 	for _, title := range []string{"Oldest", "Middle", "Newest"} {
-		job, err := store.Enqueue(ctx, capture.Request{Title: title})
+		job, err := store.Enqueue(ctx, capture.Request{TaskFields: capture.TaskFields{Title: title}})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -178,11 +178,11 @@ func TestQueueIdempotency(t *testing.T) {
 	defer store.Close()
 	ctx := context.Background()
 
-	first, err := store.Enqueue(ctx, capture.Request{Title: "Buy milk", IdempotencyKey: "key-123"})
+	first, err := store.Enqueue(ctx, capture.Request{TaskFields: capture.TaskFields{Title: "Buy milk", IdempotencyKey: "key-123"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := store.Enqueue(ctx, capture.Request{Title: "Buy milk", IdempotencyKey: "key-123"})
+	second, err := store.Enqueue(ctx, capture.Request{TaskFields: capture.TaskFields{Title: "Buy milk", IdempotencyKey: "key-123"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,7 +190,7 @@ func TestQueueIdempotency(t *testing.T) {
 		t.Fatalf("expected identical job ID %q, got %q", first.ID, second.ID)
 	}
 
-	_, err = store.Enqueue(ctx, capture.Request{Title: "Buy tea", IdempotencyKey: "key-123"})
+	_, err = store.Enqueue(ctx, capture.Request{TaskFields: capture.TaskFields{Title: "Buy tea", IdempotencyKey: "key-123"}})
 	if err == nil {
 		t.Fatal("expected conflicting payload with same idempotency key to be rejected")
 	}
@@ -206,7 +206,7 @@ func TestQueueExpireLeasesCapsMaxAttempts(t *testing.T) {
 	defer store.Close()
 	ctx := context.Background()
 
-	job, err := store.Enqueue(ctx, capture.Request{Title: "Crash-prone task"})
+	job, err := store.Enqueue(ctx, capture.Request{TaskFields: capture.TaskFields{Title: "Crash-prone task"}})
 	if err != nil {
 		t.Fatal(err)
 	}

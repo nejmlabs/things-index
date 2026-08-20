@@ -28,6 +28,7 @@ import (
 	"github.com/nejmlabs/things-index/internal/queue"
 	"github.com/nejmlabs/things-index/internal/server"
 	"github.com/nejmlabs/things-index/internal/serverapp"
+	"github.com/nejmlabs/things-index/internal/toolschema"
 	"github.com/nejmlabs/things-index/internal/worker"
 	"github.com/nejmlabs/things-index/internal/workerapp"
 	shortcutasset "github.com/nejmlabs/things-index/shortcuts"
@@ -138,6 +139,7 @@ func runStandaloneHTTP() error {
 	srvHandler, err := server.NewHandler(queueStore, server.Config{
 		PublicToken: publicToken,
 		WorkerToken: workerToken,
+		Version:     version,
 	})
 	if err != nil {
 		return fmt.Errorf("create server: %w", err)
@@ -240,6 +242,15 @@ func runStandaloneHTTP() error {
 	return nil
 }
 
+// mustAddTool registers a tool through the shared schema normalization so
+// the stdio server advertises exactly the schemas the HTTP server does. A
+// registration error is a programmer error caught on first run.
+func mustAddTool[In, Out any](server *mcp.Server, tool *mcp.Tool, handler mcp.ToolHandlerFor[In, Out]) {
+	if err := toolschema.AddTool(server, tool, handler); err != nil {
+		log.Fatalf("register tool: %v", err)
+	}
+}
+
 func runStdio() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -256,14 +267,15 @@ func runStdio() error {
 		Instructions: "Capture tasks directly in Things 3 on this Mac.",
 	})
 
-	mcp.AddTool(mcpServer, &mcp.Tool{
+	mustAddTool(mcpServer, &mcp.Tool{
 		Name:        "capture_things_task",
 		Description: "Create one task in Things 3 on this Mac with zero prompts and zero window focus steal.",
-	}, func(callCtx context.Context, _ *mcp.CallToolRequest, task capture.Request) (*mcp.CallToolResult, struct {
+	}, func(callCtx context.Context, _ *mcp.CallToolRequest, input capture.TaskFields) (*mcp.CallToolResult, struct {
 		RequestID string `json:"request_id"`
 		Status    string `json:"status"`
 		ThingsID  string `json:"things_id,omitempty"`
 	}, error) {
+		task := capture.Request{TaskFields: input}
 		if err := task.Validate(); err != nil {
 			return nil, struct {
 				RequestID string `json:"request_id"`
@@ -293,7 +305,7 @@ func runStdio() error {
 		}, nil
 	})
 
-	mcp.AddTool(mcpServer, &mcp.Tool{
+	mustAddTool(mcpServer, &mcp.Tool{
 		Name:        "create_things_heading",
 		Description: "Create a new section heading inside a Things 3 project.",
 	}, func(callCtx context.Context, _ *mcp.CallToolRequest, input capture.HeadingRequest) (*mcp.CallToolResult, struct {
@@ -322,7 +334,7 @@ func runStdio() error {
 		}, nil
 	})
 
-	mcp.AddTool(mcpServer, &mcp.Tool{
+	mustAddTool(mcpServer, &mcp.Tool{
 		Name:        "archive_things_heading",
 		Description: "Archive/hide a section heading from an active Things 3 project.",
 	}, func(callCtx context.Context, _ *mcp.CallToolRequest, input capture.HeadingRequest) (*mcp.CallToolResult, struct {
@@ -351,7 +363,7 @@ func runStdio() error {
 		}, nil
 	})
 
-	mcp.AddTool(mcpServer, &mcp.Tool{
+	mustAddTool(mcpServer, &mcp.Tool{
 		Name:        "rename_things_heading",
 		Description: "Rename an existing section heading inside a Things 3 project.",
 	}, func(callCtx context.Context, _ *mcp.CallToolRequest, input capture.HeadingRequest) (*mcp.CallToolResult, struct {
@@ -386,7 +398,7 @@ func runStdio() error {
 		}, nil
 	})
 
-	mcp.AddTool(mcpServer, &mcp.Tool{
+	mustAddTool(mcpServer, &mcp.Tool{
 		Name:        "archive_things_task",
 		Description: "Archive a task in Things 3 (mark completed, canceled, or move to trash).",
 	}, func(callCtx context.Context, _ *mcp.CallToolRequest, input capture.ArchiveTaskRequest) (*mcp.CallToolResult, struct {
@@ -415,7 +427,7 @@ func runStdio() error {
 		}, nil
 	})
 
-	mcp.AddTool(mcpServer, &mcp.Tool{
+	mustAddTool(mcpServer, &mcp.Tool{
 		Name:        "archive_things_project",
 		Description: "Archive an entire project in Things 3 (mark completed or canceled).",
 	}, func(callCtx context.Context, _ *mcp.CallToolRequest, input capture.ArchiveProjectRequest) (*mcp.CallToolResult, struct {
@@ -444,7 +456,7 @@ func runStdio() error {
 		}, nil
 	})
 
-	mcp.AddTool(mcpServer, &mcp.Tool{
+	mustAddTool(mcpServer, &mcp.Tool{
 		Name:        "get_things_today",
 		Description: "Get all tasks scheduled for Today in Things 3.",
 	}, func(callCtx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
@@ -457,7 +469,7 @@ func runStdio() error {
 		return nil, items, nil
 	})
 
-	mcp.AddTool(mcpServer, &mcp.Tool{
+	mustAddTool(mcpServer, &mcp.Tool{
 		Name:        "get_things_inbox",
 		Description: "Get all unorganized tasks in Things 3 Inbox.",
 	}, func(callCtx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
@@ -470,7 +482,7 @@ func runStdio() error {
 		return nil, items, nil
 	})
 
-	mcp.AddTool(mcpServer, &mcp.Tool{
+	mustAddTool(mcpServer, &mcp.Tool{
 		Name:        "list_things_projects",
 		Description: "List all active projects and their areas in Things 3.",
 	}, func(callCtx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
@@ -483,7 +495,7 @@ func runStdio() error {
 		return nil, items, nil
 	})
 
-	mcp.AddTool(mcpServer, &mcp.Tool{
+	mustAddTool(mcpServer, &mcp.Tool{
 		Name:        "search_things_tasks",
 		Description: "Search tasks in Things 3 across any scope (today, inbox, anytime, someday, all) by title, project, area, or tag.",
 	}, func(callCtx context.Context, _ *mcp.CallToolRequest, input capture.QueryTasksRequest) (*mcp.CallToolResult, any, error) {
@@ -496,7 +508,7 @@ func runStdio() error {
 		return nil, items, nil
 	})
 
-	mcp.AddTool(mcpServer, &mcp.Tool{
+	mustAddTool(mcpServer, &mcp.Tool{
 		Name:        "create_things_project",
 		Description: "Create a new project in Things 3.",
 	}, func(callCtx context.Context, _ *mcp.CallToolRequest, input capture.CreateProjectRequest) (*mcp.CallToolResult, struct {
@@ -525,7 +537,7 @@ func runStdio() error {
 		}, nil
 	})
 
-	mcp.AddTool(mcpServer, &mcp.Tool{
+	mustAddTool(mcpServer, &mcp.Tool{
 		Name:        "update_things_task",
 		Description: "Update, reschedule, or add notes/checklists to an existing task in Things 3.",
 	}, func(callCtx context.Context, _ *mcp.CallToolRequest, input capture.UpdateTaskRequest) (*mcp.CallToolResult, struct {
@@ -619,7 +631,7 @@ func runWorkerSetup() error {
 		fmt.Println()
 		fmt.Println("  The worker requires HTTPS unless the server is reached via a literal")
 		fmt.Println("  loopback IP. For a homelab server on plain HTTP, either:")
-		fmt.Println("    • put it behind an HTTPS reverse proxy (see deploy/traefik), or")
+		fmt.Println("    • put it behind an HTTPS reverse proxy or tunnel (worked examples in deploy/), or")
 		fmt.Println("    • keep an SSH tunnel open: ssh -N -L 8080:<server-ip>:8080 <user>@<server-host>")
 		fmt.Println("      and enter http://127.0.0.1:8080 here instead.")
 		return errors.New("worker setup aborted: server URL rejected")
@@ -713,10 +725,10 @@ func runWorkerSetup() error {
 		defer cancelTest()
 		const testTitle = "ThingsIndex setup test — safe to delete"
 		testID := randomHex(16)
-		_, err := verifier.Capture(testCtx, testID, capture.Request{
+		_, err := verifier.Capture(testCtx, testID, capture.Request{TaskFields: capture.TaskFields{
 			Title: testTitle,
 			Notes: "Created by things-index worker --setup to validate the Things auth token.",
-		})
+		}})
 		if err != nil {
 			// A slow first launch can outlast the capture poll; reconcile the
 			// pending task the same way the worker does before giving up.

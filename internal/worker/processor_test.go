@@ -84,7 +84,7 @@ func TestProcessorCreatesAndFinalisesOnce(t *testing.T) {
 	defer store.Close()
 	fake := &fakeHelper{createdID: "things-1", appliedTags: []string{"Errand"}}
 	processor := &Processor{Helper: fake, Journal: store}
-	job := Job{ID: "00000000000000000000000000000001", Task: capture.Request{Title: "Buy milk", Notes: "note", Tags: []string{"Errand"}}}
+	job := Job{ID: "00000000000000000000000000000001", Task: capture.Request{TaskFields: capture.TaskFields{Title: "Buy milk", Notes: "note", Tags: []string{"Errand"}}}}
 	outcome, err := processor.Process(context.Background(), job)
 	if err != nil {
 		t.Fatal(err)
@@ -111,7 +111,7 @@ func TestProcessorRecoversCreatedTaskFromPendingTitle(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	job := Job{ID: "00000000000000000000000000000001", Task: capture.Request{Title: "Buy milk"}}
+	job := Job{ID: "00000000000000000000000000000001", Task: capture.Request{TaskFields: capture.TaskFields{Title: "Buy milk"}}}
 	hash, _ := job.Task.Hash()
 	if _, _, err := store.Ensure(context.Background(), job.ID, hash); err != nil {
 		t.Fatal(err)
@@ -145,10 +145,10 @@ func TestProcessorFallsBackToInboxWhenHeadingIsMissing(t *testing.T) {
 	processor := &Processor{Helper: fake, Journal: store}
 	outcome, err := processor.Process(context.Background(), Job{
 		ID: "00000000000000000000000000000001",
-		Task: capture.Request{
+		Task: capture.Request{TaskFields: capture.TaskFields{
 			Title:       "Buy milk",
 			Destination: &capture.Destination{Kind: capture.DestinationProject, Name: "Shopping", Heading: "Groceries"},
-		},
+		}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -172,7 +172,7 @@ func TestProcessorTreatsOmittedAppliedTagsAsUnverified(t *testing.T) {
 	fake := &fakeHelper{createdID: "things-1", appliedTags: nil}
 	processor := &Processor{Helper: fake, Journal: store}
 	outcome, err := processor.Process(context.Background(), Job{
-		ID: "00000000000000000000000000000001", Task: capture.Request{Title: "Buy milk", Tags: []string{"Errand"}},
+		ID: "00000000000000000000000000000001", Task: capture.Request{TaskFields: capture.TaskFields{Title: "Buy milk", Tags: []string{"Errand"}}},
 	})
 	if err != nil {
 		t.Fatal(err)
