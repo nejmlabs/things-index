@@ -182,7 +182,7 @@ cat << EOF > "${INFO_FILE}"
 }
 ────────────────────────────────────────────────────────────
   Connect the Mac worker (it requires HTTPS off-loopback):
-    • Behind an HTTPS reverse proxy (see deploy/traefik):
+    • Behind any HTTPS reverse proxy (worked examples in deploy/):
         things-index worker --setup   # URL: https://<your-proxy-host>
     • Or keep an SSH tunnel open from the Mac:
         ssh -N -L 8080:${IP}:8080 <user>@<a-lan-host>
