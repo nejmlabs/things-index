@@ -28,3 +28,31 @@ jobs:
         run: go test -race ./...
       - name: Shell syntax
         run: for script in deploy/*.sh; do bash -n "$script"; done
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t things-index-server:ci .
+      - name: Validate compose file
+        run: |
+          THINGS_INDEX_PUBLIC_TOKEN=ci THINGS_INDEX_WORKER_TOKEN=ci THINGS_INDEX_DASHBOARD_TOKEN=ci \
+            docker compose config --quiet
+      - name: Boot container and probe /healthz
+        run: |
+          docker run -d --name things-index-ci -p 8080:8080 \
+            -e THINGS_INDEX_PUBLIC_TOKEN="$(openssl rand -hex 32)" \
+            -e THINGS_INDEX_WORKER_TOKEN="$(openssl rand -hex 32)" \
+            -e THINGS_INDEX_DASHBOARD_TOKEN="$(openssl rand -hex 32)" \
+            things-index-server:ci
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/healthz > /dev/null; then
+              echo "✓ /healthz answered through the published port"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "server never became healthy; container logs:" >&2
+          docker logs things-index-ci >&2
+          exit 1
