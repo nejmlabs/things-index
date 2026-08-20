@@ -59,13 +59,17 @@ doing exactly that, with no inbound ports on the LAN at all.
 
 ## Mac worker
 
-The supported path is the setup wizard, run in the logged-in Mac GUI session:
+The supported path is the one-command installer, run in the logged-in Mac GUI
+session:
 
 ```sh
-things-index worker --setup
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/nejmlabs/things-index/main/deploy/mac-worker-install.sh)"
 ```
 
-It verifies the server URL and worker token against the live server, validates
+It installs the latest released universal binary to `~/.local/bin`, verifying
+GitHub's build-provenance attestation when the `gh` CLI is available, and
+launches the setup wizard (`things-index worker --setup`, rerunnable anytime).
+The wizard verifies the server URL and worker token against the live server, validates
 the optional Things auth token with one disposable test task, installs the
 bundled ThingsIndex Helper shortcut and settles its privacy dialogs, installs
 the LaunchAgent, and waits for the daemon to record its one-time Things 3

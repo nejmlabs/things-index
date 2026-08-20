@@ -36,10 +36,11 @@ For 24/7 homelab infrastructure where the MCP server runs on Linux and leases jo
      docker compose up -d
      ```
 
-2. **Connect the Mac Worker (10-Second Setup Wizard)**:
+2. **Connect the Mac Worker (One Command)**:
    ```bash
-   things-index worker --setup
+   bash -c "$(curl -fsSL https://raw.githubusercontent.com/nejmlabs/things-index/main/deploy/mac-worker-install.sh)"
    ```
+   This downloads the latest released universal binary (Apple Silicon + Intel) to `~/.local/bin`, verifies its GitHub build-provenance attestation when the `gh` CLI is present (`gh attestation verify ~/.local/bin/things-index --repo nejmlabs/things-index` by hand otherwise), and launches the setup wizard, which:
    * Verifies the server connection **and** the worker token before installing anything.
    * Validates your optional Things auth token with a disposable test task (the token unlocks deadline/tag/checklist updates).
    * Auto-detects the Things 3 SQLite database and verifies read-only connectivity.

@@ -1,0 +1,37 @@
+name: Release
+
+# Tag v* to build the universal macOS binary on a GitHub runner, attest its
+# build provenance, and publish the release asset the Mac one-liner installer
+# downloads. Attestation requires the build to happen here — a locally built
+# binary cannot carry GitHub provenance.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Test
+        run: go test ./...
+      - name: Build universal macOS binary
+        run: make dist-mac
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/things-index-darwin-universal
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/things-index-darwin-universal \
+            --title "${GITHUB_REF_NAME}" --generate-notes
