@@ -63,6 +63,8 @@ func main() {
 		err = printConfig()
 	case "update":
 		err = runUpdate(os.Args[2:])
+	case "install-shortcut":
+		err = runInstallShortcut()
 	case "uninstall", "teardown":
 		err = runUninstall()
 	case "--version", "-v", "version":
@@ -239,6 +241,27 @@ func runStandaloneHTTP() error {
 	if err := httpServer.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
+	return nil
+}
+
+// runInstallShortcut installs the bundled ThingsIndex Helper shortcut and
+// settles its privacy dialogs — the local-mode path to enabling the heading
+// tools, which the worker wizard otherwise handles as its steps 9-10.
+func runInstallShortcut() error {
+	if runtime.GOOS != "darwin" {
+		return errors.New("the ThingsIndex Helper shortcut runs in the macOS Shortcuts app; install it on the Mac that runs Things 3")
+	}
+	if err := installHelperShortcut(); err != nil {
+		return err
+	}
+	fmt.Println("• Verifying the helper shortcut (choose “Always Allow” on any privacy dialogs)...")
+	captureAdapter := helper.NewClient(os.Getenv("THINGS_INDEX_THINGS_AUTH_TOKEN"))
+	shortcutCtx, cancelShortcut := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancelShortcut()
+	if err := captureAdapter.PingHelperShortcut(shortcutCtx); err != nil {
+		return fmt.Errorf("the helper shortcut did not answer its ping (approve its privacy dialogs and rerun install-shortcut): %w", err)
+	}
+	fmt.Println("  ✓ Helper shortcut verified; heading tools are ready.")
 	return nil
 }
 
@@ -1069,6 +1092,7 @@ Commands:
   worker          Run dedicated background worker connecting to a remote server
   worker --setup  Interactive Mac worker setup wizard (verifies server & token, installs launchd agent)
   config          Print ready-to-paste Claude Desktop stdio JSON configuration
+  install-shortcut  Install the ThingsIndex Helper shortcut for the heading tools (macOS; the worker wizard does this automatically)
   update          Replace this binary with the latest release, macOS only (verifies provenance when the gh CLI is available; --force reinstalls)
   uninstall       Stop and cleanly remove all daemons, databases, crontab, and scripts
   version         Print things-index version

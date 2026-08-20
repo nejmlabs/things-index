@@ -513,7 +513,7 @@ func runHelperShortcut(ctx context.Context, runner CommandRunner, request map[st
 		if detail == "" {
 			detail = err.Error()
 		}
-		return shortcutResponse{}, fmt.Errorf("run the %q shortcut (install it with things-index worker --setup, or open shortcuts/ThingsIndex Helper.shortcut): %s", HelperShortcutName, detail)
+		return shortcutResponse{}, fmt.Errorf("run the %q shortcut (install it with things-index install-shortcut, or open shortcuts/ThingsIndex Helper.shortcut): %s", HelperShortcutName, detail)
 	}
 	var response shortcutResponse
 	if err := json.Unmarshal(bytes.TrimSpace(stdout), &response); err != nil {
