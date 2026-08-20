@@ -50,6 +50,14 @@ copy-paste ready — as examples, not endorsements:
 - [`cloudflare/`](cloudflare/) — an outbound Cloudflare Tunnel: publishes
   only `/mcp` to the internet with zero inbound ports on your network.
 
+**These two compose — the reference deployment runs both.** Traefik serves
+the private surface on the LAN (worker API, dashboard, local MCP clients —
+tokens never leave the network), while the tunnel publishes exactly `/mcp`
+to the internet so mobile clients like the Pebble Index ring keep working
+away from home. Either alone also works: tunnel-only (pair it with the SSH
+tunnel below for the worker), or proxy-only when every MCP client lives on
+the LAN or a VPN.
+
 Bringing a different proxy? Point it at the server per the contract above
 and run the two verification curls.
 
