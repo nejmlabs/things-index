@@ -1,12 +1,17 @@
 name: Release
 
-# Tag v* to build the universal macOS binary on a GitHub runner, attest its
-# build provenance, and publish the release asset the Mac one-liner installer
-# downloads. Attestation requires the build to happen here — a locally built
-# binary cannot carry GitHub provenance.
+# Tag v* to build the release assets on GitHub runners, attest their build
+# provenance, and publish them: the universal macOS binary the Mac one-liner
+# installer downloads, plus static Linux server binaries for amd64 and arm64.
+# Attestation requires the builds to happen here — a locally built binary
+# cannot carry GitHub provenance.
+#
+# workflow_dispatch runs the same builds as a dry run (artifacts only, no
+# release), so build breakage surfaces before the next tag, not during it.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -14,7 +19,7 @@ permissions:
   attestations: write
 
 jobs:
-  release:
+  build-mac:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -24,14 +29,80 @@ jobs:
       - name: Test
         run: go test ./...
       - name: Build universal macOS binary
-        run: make dist-mac VERSION="${GITHUB_REF_NAME}"
+        env:
+          VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: make dist-mac VERSION="${VERSION}"
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: dist/things-index-darwin-universal
+      - uses: actions/upload-artifact@v4
+        with:
+          name: things-index-darwin-universal
+          path: dist/things-index-darwin-universal
+          if-no-files-found: error
+
+  build-linux:
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      # Build inside Alpine and link statically against musl so the binary
+      # runs on any distro (Debian 12's glibc predates the runner's).
+      - name: Build static Linux server binary
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src -e TARGET_ARCH=${{ matrix.arch }} \
+            golang:1.26-alpine sh -euc '
+            apk add --no-cache gcc musl-dev sqlite-dev file
+            CGO_ENABLED=1 go build \
+              -ldflags="-s -w -linkmode external -extldflags -static" \
+              -o "dist/things-index-server-linux-${TARGET_ARCH}" ./cmd/things-index-server
+            file "dist/things-index-server-linux-${TARGET_ARCH}" | tee /dev/stderr \
+              | grep -q "statically linked"
+          '
+      - name: Smoke test outside the build container
+        env:
+          THINGS_INDEX_DB_PATH: ${{ runner.temp }}/queue.sqlite
+        run: |
+          set +e
+          OUT=$("dist/things-index-server-linux-${{ matrix.arch }}" 2>&1)
+          STATUS=$?
+          set -e
+          echo "${OUT}"
+          test "${STATUS}" -ne 0
+          echo "${OUT}" | grep -q "tokens must"
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/things-index-server-linux-${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: things-index-server-linux-${{ matrix.arch }}
+          path: dist/things-index-server-linux-${{ matrix.arch }}
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [build-mac, build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" dist/things-index-darwin-universal \
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/things-index-darwin-universal \
+            dist/things-index-server-linux-amd64 \
+            dist/things-index-server-linux-arm64 \
+            --repo "${GITHUB_REPOSITORY}" \
             --title "${GITHUB_REF_NAME}" --generate-notes

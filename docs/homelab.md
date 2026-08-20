@@ -22,9 +22,19 @@ port publishing to work. If the address comes from DHCP, reserve the lease in
 the DHCP server: the reverse proxy and firewall rules below pin this address
 and break silently when it changes.
 
-Build the server natively on Linux and install it as
-`/usr/local/bin/things-index-server` (the Proxmox installer automates this
-whole section):
+Install the server as `/usr/local/bin/things-index-server`. The fast path is
+the static release binary (amd64 and arm64, provenance-attested like the Mac
+asset, runs on any distro):
+
+```sh
+curl -fL -o /usr/local/bin/things-index-server \
+  "https://github.com/nejmlabs/things-index/releases/latest/download/things-index-server-linux-$(dpkg --print-architecture)"
+chmod 0755 /usr/local/bin/things-index-server
+# Verify provenance when the gh CLI is available:
+#   gh attestation verify /usr/local/bin/things-index-server --repo nejmlabs/things-index
+```
+
+Or build it natively (the Proxmox installer automates this whole section):
 
 ```sh
 # Go 1.26+ (distribution-packaged Go is usually too old) plus a C toolchain;
@@ -102,6 +112,52 @@ only `/mcp` — `deploy/cloudflare/` shows a Cloudflare Tunnel configuration
 doing exactly that, with no inbound ports on the LAN at all. Its README is a
 step-by-step runbook, including the headless `cloudflared tunnel login` flow.
 
+## No-domain alternative: persistent SSH tunnel
+
+The worker's one exception to the HTTPS requirement is plain HTTP to a
+literal loopback address, so a persistent SSH tunnel from the Mac to the
+server satisfies a LAN-only deployment with no domain, certificates, or
+reverse proxy at all. The trade-off: nothing is published, so Pebble Cloud
+(or any client outside the tunnel) cannot reach the server. Local MCP
+clients on the same Mac can, at `http://127.0.0.1:8080/mcp`.
+
+On the Mac, create a dedicated key for the tunnel:
+
+```sh
+ssh-keygen -t ed25519 -N "" -C things-index-tunnel -f ~/.ssh/things-index-tunnel
+```
+
+On the server, append the public key to the SSH user's
+`~/.ssh/authorized_keys`, restricted so the key can only forward to the
+server port — it cannot run commands even if it leaks:
+
+```text
+restrict,port-forwarding,permitopen="127.0.0.1:8080" ssh-ed25519 AAAA... things-index-tunnel
+```
+
+Back on the Mac, install the launchd template that keeps the tunnel up
+across reboots and dropped links (`ServerAliveInterval` detects dead
+connections and exits; launchd restarts ssh):
+
+```sh
+mkdir -p ~/Library/Logs/ThingsIndex ~/Library/LaunchAgents
+curl -fsSL -o ~/Library/LaunchAgents/com.nejmlabs.things-index-tunnel.plist \
+  https://raw.githubusercontent.com/nejmlabs/things-index/main/deploy/launchd/com.nejmlabs.things-index-tunnel.plist.example
+# Edit the file: REPLACE_ME → your username, REPLACE_WITH_SSH_TARGET → <user>@<server-host>
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.nejmlabs.things-index-tunnel.plist
+curl -s http://127.0.0.1:8080/healthz   # proves the tunnel end to end
+```
+
+Then run the worker wizard with `http://127.0.0.1:8080` as the server URL.
+
+The forward destination must be an address the server actually listens on:
+`127.0.0.1:8080` works for the Proxmox and Docker installs (they bind all
+interfaces), while a native systemd install bound to its LAN address needs
+that exact `THINGS_INDEX_LISTEN_ADDR` value as the destination — change it
+in the plist's `-L` argument and mirror it in the key's `permitopen`. The
+same applies when the SSH target is a different LAN host rather than the
+server itself (and the server's firewall must then admit that host on 8080).
+
 ## Internal DNS
 
 LAN clients — the Mac worker above all — reach the proxy by name, so both
@@ -178,9 +234,9 @@ connections.
   ```
 
 - **Docker Compose** — `git pull && docker compose up -d --build`.
-- **Native systemd** — repeat the build from the Linux server section, then
-  `systemctl restart things-index-server`. The build needs the same ~2GB of
-  free memory as at install time.
+- **Native systemd** — re-download the release binary (or repeat the native
+  build, which needs the same ~2GB of free memory as at install time), then
+  `systemctl restart things-index-server`.
 - **Mac worker** — `things-index update` self-updates: it queries the latest
   release, downloads that pinned tag's binary, verifies its provenance
   attestation when an authenticated `gh` CLI is available, smoke-tests it,

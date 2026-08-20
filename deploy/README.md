@@ -52,3 +52,10 @@ copy-paste ready — as examples, not endorsements:
 
 Bringing a different proxy? Point it at the server per the contract above
 and run the two verification curls.
+
+No domain? The worker's one exception to the contract is plain HTTP to a
+literal loopback address:
+[`launchd/com.nejmlabs.things-index-tunnel.plist.example`](launchd/com.nejmlabs.things-index-tunnel.plist.example)
+keeps an SSH tunnel to the server pinned up across reboots for exactly that
+— LAN-only, publishes nothing. Walkthrough in
+[`docs/homelab.md`](../docs/homelab.md).

@@ -41,7 +41,7 @@ For 24/7 homelab infrastructure where the MCP server runs on Linux and leases jo
    Any reverse proxy or tunnel satisfying the contract in [`deploy/README.md`](deploy/README.md) works. Two worked examples ship in the repo:
    * [`deploy/traefik/`](deploy/traefik/) — inbound LAN reverse proxy (fill-in config + checklist).
    * [`deploy/cloudflare/`](deploy/cloudflare/) — outbound Cloudflare Tunnel runbook: publishes only `/mcp`, no inbound ports on your network.
-   * **Quick test without either**: keep an SSH tunnel open from the Mac (`ssh -N -L 8080:<server-ip>:8080 <user>@<lan-host>`) and use `http://127.0.0.1:8080` in the next step.
+   * **No domain at all**: an SSH tunnel to loopback also satisfies the worker — one-off for a quick test (`ssh -N -L 8080:<server-ip>:8080 <user>@<lan-host>`), or persistent across reboots via the shipped launchd template ([`deploy/launchd/com.nejmlabs.things-index-tunnel.plist.example`](deploy/launchd/com.nejmlabs.things-index-tunnel.plist.example), walkthrough in [`docs/homelab.md`](docs/homelab.md)). Use `http://127.0.0.1:8080` in the next step. LAN-only: nothing is published for Pebble Cloud.
 
    Hostnames also need internal DNS records pointing at the proxy — the full phase-by-phase pathway (server, proxy, DNS, tunnel, worker, verification checklist) is in [`docs/homelab.md`](docs/homelab.md).
 

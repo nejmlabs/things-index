@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.nejmlabs.things-index-tunnel</string>
+
+    <!-- Keeps a loopback SSH tunnel to the ThingsIndex server up across
+         reboots and drops, so the Mac worker (and local MCP clients on this
+         Mac) can use http://127.0.0.1:8080 with no domain or reverse proxy.
+         Setup walkthrough: docs/homelab.md, "No-domain alternative".
+
+         REPLACE_WITH_SSH_TARGET is user@host for the Linux server itself
+         (then the -L destination below stays 127.0.0.1:8080), or any LAN
+         host that can reach the server (then change the destination to
+         <server-ip>:8080 and match it in the key's permitopen option). -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/ssh</string>
+        <string>-N</string>
+        <string>-i</string>
+        <string>/Users/REPLACE_ME/.ssh/things-index-tunnel</string>
+        <string>-o</string>
+        <string>BatchMode=yes</string>
+        <string>-o</string>
+        <string>ExitOnForwardFailure=yes</string>
+        <string>-o</string>
+        <string>ServerAliveInterval=30</string>
+        <string>-o</string>
+        <string>ServerAliveCountMax=3</string>
+        <string>-o</string>
+        <string>ConnectTimeout=10</string>
+        <string>-o</string>
+        <string>StrictHostKeyChecking=accept-new</string>
+        <string>-L</string>
+        <string>127.0.0.1:8080:127.0.0.1:8080</string>
+        <string>REPLACE_WITH_SSH_TARGET</string>
+    </array>
+
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/REPLACE_ME/Library/Logs/ThingsIndex/tunnel.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/REPLACE_ME/Library/Logs/ThingsIndex/tunnel-error.log</string>
+</dict>
+</plist>
