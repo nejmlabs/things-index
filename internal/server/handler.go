@@ -144,7 +144,9 @@ func NewHandler(store Queue, config Config) (http.Handler, error) {
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
 		return mcpServer
 	}, &mcp.StreamableHTTPOptions{
-		Stateless:                    true,
+		// Stateful: issue Mcp-Session-Id on initialize. Pebble Index's agent
+		// runtime abandons and endlessly restarts a session-less handshake
+		// (observed live), and stateful is what mainstream servers do anyway.
 		JSONResponse:                 true,
 		DisableLocalhostProtection:   true,
 		MaxRequestBodyBytes:          maxRequestBodyBytes,
@@ -196,7 +198,10 @@ func lenientAccept(next http.Handler) http.Handler {
 // stateless mode, so an empty keep-alive stream satisfies them.
 func standaloneSSE(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
-		if request.Method != http.MethodGet || !strings.Contains(request.Header.Get("Accept"), "text/event-stream") {
+		if request.Method != http.MethodGet || !strings.Contains(request.Header.Get("Accept"), "text/event-stream") ||
+			request.Header.Get("Mcp-Session-Id") != "" {
+			// Session-bound GETs go to the SDK, which serves the real
+			// notification stream; only session-less ones need the fallback.
 			next.ServeHTTP(response, request)
 			return
 		}

@@ -345,10 +345,12 @@ func TestPlainJSONAcceptHeaderServed(t *testing.T) {
 	}
 
 	for _, accept := range []string{"application/json", "application/json, text/event-stream", "*/*", ""} {
+		session := initializeDirectSession(t, handler, accept)
 		request := httptest.NewRequest(http.MethodPost, "http://things-index.test/mcp",
-			strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`))
+			strings.NewReader(`{"jsonrpc":"2.0","id":2,"method":"tools/list"}`))
 		request.Header.Set("Authorization", "Bearer "+testPublicToken)
 		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Mcp-Session-Id", session)
 		if accept != "" {
 			request.Header.Set("Accept", accept)
 		}
@@ -358,6 +360,29 @@ func TestPlainJSONAcceptHeaderServed(t *testing.T) {
 			t.Errorf("Accept %q: got status %d, body %s", accept, recorder.Code, recorder.Body.String())
 		}
 	}
+}
+
+// initializeDirectSession performs a raw initialize POST with the given
+// Accept header and returns the session id the server issued.
+func initializeDirectSession(t *testing.T, handler http.Handler, accept string) string {
+	t.Helper()
+	request := httptest.NewRequest(http.MethodPost, "http://things-index.test/mcp",
+		strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"direct","version":"0"}}}`))
+	request.Header.Set("Authorization", "Bearer "+testPublicToken)
+	request.Header.Set("Content-Type", "application/json")
+	if accept != "" {
+		request.Header.Set("Accept", accept)
+	}
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("Accept %q: initialize status %d, body %s", accept, recorder.Code, recorder.Body.String())
+	}
+	session := recorder.Header().Get("Mcp-Session-Id")
+	if session == "" {
+		t.Fatalf("Accept %q: initialize returned no Mcp-Session-Id", accept)
+	}
+	return session
 }
 
 // Clients that open the standalone GET event stream (Pebble Index does,
@@ -412,10 +437,12 @@ func TestResultsCarryNoCacheExtensions(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	session := initializeDirectSession(t, handler, "application/json, text/event-stream")
 	request := httptest.NewRequest(http.MethodPost, "http://things-index.test/mcp",
-		strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`))
+		strings.NewReader(`{"jsonrpc":"2.0","id":2,"method":"tools/list"}`))
 	request.Header.Set("Authorization", "Bearer "+testPublicToken)
 	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Mcp-Session-Id", session)
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusOK {
