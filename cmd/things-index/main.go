@@ -37,7 +37,7 @@ import (
 // version is overridden at release time via -ldflags "-X main.version=..."
 // (see the Makefile's dist-mac target), so release binaries always report
 // the tag they were built from; source builds report this fallback.
-var version = "0.2.3"
+var version = "0.2.4"
 
 func main() {
 	if len(os.Args) < 2 {
