@@ -241,9 +241,22 @@ connections.
   release, downloads that pinned tag's binary, verifies its provenance
   attestation when an authenticated `gh` CLI is available, smoke-tests it,
   and swaps it in (keeping a `.old` rollback copy) before restarting the
-  launchd agent. If Things permission prompts reappear after an update
-  (replacing a binary can reset macOS automation grants), re-run
-  `things-index worker --setup` from the Mac's GUI session.
+  launchd agent. **After every update, check the Mac's screen**: the new
+  binary is a new code identity to macOS, so the data-access and Things
+  automation grants reset, and the restarted daemon blocks silently on
+  consent dialogs until they are approved (Screen Sharing works). If only
+  the data-access dialog appears, force the automation preflight to re-run
+  too, so it cannot interrupt a later job:
+
+  ```sh
+  rm "$HOME/Library/Application Support/ThingsIndex/automation-consent-granted"
+  launchctl kickstart -k "gui/$(id -u)/com.nejmlabs.things-index-worker"
+  ```
+
+  Approve both dialogs, then confirm the log reads "worker ready":
+  `tail ~/Library/Logs/ThingsIndex/worker-error.log`. Re-running
+  `things-index worker --setup` from the Mac's GUI session settles the same
+  grants interactively.
 
 Back up `/var/lib/things-index/queue.sqlite` on the server and the worker's
 journal before upgrades that change their schema.
