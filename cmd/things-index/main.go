@@ -34,7 +34,10 @@ import (
 	shortcutasset "github.com/nejmlabs/things-index/shortcuts"
 )
 
-const version = "0.2.2"
+// version is overridden at release time via -ldflags "-X main.version=..."
+// (see the Makefile's dist-mac target), so release binaries always report
+// the tag they were built from; source builds report this fallback.
+var version = "0.2.2"
 
 func main() {
 	if len(os.Args) < 2 {

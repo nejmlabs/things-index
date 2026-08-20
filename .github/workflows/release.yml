@@ -24,7 +24,7 @@ jobs:
       - name: Test
         run: go test ./...
       - name: Build universal macOS binary
-        run: make dist-mac
+        run: make dist-mac VERSION="${GITHUB_REF_NAME}"
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
         with:
