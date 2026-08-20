@@ -4,11 +4,11 @@ import "testing"
 
 func TestNormalizeReleaseTag(t *testing.T) {
 	cases := map[string]string{
-		"v0.2.1":    "0.2.1",
-		"0.2.1":     "0.2.1",
-		" v1.0.0 ":  "1.0.0",
-		"v":         "",
-		"":          "",
+		"v0.2.1":   "0.2.1",
+		"0.2.1":    "0.2.1",
+		" v1.0.0 ": "1.0.0",
+		"v":        "",
+		"":         "",
 	}
 	for tag, want := range cases {
 		if got := normalizeReleaseTag(tag); got != want {

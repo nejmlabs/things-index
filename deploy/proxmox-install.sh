@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # ThingsIndex - Automated Proxmox VE LXC Provisioning Script
 # Run on Proxmox Host: bash -c "$(wget -qLO - https://raw.githubusercontent.com/nejmlabs/things-index/main/deploy/proxmox-install.sh)"
+#
+# Optional: THINGS_INDEX_PROXY_IP=<reverse-proxy IP> restricts the container
+# firewall so only that host can reach port 8080 (recommended once an HTTPS
+# proxy such as deploy/traefik/ fronts the server). Without it, 8080 is open
+# to the LAN and the final banner prints the commands to tighten it later.
 
 set -euo pipefail
 
@@ -10,6 +15,14 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "ℹ This takes several minutes. If connected over SSH, consider running"
 echo "  it inside tmux or screen so a dropped session cannot kill the install."
 echo "  The final summary (tokens included) is also saved on this host."
+
+# Fail on a malformed proxy address before doing anything at all: a typo
+# reaching ufw would abort the install after the build with the firewall
+# half-configured. ufw accepts a bare IPv4 or CIDR, so both are allowed.
+if [ -n "${THINGS_INDEX_PROXY_IP:-}" ] && ! [[ "${THINGS_INDEX_PROXY_IP}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/([0-9]|[12][0-9]|3[0-2]))?$ ]]; then
+    echo "✗ THINGS_INDEX_PROXY_IP must be an IPv4 address or CIDR, got: ${THINGS_INDEX_PROXY_IP}" >&2
+    exit 1
+fi
 
 # 1. Find Next Available Container ID
 CT_ID=$(pvesh get /cluster/nextid)
@@ -22,6 +35,7 @@ CT_RAM="512"
 CT_CORES="1"
 CT_DISK="4"
 BRIDGE="vmbr0"
+PROXY_IP="${THINGS_INDEX_PROXY_IP:-}"
 
 echo "• Allocating Container ID: ${CT_ID}"
 
@@ -148,11 +162,29 @@ systemctl enable --now things-index-server
 ufw default deny incoming
 ufw default allow outgoing
 ufw allow 22/tcp
-ufw allow 8080/tcp
+# Restrict 8080 to the reverse proxy when its address is known; otherwise the
+# whole LAN may reach the plain-HTTP endpoint until the rule is tightened.
+if [ -n "${1:-}" ]; then
+    ufw allow from "${1}" to any port 8080 proto tcp
+else
+    ufw allow 8080/tcp
+fi
 echo y | ufw enable
-'
+' firewall "${PROXY_IP}"
+# ^ "firewall" fills $0 of the quoted block so the proxy IP arrives as $1;
+#   passing it as an argument keeps the host value out of the script text.
 
 IP=$(pct exec "${CT_ID}" -- ip -4 addr show eth0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1)
+
+if [ -n "${PROXY_IP}" ]; then
+    FIREWALL_NOTE="  • Firewall:          port 8080 restricted to ${PROXY_IP}"
+else
+    FIREWALL_NOTE="  • Firewall:          port 8080 open to the whole LAN
+────────────────────────────────────────────────────────────
+  Once a reverse proxy fronts this server, lock 8080 down to it:
+    pct exec ${CT_ID} -- ufw delete allow 8080/tcp
+    pct exec ${CT_ID} -- ufw allow from <proxy-ip> to any port 8080 proto tcp"
+fi
 
 # 9. Persist the summary on the host before printing it, so a dropped SSH
 #    session cannot lose the tokens (they exist nowhere else outside the
@@ -191,6 +223,15 @@ cat << EOF > "${INFO_FILE}"
   ⚠ The MCP endpoint above is plain HTTP on your LAN, so bearer tokens
     travel unencrypted. Prefer terminating HTTPS at a reverse proxy for
     anything beyond a trusted home network.
+────────────────────────────────────────────────────────────
+${FIREWALL_NOTE}
+────────────────────────────────────────────────────────────
+  ⚠ The container's address came from DHCP. Reserve ${IP} for it in your
+    router or DHCP server: reverse-proxy configs and firewall rules pin
+    this address and break silently if the lease changes.
+
+  Upgrade later by running the update script on this host:
+    bash -c "\$(wget -qLO - https://raw.githubusercontent.com/nejmlabs/things-index/main/deploy/proxmox-update.sh)"
 EOF
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
