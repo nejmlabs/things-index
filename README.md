@@ -1,6 +1,6 @@
 # ThingsIndex
 
-ThingsIndex is a production-grade, zero-prompt Model Context Protocol (MCP) server for capturing, reading, searching, updating, and archiving tasks from **Pebble Index 01**, **Claude Desktop**, **Cursor**, and AI agents into **Things 3** on macOS.
+ThingsIndex is a Model Context Protocol (MCP) server for capturing, reading, searching, updating, and archiving tasks from **Pebble Index 01**, **Claude Desktop**, **Cursor**, and AI agents into **Things 3** on macOS.
 
 ---
 
@@ -69,7 +69,7 @@ For 24/7 homelab infrastructure where the MCP server runs on Linux and leases jo
 
 ---
 
-## 🔒 Key Guarantees
+## 🔒 Aims
 * **Zero-Prompt Execution**: Uses the official Things URL Scheme (`things:///add`, `add-project`, `update`) & read-only SQLite preflights. Task/project archiving falls back to AppleScript, which triggers macOS's one-time Automation permission grant on first use. Heading operations run Things' native App Intents through the bundled signed **ThingsIndex Helper** shortcut — the only automation surface that reaches headings — after its one-time install and privacy grant (see `shortcuts/README.md`).
 * **Zero Foreground Steal**: Suppresses window focus and automatically quits Things 3 (no Dock dot) if it was closed before capture.
 * **Strictly Read-Only SQLite (`_query_only=1`)**: Never performs raw SQL writes to Cultured Code's database; Cultured Code's official engine handles writing and Things Cloud sync.
