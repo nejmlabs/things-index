@@ -33,7 +33,7 @@ import (
 	shortcutasset "github.com/nejmlabs/things-index/shortcuts"
 )
 
-const version = "0.2.0"
+const version = "0.2.1"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -862,18 +862,17 @@ func installHelperShortcut() error {
 		return nil
 	}
 	fmt.Println("• Installing the ThingsIndex Helper shortcut...")
-	tempFile, err := os.CreateTemp("", "ThingsIndex Helper-*.shortcut")
+	// Shortcuts names an import after the file's basename, so the staged file
+	// must carry the exact library name — a CreateTemp-style random suffix
+	// would import as "ThingsIndex Helper-123456789" and never match the poll.
+	tempDir, err := os.MkdirTemp("", "things-index-shortcut")
 	if err != nil {
 		return fmt.Errorf("stage helper shortcut: %w", err)
 	}
-	tempPath := tempFile.Name()
-	defer os.Remove(tempPath)
-	if _, err := tempFile.Write(shortcutasset.Helper()); err != nil {
-		tempFile.Close()
+	defer os.RemoveAll(tempDir)
+	tempPath := filepath.Join(tempDir, helper.HelperShortcutName+".shortcut")
+	if err := os.WriteFile(tempPath, shortcutasset.Helper(), 0o600); err != nil {
 		return fmt.Errorf("write helper shortcut: %w", err)
-	}
-	if err := tempFile.Close(); err != nil {
-		return fmt.Errorf("close helper shortcut: %w", err)
 	}
 	if err := exec.Command("/usr/bin/open", tempPath).Run(); err != nil {
 		return fmt.Errorf("open helper shortcut in Shortcuts: %w", err)
@@ -887,7 +886,7 @@ func installHelperShortcut() error {
 		}
 		time.Sleep(2 * time.Second)
 	}
-	return fmt.Errorf("the %q shortcut did not appear within 3 minutes; click “Add Shortcut” in the Shortcuts app and rerun the wizard", helper.HelperShortcutName)
+	return fmt.Errorf("the %q shortcut did not appear within 3 minutes; click “Add Shortcut” in the Shortcuts app and rerun the wizard (if it imported under a different name, rename it to %q first)", helper.HelperShortcutName, helper.HelperShortcutName)
 }
 
 func helperShortcutInstalled() bool {
