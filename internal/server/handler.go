@@ -59,6 +59,22 @@ type statusInput struct {
 	RequestID string `json:"request_id" jsonschema:"Request identifier returned by capture_things_task."`
 }
 
+// captureTaskInput is the public face of capture_things_task: only the task
+// fields. The internal job envelope (capture.Request) also carries the
+// heading/archive/query/project/update sub-requests used by the other tools,
+// and advertising those in this tool's schema bloated it to 13KB and misled
+// client-side LLMs into generating invalid calls.
+type captureTaskInput struct {
+	Title          string               `json:"title" jsonschema:"Things task title."`
+	Notes          string               `json:"notes,omitempty" jsonschema:"Optional task notes."`
+	Destination    *capture.Destination `json:"destination,omitempty" jsonschema:"Optional exact destination; omitted tasks go to Inbox."`
+	Schedule       *capture.Schedule    `json:"schedule,omitempty" jsonschema:"Optional Things start date and reminder."`
+	Deadline       string               `json:"deadline,omitempty" jsonschema:"Optional deadline in YYYY-MM-DD form."`
+	Tags           []string             `json:"tags,omitempty" jsonschema:"Existing Things tag names to apply."`
+	Checklist      []string             `json:"checklist,omitempty" jsonschema:"Checklist lines to create."`
+	IdempotencyKey string               `json:"idempotency_key,omitempty" jsonschema:"Optional client-provided idempotency key for safe retries."`
+}
+
 func NewHandler(store Queue, config Config) (http.Handler, error) {
 	if store == nil {
 		return nil, errors.New("queue is required")
@@ -339,7 +355,17 @@ type service struct {
 	config Config
 }
 
-func (s *service) captureTask(ctx context.Context, _ *mcp.CallToolRequest, task capture.Request) (*mcp.CallToolResult, CaptureResult, error) {
+func (s *service) captureTask(ctx context.Context, _ *mcp.CallToolRequest, input captureTaskInput) (*mcp.CallToolResult, CaptureResult, error) {
+	task := capture.Request{
+		Title:          input.Title,
+		Notes:          input.Notes,
+		Destination:    input.Destination,
+		Schedule:       input.Schedule,
+		Deadline:       input.Deadline,
+		Tags:           input.Tags,
+		Checklist:      input.Checklist,
+		IdempotencyKey: input.IdempotencyKey,
+	}
 	if err := task.Validate(); err != nil {
 		return nil, CaptureResult{}, fmt.Errorf("invalid Things capture: %w", err)
 	}
