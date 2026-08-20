@@ -260,3 +260,70 @@ func decodeCaptureResult(t *testing.T, result *mcp.CallToolResult) CaptureResult
 	}
 	return decoded
 }
+
+// Strict MCP client runtimes reject tools whose schemas use JSON Schema type
+// arrays (e.g. ["null","object"]) when converting to LLM function-call
+// formats, so every registered tool must expose single-type schemas only.
+func TestToolSchemasUseSingleTypes(t *testing.T) {
+	store, err := queue.Open(filepath.Join(t.TempDir(), "queue.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	handler, err := NewHandler(store, Config{
+		PublicToken: testPublicToken,
+		WorkerToken: testWorkerToken,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inMemoryTransport := handlerTransport{handler: handler}
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "things-index-test", Version: "1"}, nil)
+	httpClient := &http.Client{Transport: authTransport{token: testPublicToken, base: inMemoryTransport}}
+	session, err := client.Connect(context.Background(), &mcp.StreamableClientTransport{
+		Endpoint:             "http://things-index.test/mcp",
+		HTTPClient:           httpClient,
+		DisableStandaloneSSE: true,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+
+	tools, err := session.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tools.Tools) == 0 {
+		t.Fatal("no tools registered")
+	}
+	var walk func(toolName string, node any)
+	walk = func(toolName string, node any) {
+		switch value := node.(type) {
+		case map[string]any:
+			if listed, ok := value["type"].([]any); ok {
+				t.Errorf("tool %s schema uses type array %v", toolName, listed)
+			}
+			for _, child := range value {
+				walk(toolName, child)
+			}
+		case []any:
+			for _, child := range value {
+				walk(toolName, child)
+			}
+		}
+	}
+	for _, tool := range tools.Tools {
+		raw, err := json.Marshal(tool.InputSchema)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var decoded any
+		if err := json.Unmarshal(raw, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		walk(tool.Name, decoded)
+	}
+}

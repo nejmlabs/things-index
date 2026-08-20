@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/nejmlabs/things-index/internal/capture"
 	"github.com/nejmlabs/things-index/internal/queue"
@@ -86,55 +87,55 @@ func NewHandler(store Queue, config Config) (http.Handler, error) {
 	})
 
 	service := &service{queue: store, config: config}
-	mcp.AddTool(mcpServer, &mcp.Tool{
+	addTool(mcpServer, &mcp.Tool{
 		Name:        "capture_things_task",
 		Description: "Create one task in Things on the connected Mac. The call may return queued while the Mac is offline.",
 	}, service.captureTask)
-	mcp.AddTool(mcpServer, &mcp.Tool{
+	addTool(mcpServer, &mcp.Tool{
 		Name:        "things_capture_status",
 		Description: "Check a Things capture using the request_id returned by capture_things_task.",
 	}, service.captureStatus)
-	mcp.AddTool(mcpServer, &mcp.Tool{
+	addTool(mcpServer, &mcp.Tool{
 		Name:        "create_things_heading",
 		Description: "Create a new section heading inside a Things 3 project.",
 	}, service.createHeading)
-	mcp.AddTool(mcpServer, &mcp.Tool{
+	addTool(mcpServer, &mcp.Tool{
 		Name:        "archive_things_heading",
 		Description: "Archive/hide a section heading from an active Things 3 project.",
 	}, service.archiveHeading)
-	mcp.AddTool(mcpServer, &mcp.Tool{
+	addTool(mcpServer, &mcp.Tool{
 		Name:        "rename_things_heading",
 		Description: "Rename an existing section heading inside a Things 3 project.",
 	}, service.renameHeading)
-	mcp.AddTool(mcpServer, &mcp.Tool{
+	addTool(mcpServer, &mcp.Tool{
 		Name:        "archive_things_task",
 		Description: "Archive a task in Things 3 (mark completed, canceled, or move to trash).",
 	}, service.archiveTask)
-	mcp.AddTool(mcpServer, &mcp.Tool{
+	addTool(mcpServer, &mcp.Tool{
 		Name:        "archive_things_project",
 		Description: "Archive an entire project in Things 3 (mark completed or canceled).",
 	}, service.archiveProject)
-	mcp.AddTool(mcpServer, &mcp.Tool{
+	addTool(mcpServer, &mcp.Tool{
 		Name:        "get_things_today",
 		Description: "Get all tasks scheduled for Today in Things 3.",
 	}, service.getToday)
-	mcp.AddTool(mcpServer, &mcp.Tool{
+	addTool(mcpServer, &mcp.Tool{
 		Name:        "get_things_inbox",
 		Description: "Get all unorganized tasks in Things 3 Inbox.",
 	}, service.getInbox)
-	mcp.AddTool(mcpServer, &mcp.Tool{
+	addTool(mcpServer, &mcp.Tool{
 		Name:        "list_things_projects",
 		Description: "List all active projects and their areas in Things 3.",
 	}, service.listProjects)
-	mcp.AddTool(mcpServer, &mcp.Tool{
+	addTool(mcpServer, &mcp.Tool{
 		Name:        "search_things_tasks",
 		Description: "Search tasks in Things 3 across any scope (today, inbox, anytime, someday, all) by title, project, area, or tag.",
 	}, service.searchTasks)
-	mcp.AddTool(mcpServer, &mcp.Tool{
+	addTool(mcpServer, &mcp.Tool{
 		Name:        "create_things_project",
 		Description: "Create a new project in Things 3.",
 	}, service.createProject)
-	mcp.AddTool(mcpServer, &mcp.Tool{
+	addTool(mcpServer, &mcp.Tool{
 		Name:        "update_things_task",
 		Description: "Update, reschedule, or add notes/checklists to an existing task in Things 3.",
 	}, service.updateTask)
@@ -168,6 +169,47 @@ func NewHandler(store Queue, config Config) (http.Handler, error) {
 		_, _ = io.WriteString(response, `{"status":"ok"}`+"\n")
 	})
 	return mux, nil
+}
+
+// addTool registers a tool with an explicitly normalized input schema.
+// jsonschema-go infers optional pointer and slice fields as type
+// ["null","object"]/["null","array"]; several MCP client runtimes only accept
+// a single type string when converting tool schemas to their LLM's
+// function-call format, and reject the whole tool otherwise (surfacing as
+// "invalid tool call" for every use). Optionality is already conveyed by the
+// field's absence from "required", so the null member carries no information.
+func addTool[In, Out any](server *mcp.Server, tool *mcp.Tool, handler mcp.ToolHandlerFor[In, Out]) {
+	schema, err := jsonschema.For[In](nil)
+	if err != nil {
+		panic(fmt.Sprintf("infer input schema for %s: %v", tool.Name, err))
+	}
+	stripNullTypes(schema)
+	tool.InputSchema = schema
+	mcp.AddTool(server, tool, handler)
+}
+
+func stripNullTypes(schema *jsonschema.Schema) {
+	if schema == nil {
+		return
+	}
+	if len(schema.Types) > 0 {
+		kept := make([]string, 0, len(schema.Types))
+		for _, t := range schema.Types {
+			if t != "null" {
+				kept = append(kept, t)
+			}
+		}
+		if len(kept) == 1 {
+			schema.Type, schema.Types = kept[0], nil
+		} else if len(kept) > 1 {
+			schema.Types = kept
+		}
+	}
+	for _, property := range schema.Properties {
+		stripNullTypes(property)
+	}
+	stripNullTypes(schema.Items)
+	stripNullTypes(schema.AdditionalProperties)
 }
 
 type service struct {
