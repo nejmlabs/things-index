@@ -7,6 +7,9 @@ set -euo pipefail
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  🚀 ThingsIndex Proxmox LXC Installer"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "ℹ This takes several minutes. If connected over SSH, consider running"
+echo "  it inside tmux or screen so a dropped session cannot kill the install."
+echo "  The final summary (tokens included) is also saved on this host."
 
 # 1. Find Next Available Container ID
 CT_ID=$(pvesh get /cluster/nextid)
@@ -151,19 +154,22 @@ echo y | ufw enable
 
 IP=$(pct exec "${CT_ID}" -- ip -4 addr show eth0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1)
 
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  ✅ ThingsIndex Server Successfully Deployed!"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  • Container ID:      ${CT_ID}"
-echo "  • IP Address:        ${IP}"
-echo "  • Server Endpoint:   http://${IP}:8080/mcp"
-echo "  • Public Token:      ${PUB_TOKEN}"
-echo "  • Worker Token:      ${WRK_TOKEN}"
-echo "  • Dashboard Token:   ${DSH_TOKEN}"
-echo "────────────────────────────────────────────────────────────"
-echo "  Paste this into your Claude Desktop / Pebble config:"
-echo ""
-cat << EOF
+# 9. Persist the summary on the host before printing it, so a dropped SSH
+#    session cannot lose the tokens (they exist nowhere else outside the
+#    container's /etc/things-index/server.env).
+INFO_FILE="/root/things-index-${CT_ID}.info"
+touch "${INFO_FILE}"
+chmod 600 "${INFO_FILE}"
+cat << EOF > "${INFO_FILE}"
+  • Container ID:      ${CT_ID}
+  • IP Address:        ${IP}
+  • Server Endpoint:   http://${IP}:8080/mcp
+  • Public Token:      ${PUB_TOKEN}
+  • Worker Token:      ${WRK_TOKEN}
+  • Dashboard Token:   ${DSH_TOKEN}
+────────────────────────────────────────────────────────────
+  Paste this into your Claude Desktop / Pebble config:
+
 {
   "mcpServers": {
     "things": {
@@ -174,16 +180,23 @@ cat << EOF
     }
   }
 }
+────────────────────────────────────────────────────────────
+  Connect the Mac worker (it requires HTTPS off-loopback):
+    • Behind an HTTPS reverse proxy (see deploy/traefik):
+        things-index worker --setup   # URL: https://<your-proxy-host>
+    • Or keep an SSH tunnel open from the Mac:
+        ssh -N -L 8080:${IP}:8080 <user>@<a-lan-host>
+        things-index worker --setup   # URL: http://127.0.0.1:8080
+
+  ⚠ The MCP endpoint above is plain HTTP on your LAN, so bearer tokens
+    travel unencrypted. Prefer terminating HTTPS at a reverse proxy for
+    anything beyond a trusted home network.
 EOF
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  ✅ ThingsIndex Server Successfully Deployed!"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+cat "${INFO_FILE}"
 echo "────────────────────────────────────────────────────────────"
-echo "  Connect the Mac worker (it requires HTTPS off-loopback):"
-echo "    • Behind an HTTPS reverse proxy (see deploy/traefik):"
-echo "        things-index worker --setup   # URL: https://<your-proxy-host>"
-echo "    • Or keep an SSH tunnel open from the Mac:"
-echo "        ssh -N -L 8080:${IP}:8080 <user>@<a-lan-host>"
-echo "        things-index worker --setup   # URL: http://127.0.0.1:8080"
-echo ""
-echo "  ⚠ The MCP endpoint above is plain HTTP on your LAN, so bearer tokens"
-echo "    travel unencrypted. Prefer terminating HTTPS at a reverse proxy for"
-echo "    anything beyond a trusted home network."
+echo "  ℹ This summary is saved on this host: ${INFO_FILE}"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
