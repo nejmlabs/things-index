@@ -849,7 +849,7 @@ func TestHeadingOperationsExplainMissingShortcut(t *testing.T) {
 	client, _ := headingTestClient(t, runner)
 
 	_, err := client.CreateHeading(context.Background(), "Shopping", "Groceries")
-	if err == nil || !strings.Contains(err.Error(), "worker --setup") {
+	if err == nil || !strings.Contains(err.Error(), "install-shortcut") {
 		t.Fatalf("expected install remediation in error, got %v", err)
 	}
 }
