@@ -87,7 +87,7 @@ func NewHandler(store Queue, config Config) (http.Handler, error) {
 		Name:    "things-index",
 		Version: config.Version,
 	}, &mcp.ServerOptions{
-		Instructions: "Capture tasks in Things. Use the returned request_id to check a queued capture.",
+		Instructions: "Capture tasks in Things. Use things_capture_status with the returned request_id to check any queued operation. " + toolschema.ProjectWorkflowInstructions,
 		Capabilities: &mcp.ServerCapabilities{},
 	})
 
@@ -100,7 +100,7 @@ func NewHandler(store Queue, config Config) (http.Handler, error) {
 	}
 	register(toolschema.AddTool(mcpServer, &mcp.Tool{
 		Name:        "capture_things_task",
-		Description: "Create one task in Things on the connected Mac. The call may return queued while the Mac is offline.",
+		Description: "Create one task in Things on the connected Mac. Exact or clear fuzzy project matches use that project. Missing or ambiguous projects, including unavailable project IDs, save to Inbox with requested project and heading in notes and a warning. No clarification question is needed. The call may return queued while the Mac is offline.",
 	}, service.captureTask))
 	register(toolschema.AddTool(mcpServer, &mcp.Tool{
 		Name:        "things_capture_status",
@@ -144,7 +144,7 @@ func NewHandler(store Queue, config Config) (http.Handler, error) {
 	}, service.searchTasks))
 	register(toolschema.AddTool(mcpServer, &mcp.Tool{
 		Name:        "create_things_project",
-		Description: "Create a new project in Things 3.",
+		Description: "Create a project in Things 3 using the requested title and optional area. After creation succeeds, use its things_id as destination.id when adding tasks to it.",
 	}, service.createProject))
 	register(toolschema.AddTool(mcpServer, &mcp.Tool{
 		Name:        "update_things_task",

@@ -37,7 +37,7 @@ import (
 // version is overridden at release time via -ldflags "-X main.version=..."
 // (see the Makefile's dist-mac target), so release binaries always report
 // the tag they were built from; source builds report this fallback.
-var version = "0.2.4"
+var version = "0.2.5"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -277,6 +277,13 @@ func mustAddTool[In, Out any](server *mcp.Server, tool *mcp.Tool, handler mcp.To
 	}
 }
 
+type stdioCaptureResult struct {
+	RequestID string   `json:"request_id"`
+	Status    string   `json:"status"`
+	ThingsID  string   `json:"things_id,omitempty"`
+	Warnings  []string `json:"warnings,omitempty"`
+}
+
 func runStdio() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -290,44 +297,29 @@ func runStdio() error {
 		Name:    "things-index",
 		Version: version,
 	}, &mcp.ServerOptions{
-		Instructions: "Capture tasks directly in Things 3 on this Mac.",
+		Instructions: "Capture tasks directly in Things 3 on this Mac. " + toolschema.ProjectWorkflowInstructions,
 	})
 
 	mustAddTool(mcpServer, &mcp.Tool{
 		Name:        "capture_things_task",
-		Description: "Create one task in Things 3 on this Mac with zero prompts and zero window focus steal.",
-	}, func(callCtx context.Context, _ *mcp.CallToolRequest, input capture.TaskFields) (*mcp.CallToolResult, struct {
-		RequestID string `json:"request_id"`
-		Status    string `json:"status"`
-		ThingsID  string `json:"things_id,omitempty"`
-	}, error) {
+		Description: "Create one task in Things 3 on this Mac. Exact or clear fuzzy project matches use that project. Missing or ambiguous projects, including unavailable project IDs, save to Inbox with requested project and heading in notes and a warning. No clarification question is needed.",
+	}, func(callCtx context.Context, _ *mcp.CallToolRequest, input capture.TaskFields) (*mcp.CallToolResult, stdioCaptureResult, error) {
 		task := capture.Request{TaskFields: input}
 		if err := task.Validate(); err != nil {
-			return nil, struct {
-				RequestID string `json:"request_id"`
-				Status    string `json:"status"`
-				ThingsID  string `json:"things_id,omitempty"`
-			}{}, fmt.Errorf("invalid Things task: %w", err)
+			return nil, stdioCaptureResult{}, fmt.Errorf("invalid Things task: %w", err)
 		}
 
 		reqID := randomHex(16)
 		resp, err := captureAdapter.Capture(callCtx, reqID, task)
 		if err != nil {
-			return nil, struct {
-				RequestID string `json:"request_id"`
-				Status    string `json:"status"`
-				ThingsID  string `json:"things_id,omitempty"`
-			}{}, fmt.Errorf("capture task in Things 3: %w", err)
+			return nil, stdioCaptureResult{}, fmt.Errorf("capture task in Things 3: %w", err)
 		}
 
-		return nil, struct {
-			RequestID string `json:"request_id"`
-			Status    string `json:"status"`
-			ThingsID  string `json:"things_id,omitempty"`
-		}{
+		return nil, stdioCaptureResult{
 			RequestID: reqID,
 			Status:    "created",
 			ThingsID:  resp.ID,
+			Warnings:  resp.Warnings,
 		}, nil
 	})
 
@@ -536,7 +528,7 @@ func runStdio() error {
 
 	mustAddTool(mcpServer, &mcp.Tool{
 		Name:        "create_things_project",
-		Description: "Create a new project in Things 3.",
+		Description: "Create a project in Things 3 using the requested title and optional area. After creation succeeds, use its things_id as destination.id when adding tasks to it.",
 	}, func(callCtx context.Context, _ *mcp.CallToolRequest, input capture.CreateProjectRequest) (*mcp.CallToolResult, struct {
 		Status   string `json:"status"`
 		ThingsID string `json:"things_id,omitempty"`

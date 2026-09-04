@@ -1,0 +1,5 @@
+package toolschema
+
+// ProjectWorkflowInstructions keeps both MCP transports consistent for voice
+// capture and the create-project-then-add-task workflow.
+const ProjectWorkflowInstructions = "Index 01 accepts one spoken command and cannot answer clarification questions. When capturing a new task in an existing project, pass the name as spoken or an explicit project ID. Exact names take priority, and a clear partial name or typo is matched automatically. Missing or ambiguous projects, including unavailable explicit IDs, save the task in Inbox with the requested project and heading in its notes. Explain the selected project or Inbox fallback from the returned warning in your confirmation; do not ask a follow-up question or offer project choices. Use create_things_project only when the user explicitly asks for a new project; it uses the requested title and an optional exact area. Once creation succeeds, pass its things_id as capture_things_task destination.id with kind project. If project creation fails, report the failure without asking for clarification. A queued result is not confirmation that the task or project has been created."

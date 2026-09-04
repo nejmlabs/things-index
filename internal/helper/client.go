@@ -60,6 +60,7 @@ type Response struct {
 	ID          string   `json:"id,omitempty"`
 	IDs         []string `json:"ids,omitempty"`
 	AppliedTags []string `json:"appliedTags,omitempty"`
+	Warnings    []string `json:"warnings,omitempty"`
 	Code        string   `json:"code,omitempty"`
 }
 
@@ -205,17 +206,39 @@ func (c *Client) Capture(ctx context.Context, requestID string, task capture.Req
 		location = time.Local
 	}
 
-	// 1. Preflight destination existence and ambiguity
-	if task.Destination != nil && task.Destination.Name != "" {
+	// Resolve a copy: the caller's original destination remains part of its
+	// durable request hash. Dispatch the selected project by ID, not its title.
+	var warnings []string
+	if task.Destination != nil {
+		destination := *task.Destination
+		task.Destination = &destination
 		switch task.Destination.Kind {
 		case capture.DestinationProject:
-			projectUUID, err := findProjectUUID(ctx, db, task.Destination.Name)
+			project, err := resolveCaptureProject(ctx, db, destination.Name, destination.ID)
 			if err != nil {
-				return Response{}, err
+				var matchErr *ProjectMatchError
+				if !errors.As(err, &matchErr) {
+					return Response{}, err
+				}
+				// Index 01 cannot answer a clarification question. Preserve the
+				// task and requested placement without guessing between projects.
+				warning := projectInboxWarning(destination, matchErr)
+				warnings = append(warnings, warning)
+				if task.Notes != "" {
+					task.Notes += "\n\n"
+				}
+				task.Notes += warning
+				destination = capture.Destination{Kind: capture.DestinationInbox}
+				break
 			}
+			if destination.ID == "" && !strings.EqualFold(strings.TrimSpace(destination.Name), project.Title) {
+				warnings = append(warnings, fmt.Sprintf("ThingsIndex warning: matched project %q to %q.", destination.Name, project.Title))
+			}
+			destination.ID = project.ID
+			destination.Name = project.Title
 
 			if task.Destination.Heading != "" {
-				headingRows, err := db.QueryContext(ctx, `SELECT uuid FROM TMTask WHERE type = 2 AND LOWER(title) = LOWER(?) AND project = ? AND trashed = 0`, task.Destination.Heading, projectUUID)
+				headingRows, err := db.QueryContext(ctx, `SELECT uuid FROM TMTask WHERE type = 2 AND LOWER(title) = LOWER(?) AND project = ? AND trashed = 0`, task.Destination.Heading, project.ID)
 				if err != nil {
 					return Response{}, fmt.Errorf("query destination heading: %w", err)
 				}
@@ -332,6 +355,7 @@ func (c *Client) Capture(ctx context.Context, requestID string, task capture.Req
 		OK:          true,
 		ID:          taskUUID,
 		AppliedTags: appliedTags,
+		Warnings:    warnings,
 	}, nil
 }
 
@@ -403,8 +427,12 @@ func buildAddURL(pendingTitle string, task capture.Request, appliedTags []string
 		values.Set("notes", task.Notes)
 	}
 	values.Set("reveal", "false")
-	if task.Destination != nil && task.Destination.Name != "" {
-		values.Set("list", task.Destination.Name)
+	if task.Destination != nil && (task.Destination.Name != "" || task.Destination.ID != "") {
+		if task.Destination.ID != "" {
+			values.Set("list-id", task.Destination.ID)
+		} else {
+			values.Set("list", task.Destination.Name)
+		}
 		if task.Destination.Heading != "" {
 			values.Set("heading", task.Destination.Heading)
 		}
@@ -1129,91 +1157,6 @@ func (c *Client) QueryTasks(ctx context.Context, req capture.QueryTasksRequest) 
 
 	dataBytes, _ := json.Marshal(tasks)
 	return Response{OK: true, ID: string(dataBytes)}, nil
-}
-
-func (c *Client) CreateProject(ctx context.Context, req capture.CreateProjectRequest) (Response, error) {
-	if strings.TrimSpace(req.Title) == "" {
-		return Response{}, errors.New("project title is required")
-	}
-	db, err := c.openDB(ctx)
-	if err != nil {
-		return Response{}, err
-	}
-	defer db.Close()
-
-	// Reuse an existing active project with the same title (mirroring
-	// CreateHeading), so a retry after a slow Things launch reconciles with
-	// the project the first dispatch created instead of duplicating it.
-	var existingUUID string
-	err = db.QueryRowContext(ctx, `SELECT uuid FROM TMTask WHERE type = 1 AND LOWER(title) = LOWER(?) AND trashed = 0 AND status = 0 ORDER BY creationDate DESC LIMIT 1`, req.Title).Scan(&existingUUID)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return Response{}, fmt.Errorf("query existing project: %w", err)
-	}
-	if existingUUID != "" {
-		return Response{OK: true, ID: existingUUID}, nil
-	}
-
-	values := url.Values{}
-	values.Set("title", req.Title)
-	values.Set("reveal", "false")
-	if req.Area != "" {
-		values.Set("area", req.Area)
-	}
-	if req.Notes != "" {
-		values.Set("notes", req.Notes)
-	}
-	if req.Deadline != "" {
-		values.Set("deadline", req.Deadline)
-	}
-	if req.When != "" {
-		values.Set("when", req.When)
-	}
-	if len(req.Tags) > 0 {
-		values.Set("tags", strings.Join(req.Tags, ","))
-	}
-	if c.AuthToken != "" {
-		values.Set("auth-token", c.AuthToken)
-	}
-
-	addURL := "things:///add-project?" + strings.ReplaceAll(values.Encode(), "+", "%20")
-
-	runner := c.Runner
-	if runner == nil {
-		runner = ExecRunner{}
-	}
-
-	wasRunning := false
-	if _, _, err := runner.Run(ctx, "/usr/bin/pgrep", []string{"-x", "Things3"}); err == nil {
-		wasRunning = true
-	}
-
-	minCreationDate := macEpochSeconds(time.Now().Add(-1 * time.Second))
-
-	if _, _, err := runner.Run(ctx, "/usr/bin/open", []string{"-g", addURL}); err != nil {
-		return Response{}, fmt.Errorf("dispatch add-project URL: %w", err)
-	}
-
-	// The creationDate floor keeps the poll from matching an archived
-	// same-title project and reporting its UUID as the created one.
-	var projectUUID string
-	deadline := c.verifyDeadline()
-	for time.Now().Before(deadline) {
-		row := db.QueryRowContext(ctx, `SELECT uuid FROM TMTask WHERE type = 1 AND LOWER(title) = LOWER(?) AND creationDate >= ? AND trashed = 0 ORDER BY creationDate DESC LIMIT 1`, req.Title, minCreationDate)
-		if err := row.Scan(&projectUUID); err == nil && projectUUID != "" {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	if projectUUID == "" {
-		return Response{}, &OperationError{Code: "create_failed"}
-	}
-
-	if !wasRunning {
-		time.Sleep(50 * time.Millisecond)
-		_, _, _ = runner.Run(ctx, "/usr/bin/osascript", []string{"-e", `tell application "Things3" to quit`})
-	}
-
-	return Response{OK: true, ID: projectUUID}, nil
 }
 
 func (c *Client) UpdateTask(ctx context.Context, req capture.UpdateTaskRequest) (Response, error) {

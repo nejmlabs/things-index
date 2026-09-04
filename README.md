@@ -87,6 +87,49 @@ For 24/7 homelab infrastructure where the MCP server runs on Linux and leases jo
 | `archive_things_project` | Write | Archive an entire project: mark `completed` or `canceled`. |
 | `things_capture_status` | Read | Check async status of any queued operation via `request_id` (server mode only; stdio mode captures synchronously). |
 
+### Project capture from Index 01
+
+Index 01 handles each spoken command without a clarification exchange. Say
+“Add buy paint to the kitchen project” to capture a task, or explicitly ask
+“Create a project called Kitchen renovation” to create a project.
+
+`create_things_project` creates the requested title in an optional exact area.
+It reuses an active exact-name project only in that same area; omitting the area
+means an unfiled project. After creation succeeds, the returned `things_id` can
+be used directly in a task's destination:
+
+```json
+{"title":"Buy paint","destination":{"kind":"project","id":"<returned things_id>"}}
+```
+
+For an existing project, `capture_things_task` accepts its name as spoken:
+
+```json
+{"title":"Buy paint","destination":{"kind":"project","name":"kitchen"}}
+```
+
+Project matching prefers exact names, then handles punctuation, reordered
+words, a unique whole-word partial name, or a small typo in the full name
+(such as “Kichen renovation”). Only active projects are considered. A matching
+notice names the selected project so the voice client can confirm it. Numeric
+differences such as 2025 versus 2026 are not treated as typos.
+
+If “kitchen” could mean both “Kitchen renovation” and “Kitchen supplies”, the
+task is saved in Inbox. Its notes retain the requested project and heading,
+and the confirmation explains the Inbox fallback. The same applies when no
+project matches or an explicit project ID is unavailable. Index 01 does not
+need to ask a follow-up question or offer choices, and an uncertain match does
+not create a new project.
+
+Explicit project IDs take precedence over names. Area names and heading names
+remain exact, and project creation does not use fuzzy matching. If an explicit
+project creation request fails, the client reports the failure without asking
+for clarification.
+
+In server mode, check `things_capture_status` until a queued project creation
+succeeds before adding tasks using its ID. A queued result means the Mac has
+not yet confirmed the operation.
+
 ---
 
 ## 🔒 Aims

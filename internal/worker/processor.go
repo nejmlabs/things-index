@@ -28,6 +28,10 @@ func IsRetryable(err error) bool {
 	if errors.As(err, &permanent) {
 		return false
 	}
+	var projectMatchError *helper.ProjectMatchError
+	if errors.As(err, &projectMatchError) {
+		return false // Defensive: normal capture handles uncertain projects in Inbox before dispatch.
+	}
 	var operationError *helper.OperationError
 	if errors.As(err, &operationError) {
 		return operationError.Code == "create_failed" ||
@@ -207,6 +211,9 @@ func (p *Processor) Process(ctx context.Context, job Job) (Outcome, error) {
 			return Outcome{}, fmt.Errorf("create Things task: %w", captureErr)
 		}
 		finalNotes := task.Notes
+		for _, warning := range response.Warnings {
+			finalNotes = appendWarning(finalNotes, warning)
+		}
 		// The helper may omit appliedTags when it cannot verify Things' resulting
 		// tag array. Omitted means "not verified", not "none applied".
 		if response.AppliedTags != nil {

@@ -275,18 +275,9 @@ func TestClientPreflightDestinationErrors(t *testing.T) {
 		Runner: &mockRunner{},
 	}
 
-	// Project not found
-	_, err := client.Capture(context.Background(), testRequestID, capture.Request{TaskFields: capture.TaskFields{
-		Title:       "Task",
-		Destination: &capture.Destination{Kind: capture.DestinationProject, Name: "NonExistent"},
-	}})
-	var opErr *OperationError
-	if !errors.As(err, &opErr) || opErr.Code != "destination_not_found" {
-		t.Fatalf("expected destination_not_found, got %v", err)
-	}
-
 	// Area not found
-	_, err = client.Capture(context.Background(), testRequestID, capture.Request{TaskFields: capture.TaskFields{
+	var opErr *OperationError
+	_, err := client.Capture(context.Background(), testRequestID, capture.Request{TaskFields: capture.TaskFields{
 		Title:       "Task",
 		Destination: &capture.Destination{Kind: capture.DestinationArea, Name: "NonExistent"},
 	}})

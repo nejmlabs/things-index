@@ -29,7 +29,8 @@ const (
 
 type Destination struct {
 	Kind    DestinationKind `json:"kind" jsonschema:"Where to place the task: inbox, project, or area."`
-	Name    string          `json:"name,omitempty" jsonschema:"Exact project or area name. Omit for Inbox."`
+	ID      string          `json:"id,omitempty" jsonschema:"Optional active project ID, for example the things_id from create_things_project. Takes precedence over name. An unavailable ID saves the new task in Inbox with requested placement in notes and a warning. Only supported for project destinations."`
+	Name    string          `json:"name,omitempty" jsonschema:"Project name as spoken: exact matches first, then a clear partial name or typo match. Missing or ambiguous projects save the new task in Inbox with requested placement in notes and a warning. Area names must be exact. Optional with a project id; omit for Inbox."`
 	Heading string          `json:"heading,omitempty" jsonschema:"Optional exact heading name inside the selected project."`
 }
 
@@ -159,7 +160,7 @@ func (u UpdateTaskRequest) Validate() error {
 type TaskFields struct {
 	Title          string       `json:"title" jsonschema:"Things task title."`
 	Notes          string       `json:"notes,omitempty" jsonschema:"Optional task notes."`
-	Destination    *Destination `json:"destination,omitempty" jsonschema:"Optional exact destination; omitted tasks go to Inbox."`
+	Destination    *Destination `json:"destination,omitempty" jsonschema:"Optional destination. Projects accept a fuzzy name or an explicit id; missing or ambiguous projects save to Inbox with a warning. Omitted destinations go to Inbox."`
 	Schedule       *Schedule    `json:"schedule,omitempty" jsonschema:"Optional Things start date and reminder."`
 	Deadline       string       `json:"deadline,omitempty" jsonschema:"Optional deadline in YYYY-MM-DD form."`
 	Tags           []string     `json:"tags,omitempty" jsonschema:"Existing Things tag names to apply."`
@@ -222,12 +223,15 @@ func (r Request) Validate() error {
 	if r.Destination != nil {
 		switch r.Destination.Kind {
 		case DestinationInbox:
-			if r.Destination.Name != "" || r.Destination.Heading != "" {
-				return errors.New("an Inbox destination must not have a name or heading")
+			if r.Destination.ID != "" || r.Destination.Name != "" || r.Destination.Heading != "" {
+				return errors.New("an Inbox destination must not have an id, name, or heading")
 			}
 		case DestinationProject:
-			if strings.TrimSpace(r.Destination.Name) == "" {
-				return errors.New("a project destination requires an exact name")
+			if r.Destination.ID == "" && strings.TrimSpace(r.Destination.Name) == "" {
+				return errors.New("a project destination requires a name or id")
+			}
+			if r.Destination.ID != "" && (!utf8.ValidString(r.Destination.ID) || len(r.Destination.ID) > MaxDestinationLen || strings.TrimSpace(r.Destination.ID) != r.Destination.ID || strings.ContainsAny(r.Destination.ID, "\r\n\t")) {
+				return errors.New("project id must be a nonblank single-line identifier of at most 400 bytes")
 			}
 			if !utf8.ValidString(r.Destination.Name) || len(r.Destination.Name) > MaxDestinationLen {
 				return fmt.Errorf("destination name must be valid UTF-8 and at most %d bytes", MaxDestinationLen)
@@ -239,6 +243,9 @@ func (r Request) Validate() error {
 				return errors.New("heading must not be blank")
 			}
 		case DestinationArea:
+			if r.Destination.ID != "" {
+				return errors.New("an explicit destination id is only supported for projects")
+			}
 			if strings.TrimSpace(r.Destination.Name) == "" {
 				return errors.New("an area destination requires an exact name")
 			}
