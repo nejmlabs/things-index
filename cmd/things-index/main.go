@@ -49,6 +49,7 @@ func main() {
 
 	command := os.Args[1]
 	var err error
+	interactiveCommand := false
 	switch command {
 	case "start", "run", "local":
 		err = runStandaloneHTTP()
@@ -58,6 +59,7 @@ func main() {
 		err = runDedicatedServer()
 	case "worker":
 		if len(os.Args) >= 3 && (os.Args[2] == "--setup" || os.Args[2] == "setup" || os.Args[2] == "-s") {
+			interactiveCommand = true
 			err = runWorkerSetup()
 		} else {
 			err = runDedicatedWorker()
@@ -66,6 +68,9 @@ func main() {
 		err = printConfig()
 	case "update":
 		err = runUpdate(os.Args[2:])
+	case "install-worker":
+		interactiveCommand = true
+		err = runWorkerInstall(os.Args[2:])
 	case "install-shortcut":
 		err = runInstallShortcut()
 	case "uninstall", "teardown":
@@ -80,7 +85,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err != nil && !errors.Is(err, context.Canceled) {
+	if err != nil && (interactiveCommand || !errors.Is(err, context.Canceled)) {
 		log.Fatal(err)
 	}
 }
@@ -603,10 +608,30 @@ func runDedicatedWorker() error {
 // the deploy/launchd example documents.
 const workerLaunchAgentLabel = "com.nejmlabs.things-index-worker"
 
-func runWorkerSetup() error {
+func runWorkerSetup() (resultErr error) {
 	if runtime.GOOS != "darwin" {
 		return errors.New("the Mac worker setup wizard must be run on macOS")
 	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	defer stop()
+	lifecycle, err := newWorkerSetupLifecycle()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if resultErr != nil && lifecycle.touched {
+			cleanup, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			if err := lifecycle.stop(cleanup); err != nil {
+				resultErr = errors.Join(resultErr, fmt.Errorf("worker stop cleanup failed: %w", err))
+			}
+		}
+	}()
+	if err := verifySetupSigning(ctx, lifecycle.executable); err != nil {
+		return err
+	}
+	home, exePath := lifecycle.home, lifecycle.executable
 
 	reader := bufio.NewReader(os.Stdin)
 	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -620,7 +645,10 @@ func runWorkerSetup() error {
 		defaultServer = "http://127.0.0.1:8080"
 	}
 	fmt.Printf("• Enter Server URL [%s]: ", defaultServer)
-	serverURLInput, _ := reader.ReadString('\n')
+	serverURLInput, err := readSetupLineContext(ctx, reader)
+	if err != nil {
+		return err
+	}
 	serverURL := strings.TrimSpace(serverURLInput)
 	if serverURL == "" {
 		serverURL = defaultServer
@@ -629,7 +657,10 @@ func runWorkerSetup() error {
 	// 2. Prompt for Worker Token
 	defaultToken := os.Getenv("THINGS_INDEX_WORKER_TOKEN")
 	fmt.Print("• Enter Worker Token: ")
-	tokenInput, _ := reader.ReadString('\n')
+	tokenInput, err := readSetupLineContext(ctx, reader)
+	if err != nil {
+		return err
+	}
 	workerToken := strings.TrimSpace(tokenInput)
 	if workerToken == "" {
 		workerToken = defaultToken
@@ -658,7 +689,7 @@ func runWorkerSetup() error {
 	// 4. Verify the connection and the token against the authenticated worker
 	// API, so a mistyped token fails here instead of invisibly at boot.
 	fmt.Printf("• Checking server connection to %s...\n", serverURL)
-	pingCtx, cancelPing := context.WithTimeout(context.Background(), 5*time.Second)
+	pingCtx, cancelPing := context.WithTimeout(ctx, 5*time.Second)
 	pingErr := serverClient.Ping(pingCtx)
 	cancelPing()
 	switch {
@@ -688,7 +719,10 @@ func runWorkerSetup() error {
 		thingsTokenPrompt += " [detected in environment]"
 	}
 	fmt.Print(thingsTokenPrompt + ": ")
-	thingsTokenInput, _ := reader.ReadString('\n')
+	thingsTokenInput, err := readSetupLineContext(ctx, reader)
+	if err != nil {
+		return err
+	}
 	thingsAuthToken := strings.TrimSpace(thingsTokenInput)
 	if thingsAuthToken == "" {
 		thingsAuthToken = defaultThingsToken
@@ -702,6 +736,12 @@ func runWorkerSetup() error {
 		fmt.Println("    General > Enable Things URLs > Manage to unlock the rest.")
 	}
 
+	// Resolve permissions before even discovering the protected Things data
+	// container. Only the launched daemon can prove its own TCC access.
+	if err := lifecycle.prepareFDA(ctx, reader, os.Stdout); err != nil {
+		return err
+	}
+
 	// 6. Auto-detect Things 3 SQLite Database
 	fmt.Println("• Detecting Things 3 SQLite database...")
 	thingsDB, err := helper.FindThingsDatabase()
@@ -713,9 +753,9 @@ func runWorkerSetup() error {
 	// 7. Test Things 3 Access
 	captureAdapter := helper.NewClient("")
 	captureAdapter.DBPath = thingsDB
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	if err := captureAdapter.Ping(ctx); err != nil {
+	databaseCtx, cancelDatabase := context.WithTimeout(ctx, 3*time.Second)
+	defer cancelDatabase()
+	if err := captureAdapter.Ping(databaseCtx); err != nil {
 		return fmt.Errorf("failed to query Things 3 database: %w", err)
 	}
 	fmt.Println("  ✓ Things 3 database query verified (Read-Only OK)")
@@ -728,18 +768,22 @@ func runWorkerSetup() error {
 	// must belong to the daemon, not this terminal.
 	if thingsAuthToken != "" {
 		fmt.Println("• Validating the Things auth token with a disposable test task...")
-		_ = exec.Command("/usr/bin/open", "-g", "-j", "-a", "/Applications/Things3.app").Run()
+		_, _ = lifecycle.run(ctx, "/usr/bin/open", "-g", "-j", "-a", "/Applications/Things3.app")
 		for attempt := 0; attempt < 20; attempt++ {
-			if exec.Command("/usr/bin/pgrep", "-x", "Things3").Run() == nil {
+			if _, err := lifecycle.run(ctx, "/usr/bin/pgrep", "-x", "Things3"); err == nil {
 				break
 			}
-			time.Sleep(500 * time.Millisecond)
+			if err := lifecycle.wait(ctx, 500*time.Millisecond); err != nil {
+				return err
+			}
 		}
-		time.Sleep(time.Second)
+		if err := lifecycle.wait(ctx, time.Second); err != nil {
+			return err
+		}
 
 		verifier := helper.NewClient(thingsAuthToken)
 		verifier.DBPath = thingsDB
-		testCtx, cancelTest := context.WithTimeout(context.Background(), 45*time.Second)
+		testCtx, cancelTest := context.WithTimeout(ctx, 45*time.Second)
 		defer cancelTest()
 		const testTitle = "ThingsIndex setup test — safe to delete"
 		testID := randomHex(16)
@@ -750,7 +794,9 @@ func runWorkerSetup() error {
 		if err != nil {
 			// A slow first launch can outlast the capture poll; reconcile the
 			// pending task the same way the worker does before giving up.
-			time.Sleep(3 * time.Second)
+			if err := lifecycle.wait(ctx, 3*time.Second); err != nil {
+				return err
+			}
 			if ids, findErr := verifier.FindCapture(testCtx, testID); findErr == nil && len(ids) == 1 {
 				err = verifier.FinaliseCapture(testCtx, ids[0], testTitle)
 			}
@@ -764,7 +810,7 @@ func runWorkerSetup() error {
 	// 9. Install the bundled ThingsIndex Helper shortcut — heading operations
 	// run through it, and Apple's CLI cannot install shortcuts silently, so
 	// this needs one click in the Shortcuts app.
-	if err := installHelperShortcut(); err != nil {
+	if err := installHelperShortcutContext(ctx); err != nil {
 		return err
 	}
 
@@ -772,7 +818,7 @@ func runWorkerSetup() error {
 	// ping; the grants are stored per shortcut, so they cover the daemon's
 	// runs too.
 	fmt.Println("• Verifying the helper shortcut (choose “Always Allow” on any privacy dialogs)...")
-	shortcutCtx, cancelShortcut := context.WithTimeout(context.Background(), 3*time.Minute)
+	shortcutCtx, cancelShortcut := context.WithTimeout(ctx, 3*time.Minute)
 	err = captureAdapter.PingHelperShortcut(shortcutCtx)
 	cancelShortcut()
 	if err != nil {
@@ -781,18 +827,14 @@ func runWorkerSetup() error {
 	fmt.Println("  ✓ Helper shortcut verified; its privacy grants are settled.")
 
 	// 11. Install Background Launcher Script (carries the secrets, hence 0700)
-	home, _ := os.UserHomeDir()
 	binDir := filepath.Join(home, ".local", "bin")
-	_ = os.MkdirAll(binDir, 0o755)
-
-	exePath, err := os.Executable()
-	if err != nil {
-		exePath = "/usr/local/bin/things-index"
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		return fmt.Errorf("create worker binary directory: %w", err)
 	}
 
 	launcherScript := filepath.Join(binDir, "run-things-worker.sh")
 	scriptContent := buildLauncherScript(home, serverURL, workerToken, thingsDB, thingsAuthToken, exePath)
-	if err := os.WriteFile(launcherScript, []byte(scriptContent), 0o700); err != nil {
+	if err := writeSetupFile(launcherScript, []byte(scriptContent), 0o700); err != nil {
 		return fmt.Errorf("write launcher script: %w", err)
 	}
 	fmt.Printf("  ✓ Created launcher script: %s\n", launcherScript)
@@ -800,80 +842,40 @@ func runWorkerSetup() error {
 	// 12. Install the LaunchAgent: starts at login, KeepAlive restarts the
 	// worker if it ever crashes, and logs land in ~/Library/Logs/ThingsIndex.
 	logDir := filepath.Join(home, "Library", "Logs", "ThingsIndex")
-	_ = os.MkdirAll(logDir, 0o755)
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		return fmt.Errorf("create worker log directory: %w", err)
+	}
 	agentsDir := filepath.Join(home, "Library", "LaunchAgents")
 	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
 		return fmt.Errorf("create LaunchAgents directory: %w", err)
 	}
 	plistPath := filepath.Join(agentsDir, workerLaunchAgentLabel+".plist")
-	if err := os.WriteFile(plistPath, []byte(buildLaunchAgentPlist(launcherScript, logDir)), 0o644); err != nil {
+	if err := writeSetupFile(plistPath, []byte(buildLaunchAgentPlist(launcherScript, logDir)), 0o644); err != nil {
 		return fmt.Errorf("write LaunchAgent: %w", err)
 	}
 	fmt.Printf("  ✓ Created LaunchAgent: %s\n", plistPath)
 
-	// 13. Replace any previous install (LaunchAgent or the cron+screen
-	// mechanism earlier wizard versions used) and start the agent. Deleting
-	// the consent marker forces the daemon to re-run its automation
-	// preflight, so the Things 3 grant lands on this (possibly rebuilt)
-	// binary rather than being assumed from an older install.
-	if markerPath, err := workerapp.AutomationConsentMarkerPath(); err == nil {
-		_ = os.Remove(markerPath)
+	// Earn Automation permission as the real launchd worker, with a fresh
+	// marker and log segment. Existing markers are archived for diagnostics.
+	fmt.Println("• Starting the signed worker; approve its request to control Things3 if shown...")
+	firstCtx, cancelFirst := context.WithTimeout(ctx, 3*time.Minute)
+	_, err = lifecycle.startVerified(firstCtx, plistPath)
+	cancelFirst()
+	if err != nil {
+		return fmt.Errorf("first worker startup failed: %w", err)
 	}
-	fmt.Println("• Starting background worker via launchd...")
-	fmt.Println("  For unattended restarts, open System Settings > Privacy & Security > Full Disk Access.")
-	fmt.Printf("  Add and enable this worker executable: %s\n", exePath)
-	fmt.Println("  If that path is a symlink, select its resolved executable.")
-	fmt.Println("  App Data dialog approval lasts only until the worker process quits.")
-	fmt.Println("  Separately approve this worker's request to control Things3.")
-	fmt.Println("  When moving from an ad hoc build to a signed release, renew these grants once.")
-	fmt.Println("  Future updates must preserve the worker's signing identity.")
-	domainTarget := fmt.Sprintf("gui/%d", os.Getuid())
-	_ = exec.Command("launchctl", "bootout", domainTarget+"/"+workerLaunchAgentLabel).Run()
-	_ = exec.Command("/bin/sh", "-c", `(crontab -l 2>/dev/null | grep -v "things-worker") | crontab - 2>/dev/null || true`).Run()
-	_ = exec.Command("/bin/sh", "-c", `screen -S things-worker -X quit 2>/dev/null || true`).Run()
-	_ = exec.Command("/bin/sh", "-c", `pkill -f "things-index worker" 2>/dev/null || true`).Run()
-	if output, err := exec.Command("launchctl", "bootstrap", domainTarget, plistPath).CombinedOutput(); err != nil {
-		return fmt.Errorf("start LaunchAgent in %s: %w: %s", domainTarget, err, strings.TrimSpace(string(output)))
+	fmt.Println("  ✓ Fresh database access, Things Automation and worker startup verified.")
+	fmt.Println("• Restarting once to verify permissions survive a new worker process...")
+	if err := lifecycle.stop(ctx); err != nil {
+		return err
 	}
-
-	// 14. Confirm the worker is running AND has recorded its automation
-	// consent before declaring success. macOS pgrep excludes this wizard (an
-	// ancestor), so only the daemon matches.
-	fmt.Println("• Waiting for the worker to start and record its automation consent...")
-	markerPath, markerErr := workerapp.AutomationConsentMarkerPath()
-	running := false
-	consented := false
-	deadline := time.Now().Add(3 * time.Minute)
-	for time.Now().Before(deadline) {
-		time.Sleep(2 * time.Second)
-		running = exec.Command("/usr/bin/pgrep", "-f", "things-index worker").Run() == nil
-		if markerErr == nil {
-			if _, err := os.Stat(markerPath); err == nil {
-				consented = true
-			}
-		}
-		if running && consented {
-			break
-		}
+	secondCtx, cancelSecond := context.WithTimeout(ctx, 45*time.Second)
+	_, err = lifecycle.startVerified(secondCtx, plistPath)
+	cancelSecond()
+	if err != nil {
+		return fmt.Errorf("worker restart verification failed; review Full Disk Access and Automation before rerunning setup: %w", err)
 	}
-
 	fmt.Println()
-	if !running || !consented {
-		fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-		fmt.Println("  ⚠️  Setup finished, but the worker is not fully confirmed yet.")
-		if !running {
-			fmt.Println("  • The worker process has not been seen running.")
-		}
-		if !consented {
-			fmt.Println("  • Things 3 automation consent has not been recorded — approve")
-			fmt.Println("    the “control Things3” dialog if it is still on screen.")
-		}
-		fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-		fmt.Printf("  • Check logs:   %s\n", filepath.Join(logDir, "worker-error.log"))
-		fmt.Printf("  • Check status: launchctl print %s/%s\n", domainTarget, workerLaunchAgentLabel)
-		fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-		return nil
-	}
 	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 	fmt.Println("  🎉 ThingsIndex Mac Worker Successfully Configured & Active!")
 	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -881,11 +883,16 @@ func runWorkerSetup() error {
 	fmt.Printf("  • Things Database: %s\n", thingsDB)
 	fmt.Printf("  • LaunchAgent:     %s (starts at login, auto-restarts)\n", workerLaunchAgentLabel)
 	fmt.Printf("  • Logs:            %s\n", logDir)
-	fmt.Println("  • Permissions:     startup and Automation checks passed.")
-	fmt.Println("                     Verify Full Disk Access in System Settings for unattended restarts.")
+	fmt.Println("  • Permissions:     fresh database and Automation checks passed across two worker processes.")
+	if lifecycle.grant == fdaMatched {
+		fmt.Println("                     The stored Full Disk Access grant matches this signed executable.")
+	} else {
+		fmt.Println("                     You confirmed Full Disk Access; its stored grant was not readable here.")
+	}
+	fmt.Println("                     Future updates must retain the same signing certificate and identifier.")
 	fmt.Println("────────────────────────────────────────────────────────────")
 	fmt.Println("  The worker is now actively listening in the background")
-	fmt.Println("  Full Disk Access prepares it for unattended restarts.")
+	fmt.Println("  Fresh startup checks passed after a controlled restart.")
 	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 	return nil
 }
@@ -894,7 +901,11 @@ func runWorkerSetup() error {
 // library. Apple's shortcuts CLI cannot install (only run/list/view/sign), so
 // this opens the import dialog and waits for the user's one Add click.
 func installHelperShortcut() error {
-	if helperShortcutInstalled() {
+	return installHelperShortcutContext(context.Background())
+}
+
+func installHelperShortcutContext(ctx context.Context) error {
+	if helperShortcutInstalledContext(ctx) {
 		fmt.Printf("  ✓ %q shortcut already installed.\n", helper.HelperShortcutName)
 		return nil
 	}
@@ -911,23 +922,29 @@ func installHelperShortcut() error {
 	if err := os.WriteFile(tempPath, shortcutasset.Helper(), 0o600); err != nil {
 		return fmt.Errorf("write helper shortcut: %w", err)
 	}
-	if err := exec.Command("/usr/bin/open", tempPath).Run(); err != nil {
+	if _, err := runSetupCommand(ctx, "/usr/bin/open", tempPath); err != nil {
 		return fmt.Errorf("open helper shortcut in Shortcuts: %w", err)
 	}
 	fmt.Println("  Shortcuts opened an import dialog — click “Add Shortcut”. Waiting...")
 	deadline := time.Now().Add(3 * time.Minute)
 	for time.Now().Before(deadline) {
-		if helperShortcutInstalled() {
+		if helperShortcutInstalledContext(ctx) {
 			fmt.Printf("  ✓ %q shortcut installed.\n", helper.HelperShortcutName)
 			return nil
 		}
-		time.Sleep(2 * time.Second)
+		if err := waitSetupContext(ctx, 2*time.Second); err != nil {
+			return err
+		}
 	}
 	return fmt.Errorf("the %q shortcut did not appear within 3 minutes; click “Add Shortcut” in the Shortcuts app and rerun the wizard (if it imported under a different name, rename it to %q first)", helper.HelperShortcutName, helper.HelperShortcutName)
 }
 
 func helperShortcutInstalled() bool {
-	output, err := exec.Command("/usr/bin/shortcuts", "list").Output()
+	return helperShortcutInstalledContext(context.Background())
+}
+
+func helperShortcutInstalledContext(ctx context.Context) bool {
+	output, err := runSetupCommand(ctx, "/usr/bin/shortcuts", "list")
 	return err == nil && slices.Contains(strings.Split(string(output), "\n"), helper.HelperShortcutName)
 }
 

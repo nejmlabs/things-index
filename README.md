@@ -50,12 +50,13 @@ For 24/7 homelab infrastructure where the MCP server runs on Linux and leases jo
    bash -c "$(curl -fsSL https://raw.githubusercontent.com/nejmlabs/things-index/main/deploy/mac-worker-install.sh)"
    ```
    This downloads the latest released universal binary (Apple Silicon + Intel) to `~/.local/bin`, verifies its GitHub build-provenance attestation when the `gh` CLI is present (`gh attestation verify ~/.local/bin/things-index --repo nejmlabs/things-index` by hand otherwise), and launches the setup wizard, which:
-   * Verifies the server connection **and** the worker token before installing anything.
+   * Verifies the server connection **and** the worker token before configuring the background worker.
    * Validates your optional Things auth token with a disposable test task (the token unlocks deadline/tag/checklist updates).
    * Auto-detects the Things 3 SQLite database and verifies read-only connectivity.
    * Installs the bundled **ThingsIndex Helper** shortcut and settles its privacy dialogs.
    * Installs a launchd LaunchAgent that starts at login, auto-restarts the worker if it crashes, and logs to `~/Library/Logs/ThingsIndex/`.
-   * Explains the separate database-access and Things Automation permissions. For unattended operation across restarts, add the actual worker executable (normally `~/.local/bin/things-index`) to **System Settings > Privacy & Security > Full Disk Access**. The ordinary App Data dialog's approval lasts only until the process quits; see [Mac worker permissions](docs/homelab.md#mac-worker).
+   * Checks the worker's signing identity and guides **Full Disk Access** setup before querying Things or starting the worker. It opens the settings and shows the actual executable to add; an old entry may need to be removed and added again.
+   * Verifies fresh database access and Things Automation consent through the background worker, then repeats startup after a restart. A failed check leaves the worker stopped and reports setup as incomplete. macOS still requires you to approve the initial permissions; see [Mac worker permissions](docs/homelab.md#mac-worker).
 
    Releases through v0.2.5 use ad hoc signing, which can invalidate permissions after an update. The release workflow now requires a persistent signing certificate, and the updater checks the certificate and identity requirements before replacing an installed signed build. Moving to the first signed release still needs a manual permission refresh; see [release signing and migration](docs/macos-signing.md). Prompt-free operation across an update must be verified on the Mac after this migration.
 

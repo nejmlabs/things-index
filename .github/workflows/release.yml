@@ -40,7 +40,14 @@ jobs:
           MACOS_SIGNING_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_SIGNING_CERTIFICATE_P12_BASE64 }}
           MACOS_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_SIGNING_CERTIFICATE_PASSWORD }}
           MACOS_SIGNING_IDENTITY_SHA1: ${{ secrets.MACOS_SIGNING_IDENTITY_SHA1 }}
-        run: bash deploy/sign-macos-release.sh dist/things-index-darwin-universal
+        run: |
+          EXPECTED_CERTIFICATE="$(sed -n 's/^MACOS_RELEASE_CERTIFICATE_SHA1="\([A-F0-9]*\)"$/\1/p' deploy/mac-worker-install.sh)"
+          CONFIGURED_CERTIFICATE="$(printf '%s' "${MACOS_SIGNING_IDENTITY_SHA1}" | tr '[:lower:]' '[:upper:]')"
+          if [ "${#EXPECTED_CERTIFICATE}" -ne 40 ] || [ "${CONFIGURED_CERTIFICATE}" != "${EXPECTED_CERTIFICATE}" ]; then
+            echo "Release signing identity must match the installer's public certificate pin." >&2
+            exit 1
+          fi
+          bash deploy/sign-macos-release.sh dist/things-index-darwin-universal
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
         with:
