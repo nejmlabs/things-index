@@ -53,9 +53,11 @@ For 24/7 homelab infrastructure where the MCP server runs on Linux and leases jo
    * Verifies the server connection **and** the worker token before installing anything.
    * Validates your optional Things auth token with a disposable test task (the token unlocks deadline/tag/checklist updates).
    * Auto-detects the Things 3 SQLite database and verifies read-only connectivity.
-   * Installs the bundled **ThingsIndex Helper** shortcut and settles its one-time privacy dialogs.
+   * Installs the bundled **ThingsIndex Helper** shortcut and settles its privacy dialogs.
    * Installs a launchd LaunchAgent that starts at login, auto-restarts the worker if it crashes, and logs to `~/Library/Logs/ThingsIndex/`.
-   * Walks you through the two one-time macOS permission dialogs (data access + Things automation) so background operation stays prompt-free.
+   * Explains the separate database-access and Things Automation permissions. For unattended operation across restarts, add the actual worker executable (normally `~/.local/bin/things-index`) to **System Settings > Privacy & Security > Full Disk Access**. The ordinary App Data dialog's approval lasts only until the process quits; see [Mac worker permissions](docs/homelab.md#mac-worker).
+
+   Releases through v0.2.5 use ad hoc signing, which can invalidate permissions after an update. The release workflow now requires a persistent signing certificate, and the updater checks the certificate and identity requirements before replacing an installed signed build. Moving to the first signed release still needs a manual permission refresh; see [release signing and migration](docs/macos-signing.md). Prompt-free operation across an update must be verified on the Mac after this migration.
 
 4. **Updating** — both halves update with one command:
    * **Server** (on the Proxmox host — finds the `things-index` container, pulls, rebuilds, restarts):
@@ -133,7 +135,7 @@ not yet confirmed the operation.
 ---
 
 ## 🔒 Aims
-* **Zero-Prompt Execution**: Uses the official Things URL Scheme (`things:///add`, `add-project`, `update`) & read-only SQLite preflights. Task/project archiving falls back to AppleScript, which triggers macOS's one-time Automation permission grant on first use. Heading operations run Things' native App Intents through the bundled signed **ThingsIndex Helper** shortcut — the only automation surface that reaches headings — after its one-time install and privacy grant (see `shortcuts/README.md`).
+* **Unattended Execution**: Uses Things URLs for writes and SQLite for reads. Background operation across restarts requires Full Disk Access for the worker, separate Things Automation permission for AppleScript, and the **ThingsIndex Helper** shortcut's permissions for headings. Release signing and updater identity checks preserve the identity used by those grants; existing ad hoc installations need a one-time migration and verification. See [Mac worker permissions](docs/homelab.md#mac-worker).
 * **Zero Foreground Steal**: Suppresses window focus and automatically quits Things 3 (no Dock dot) if it was closed before capture.
 * **Strictly Read-Only SQLite (`_query_only=1`)**: Never performs raw SQL writes to Cultured Code's database; Cultured Code's official engine handles writing and Things Cloud sync.
 * **Durable Queue**: In server mode, If the Mac is asleep or rebooting, tasks wait safely in the server queue and process immediately on wakeup.

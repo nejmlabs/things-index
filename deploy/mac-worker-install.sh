@@ -28,9 +28,13 @@ echo "  ⬇️  ThingsIndex Mac Worker Installer"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 mkdir -p "${BIN_DIR}"
-trap 'rm -f "${BINARY}.download"' EXIT
+# Keep each download private and fresh; a reused file can retain metadata
+# from an earlier download. Staging beside the binary preserves atomic rename.
+DOWNLOAD_DIR="$(mktemp -d "${BIN_DIR}/.things-index-download.XXXXXX")"
+DOWNLOAD_PATH="${DOWNLOAD_DIR}/things-index"
+trap 'rm -rf -- "${DOWNLOAD_DIR}"' EXIT
 echo "• Downloading the latest things-index release..."
-curl -fL --progress-bar -o "${BINARY}.download" \
+curl -fL --progress-bar -o "${DOWNLOAD_PATH}" \
     "https://github.com/${REPO}/releases/latest/download/${ASSET}"
 
 # Verify GitHub's build-provenance attestation when possible: proof the
@@ -38,15 +42,17 @@ curl -fL --progress-bar -o "${BINARY}.download" \
 # runners, not on someone's laptop.
 if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
     echo "• Verifying build provenance attestation..."
-    gh attestation verify "${BINARY}.download" --repo "${REPO}" >/dev/null
+    gh attestation verify "${DOWNLOAD_PATH}" --repo "${REPO}" >/dev/null
     echo "  ✓ Provenance verified: built by GitHub Actions from ${REPO}"
 else
     echo "  • Skipping provenance verification (no authenticated gh CLI)."
     echo "    To verify by hand later: gh attestation verify ${BINARY} --repo ${REPO}"
 fi
 
-chmod 0755 "${BINARY}.download"
-mv "${BINARY}.download" "${BINARY}"
+chmod 0755 "${DOWNLOAD_PATH}"
+mv "${DOWNLOAD_PATH}" "${BINARY}"
+rmdir "${DOWNLOAD_DIR}"
+trap - EXIT
 echo "  ✓ Installed ${BINARY} ($("${BINARY}" version))"
 
 case ":${PATH}:" in

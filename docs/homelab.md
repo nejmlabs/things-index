@@ -191,9 +191,34 @@ launches the setup wizard (`things-index worker --setup`, rerunnable anytime).
 The wizard verifies the server URL and worker token against the live server, validates
 the optional Things auth token with one disposable test task, installs the
 bundled ThingsIndex Helper shortcut and settles its privacy dialogs, installs
-the LaunchAgent, and waits for the daemon to record its one-time Things 3
-automation consent. Approve each macOS dialog with **Always Allow** during this
-deliberate setup run.
+the LaunchAgent, and waits for the daemon to record its Things 3 automation
+consent.
+
+For unattended operation across restarts, open **System Settings > Privacy &
+Security > Full Disk Access**, click **+**, and add and enable the actual worker
+executable: normally `~/.local/bin/things-index`. Use **Command–Shift–G** in the
+file picker to enter its path. For a custom or manual installation, use the
+resolved executable path launched by the worker's launcher. Grant access to
+that executable, not Terminal or a shell.
+
+The worker reads Things' protected database at startup. Approving the ordinary
+“access data from other apps” dialog only lasts until the worker process quits;
+Full Disk Access suppresses that prompt across restarts. It is a broad file
+access permission. Things Automation permission is separate: approve the
+worker's request to control Things, and settle the Helper shortcut's own
+privacy dialogs during setup. [Apple explains App Data permission lifetime and
+Full Disk Access](https://developer.apple.com/videos/play/wwdc2023/10053/).
+
+Releases through v0.2.5 use ad hoc signing. Their Full Disk Access entry can
+remain enabled while referring to an older binary's code hash. The release
+workflow now requires a persistent signing certificate and identifier, and
+the updater rejects incompatible signing identities before replacing a signed
+installation. The first signed release requires a manual permission refresh:
+remove the old ThingsIndex Full Disk Access entry, add the newly installed
+worker, and approve Things Automation if requested. Verify a restart and an
+update before relying on unattended operation; see [release signing and
+migration](macos-signing.md). [Apple explains how privacy grants track code
+identity](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements).
 
 To install the binary without launching the wizard (for example, ahead of the
 HTTPS route existing), pass `--no-setup` after a placeholder for `argv[0]`:
@@ -219,8 +244,8 @@ THINGS_INDEX_JOURNAL_RETENTION_DAYS=30
 ```
 
 The daemon runs its automation-consent preflight at first start either way.
-Routine operation must not prompt, and the worker accepts no inbound
-connections.
+Configure the permissions above before relying on unattended operation. The
+worker accepts no inbound connections.
 
 ## Upgrading
 
@@ -240,23 +265,27 @@ connections.
 - **Mac worker** — `things-index update` self-updates: it queries the latest
   release, downloads that pinned tag's binary, verifies its provenance
   attestation when an authenticated `gh` CLI is available, smoke-tests it,
-  and swaps it in (keeping a `.old` rollback copy) before restarting the
-  launchd agent. **After every update, check the Mac's screen**: the new
-  binary is a new code identity to macOS, so the data-access and Things
-  automation grants reset, and the restarted daemon blocks silently on
-  consent dialogs until they are approved (Screen Sharing works). If only
-  the data-access dialog appears, force the automation preflight to re-run
-  too, so it cannot interrupt a later job:
+  and swaps it in before restarting the launchd agent. The `.old` backup is
+  temporary and is deleted after a successful swap; save a manual copy before
+  updating if you need a rollback binary.
+
+  The updater verifies the release's certificate signature for both Apple
+  Silicon and Intel, and requires the same signing certificate and compatible
+  identity requirements as the installed signed binary. It keeps the current
+  binary if either check fails. When migrating
+  from v0.2.5 or an earlier ad hoc build, refresh Full Disk Access for the
+  installed worker executable and approve Things Automation separately.
+  To repeat the Automation preflight when an old consent marker suppresses it:
 
   ```sh
   rm "$HOME/Library/Application Support/ThingsIndex/automation-consent-granted"
   launchctl kickstart -k "gui/$(id -u)/com.nejmlabs.things-index-worker"
   ```
 
-  Approve both dialogs, then confirm the log reads "worker ready":
-  `tail ~/Library/Logs/ThingsIndex/worker-error.log`. Re-running
-  `things-index worker --setup` from the Mac's GUI session settles the same
-  grants interactively.
+  Confirm the log reads "worker ready":
+  `tail ~/Library/Logs/ThingsIndex/worker-error.log`. Approving an App Data
+  dialog without Full Disk Access does not prepare the next worker restart
+  for unattended operation.
 
 Back up `/var/lib/things-index/queue.sqlite` on the server and the worker's
 journal before upgrades that change their schema.

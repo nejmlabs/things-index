@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -115,6 +116,50 @@ func TestReleaseSourceDownloadPinsTag(t *testing.T) {
 	}
 	if string(written) != string(payload) {
 		t.Errorf("downloaded content mismatch")
+	}
+}
+
+func TestReleaseSourceDownloadRefusesExistingStagingFiles(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("new binary"))
+	}))
+	defer server.Close()
+	source := &releaseSource{downloadBase: server.URL, client: server.Client()}
+
+	for _, symlink := range []bool{false, true} {
+		name := "regular file"
+		if symlink {
+			name = "symlink"
+		}
+		t.Run(name, func(t *testing.T) {
+			directory := t.TempDir()
+			original := filepath.Join(directory, "original")
+			if err := os.WriteFile(original, []byte("previous download"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.Stat(original)
+			if err != nil {
+				t.Fatal(err)
+			}
+			destination := original
+			if symlink {
+				destination = filepath.Join(directory, "staging")
+				if err := os.Symlink(original, destination); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := source.downloadAsset(context.Background(), "1.2.3", destination); !errors.Is(err, os.ErrExist) {
+				t.Fatalf("expected existing staging path to be rejected, got %v", err)
+			}
+			contents, err := os.ReadFile(original)
+			if err != nil || string(contents) != "previous download" {
+				t.Fatalf("existing file was changed: content=%q, error=%v", contents, err)
+			}
+			after, err := os.Stat(original)
+			if err != nil || !os.SameFile(before, after) {
+				t.Fatalf("existing file was replaced: %v", err)
+			}
+		})
 	}
 }
 

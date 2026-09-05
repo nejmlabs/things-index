@@ -32,6 +32,15 @@ jobs:
         env:
           VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
         run: make dist-mac VERSION="${VERSION}"
+      # Sign the final universal file before attestation, including dry runs.
+      # Missing or invalid signing secrets must never publish ad-hoc assets.
+      - name: Sign and verify macOS release identity
+        timeout-minutes: 5
+        env:
+          MACOS_SIGNING_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_SIGNING_CERTIFICATE_P12_BASE64 }}
+          MACOS_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_SIGNING_CERTIFICATE_PASSWORD }}
+          MACOS_SIGNING_IDENTITY_SHA1: ${{ secrets.MACOS_SIGNING_IDENTITY_SHA1 }}
+        run: bash deploy/sign-macos-release.sh dist/things-index-darwin-universal
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
         with:

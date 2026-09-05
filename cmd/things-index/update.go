@@ -50,6 +50,7 @@ func runUpdate(args []string) error {
 			fmt.Println("Usage: things-index update [--force]")
 			fmt.Println("  Replaces this binary with the latest GitHub release (macOS only).")
 			fmt.Println("  Provenance is verified when an authenticated gh CLI is available.")
+			fmt.Println("  Certificate-signed installations require a compatible signing identity.")
 			fmt.Println("  --force reinstalls even when already on the latest version.")
 			return nil
 		default:
@@ -82,14 +83,30 @@ func runUpdate(args []string) error {
 	fmt.Printf("• Updating things-index %s → %s\n", version, latest)
 	fmt.Printf("  Binary: %s\n", executablePath)
 
-	tempPath := executablePath + ".update"
+	// A new private directory on the same filesystem gives each download a
+	// fresh inode and keeps the final rename atomic. Reusing a fixed staging
+	// file would retain metadata from an earlier download when truncating it.
+	tempDirectory, err := os.MkdirTemp(filepath.Dir(executablePath), ".things-index-update-*")
+	if err != nil {
+		return fmt.Errorf("create update staging directory: %w", err)
+	}
+	defer os.RemoveAll(tempDirectory)
+	tempPath := filepath.Join(tempDirectory, filepath.Base(executablePath))
 	if err := source.downloadAsset(ctx, latest, tempPath); err != nil {
 		return err
 	}
-	defer os.Remove(tempPath)
 
 	if err := verifyProvenance(tempPath); err != nil {
 		return err
+	}
+	migration, err := verifyUpdateSigning(ctx, executablePath, tempPath, runCodeSign)
+	if err != nil {
+		return fmt.Errorf("signing verification failed - keeping the current binary: %w", err)
+	}
+	if migration {
+		fmt.Println("  • Migrating unsigned/ad-hoc code to certificate signing: review Full Disk Access and Things Automation for this executable; existing grants are not assumed to carry over.")
+	} else {
+		fmt.Println("  ✓ Downloaded signing identity satisfies the installed requirements.")
 	}
 	if err := os.Chmod(tempPath, 0o755); err != nil {
 		return fmt.Errorf("mark downloaded binary executable: %w", err)
@@ -187,7 +204,8 @@ func (r *releaseSource) downloadAsset(ctx context.Context, assetVersion, destina
 	if response.StatusCode != http.StatusOK {
 		return fmt.Errorf("release download returned %s", response.Status)
 	}
-	file, err := os.OpenFile(destination, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	// Refuse an existing file or symlink rather than reusing its metadata.
+	file, err := os.OpenFile(destination, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
 	if err != nil {
 		return fmt.Errorf("stage downloaded binary: %w", err)
 	}
