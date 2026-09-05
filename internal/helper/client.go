@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -21,18 +20,6 @@ import (
 
 type CommandRunner interface {
 	Run(ctx context.Context, executable string, args []string) (stdout []byte, stderr []byte, err error)
-}
-
-type ExecRunner struct{}
-
-func (ExecRunner) Run(ctx context.Context, executable string, args []string) ([]byte, []byte, error) {
-	command := exec.CommandContext(ctx, executable, args...)
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	command.Stdout = &stdout
-	command.Stderr = &stderr
-	err := command.Run()
-	return stdout.Bytes(), stderr.Bytes(), err
 }
 
 type Client struct {
@@ -164,9 +151,9 @@ func (c *Client) FindCapture(ctx context.Context, requestID string) ([]string, e
 	pendingTitle := fmt.Sprintf("ThingsIndex pending [%s]", requestID)
 	rows, err := db.QueryContext(ctx, `
 		SELECT uuid FROM TMTask
-		WHERE (title = ? OR notes LIKE '%' || ? || '%') AND trashed = 0
+		WHERE type = 0 AND title = ? AND trashed = 0
 		ORDER BY creationDate DESC
-		LIMIT 2`, pendingTitle, requestID)
+		LIMIT 2`, pendingTitle)
 	if err != nil {
 		return nil, fmt.Errorf("find pending Things capture: %w", err)
 	}
@@ -186,6 +173,24 @@ func (c *Client) FindCapture(ctx context.Context, requestID string) ([]string, e
 		return nil, fmt.Errorf("iterate pending Things captures: %w", err)
 	}
 	return ids, nil
+}
+
+// ReadCaptureNotes preserves the actual notes, including placement/tag warnings,
+// when the worker recovers a pending task after an interrupted capture.
+func (c *Client) ReadCaptureNotes(ctx context.Context, id string) (string, error) {
+	if strings.TrimSpace(id) == "" {
+		return "", errors.New("Things identifier is required")
+	}
+	db, err := c.openDB(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer db.Close()
+	var notes string
+	if err := db.QueryRowContext(ctx, `SELECT COALESCE(notes, '') FROM TMTask WHERE uuid = ? AND type = 0 AND trashed = 0`, id).Scan(&notes); err != nil {
+		return "", fmt.Errorf("read captured Things notes: %w", err)
+	}
+	return notes, nil
 }
 
 func (c *Client) Capture(ctx context.Context, requestID string, task capture.Request) (Response, error) {
@@ -224,10 +229,6 @@ func (c *Client) Capture(ctx context.Context, requestID string, task capture.Req
 				// task and requested placement without guessing between projects.
 				warning := projectInboxWarning(destination, matchErr)
 				warnings = append(warnings, warning)
-				if task.Notes != "" {
-					task.Notes += "\n\n"
-				}
-				task.Notes += warning
 				destination = capture.Destination{Kind: capture.DestinationInbox}
 				break
 			}
@@ -238,15 +239,10 @@ func (c *Client) Capture(ctx context.Context, requestID string, task capture.Req
 			destination.Name = project.Title
 
 			if task.Destination.Heading != "" {
-				headingRows, err := db.QueryContext(ctx, `SELECT uuid FROM TMTask WHERE type = 2 AND LOWER(title) = LOWER(?) AND project = ? AND trashed = 0`, task.Destination.Heading, project.ID)
-				if err != nil {
+				var headingCount int
+				if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM TMTask WHERE type = 2 AND LOWER(title) = LOWER(?) AND project = ? AND trashed = 0`, task.Destination.Heading, project.ID).Scan(&headingCount); err != nil {
 					return Response{}, fmt.Errorf("query destination heading: %w", err)
 				}
-				var headingCount int
-				for headingRows.Next() {
-					headingCount++
-				}
-				headingRows.Close()
 				if headingCount == 0 {
 					return Response{}, &OperationError{Code: "heading_not_found"}
 				}
@@ -256,15 +252,10 @@ func (c *Client) Capture(ctx context.Context, requestID string, task capture.Req
 			}
 
 		case capture.DestinationArea:
-			areaRows, err := db.QueryContext(ctx, `SELECT uuid FROM TMArea WHERE LOWER(title) = LOWER(?) AND (visible IS NULL OR visible != 0)`, task.Destination.Name)
-			if err != nil {
+			var areaCount int
+			if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM TMArea WHERE LOWER(title) = LOWER(?) AND (visible IS NULL OR visible != 0)`, task.Destination.Name).Scan(&areaCount); err != nil {
 				return Response{}, fmt.Errorf("query destination area: %w", err)
 			}
-			var areaCount int
-			for areaRows.Next() {
-				areaCount++
-			}
-			areaRows.Close()
 			if areaCount == 0 {
 				return Response{}, &OperationError{Code: "destination_not_found"}
 			}
@@ -278,31 +269,52 @@ func (c *Client) Capture(ctx context.Context, requestID string, task capture.Req
 	var appliedTags []string
 	if len(task.Tags) > 0 {
 		tagRows, err := db.QueryContext(ctx, `SELECT title FROM TMTag`)
-		if err == nil {
-			defer tagRows.Close()
-			existingTags := make(map[string]string)
-			for tagRows.Next() {
-				var tagTitle string
-				if err := tagRows.Scan(&tagTitle); err == nil {
-					existingTags[strings.ToLower(tagTitle)] = tagTitle
-				}
+		if err != nil {
+			return Response{}, fmt.Errorf("query available Things tags: %w", err)
+		}
+		existingTags := make(map[string]string)
+		for tagRows.Next() {
+			var tagTitle string
+			if err := tagRows.Scan(&tagTitle); err != nil {
+				tagRows.Close()
+				return Response{}, fmt.Errorf("read available Things tag: %w", err)
 			}
-			for _, requested := range task.Tags {
-				if canonical, found := existingTags[strings.ToLower(requested)]; found {
-					appliedTags = append(appliedTags, canonical)
-				}
+			existingTags[strings.ToLower(tagTitle)] = tagTitle
+		}
+		rowErr := tagRows.Err()
+		tagRows.Close()
+		if rowErr != nil {
+			return Response{}, fmt.Errorf("iterate available Things tags: %w", rowErr)
+		}
+		appliedTags = make([]string, 0, len(task.Tags))
+		for _, requested := range task.Tags {
+			if canonical, found := existingTags[strings.ToLower(requested)]; found {
+				appliedTags = append(appliedTags, canonical)
+			} else {
+				warnings = append(warnings, fmt.Sprintf("ThingsIndex warning: tag %q did not exist and was not applied.", requested))
 			}
 		}
 	}
-
-	runner := c.Runner
-	if runner == nil {
-		runner = ExecRunner{}
+	for _, warning := range warnings {
+		if !strings.Contains("\n\n"+task.Notes+"\n\n", "\n\n"+warning+"\n\n") {
+			if task.Notes != "" {
+				task.Notes += "\n\n"
+			}
+			task.Notes += warning
+		}
 	}
 
-	wasRunning := false
-	if _, _, err := runner.Run(ctx, "/usr/bin/pgrep", []string{"-x", "Things3"}); err == nil {
-		wasRunning = true
+	runner := c.commandRunner()
+
+	_, _, runningErr := runner.Run(ctx, "/usr/bin/pgrep", []string{"-x", "Things3"})
+	if err := ctx.Err(); err != nil {
+		return Response{}, err
+	}
+	if errors.Is(runningErr, context.DeadlineExceeded) || errors.Is(runningErr, context.Canceled) {
+		return Response{}, fmt.Errorf("check Things running state: %w", runningErr)
+	}
+	if runningErr != nil {
+		defer restoreThingsStoppedState(ctx, runner)
 	}
 
 	// 3. Construct Things URL with the pending marker title. The marker is what
@@ -315,41 +327,48 @@ func (c *Client) Capture(ctx context.Context, requestID string, task capture.Req
 
 	// 4. Dispatch URL via open -g -j (do not bring forward, launch hidden)
 	if _, _, err := runner.Run(ctx, "/usr/bin/open", []string{"-g", "-j", "-a", "/Applications/Things3.app", addURL}); err != nil {
-		if _, _, err := runner.Run(ctx, "/usr/bin/open", []string{"-g", addURL}); err != nil {
+		if err := ctx.Err(); err != nil {
+			return Response{}, err
+		}
+		// A timed-out command may already have delivered the URL. Its pending
+		// marker must be reconciled instead of dispatching a second creation.
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			return Response{}, fmt.Errorf("dispatch Things add URL: %w", err)
+		}
+		if _, _, err := runner.Run(ctx, "/usr/bin/open", []string{"-g", "-j", addURL}); err != nil {
 			return Response{}, fmt.Errorf("dispatch Things add URL: %w", err)
 		}
 	}
 
 	// 5. Poll SQLite for created task UUID
 	var taskUUID string
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := c.verifyDeadline()
 	for time.Now().Before(deadline) {
-		row := db.QueryRowContext(ctx, `SELECT uuid FROM TMTask WHERE title = ? AND creationDate >= ? AND trashed = 0 ORDER BY creationDate DESC LIMIT 1`, pendingTitle, minCreationDate)
-		if err := row.Scan(&taskUUID); err == nil && taskUUID != "" {
+		row := db.QueryRowContext(ctx, `SELECT uuid FROM TMTask WHERE type = 0 AND title = ? AND creationDate >= ? AND trashed = 0 ORDER BY creationDate DESC LIMIT 1`, pendingTitle, minCreationDate)
+		err := row.Scan(&taskUUID)
+		if err == nil && taskUUID != "" {
 			break
 		}
-		time.Sleep(50 * time.Millisecond)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return Response{}, fmt.Errorf("verify created Things task: %w", err)
+		}
+		if err := waitForPoll(ctx, min(50*time.Millisecond, time.Until(deadline))); err != nil {
+			return Response{}, err
+		}
 	}
 	if taskUUID == "" {
-		row := db.QueryRowContext(ctx, `SELECT uuid FROM TMTask WHERE title = ? AND trashed = 0 ORDER BY creationDate DESC LIMIT 1`, pendingTitle)
-		_ = row.Scan(&taskUUID)
+		row := db.QueryRowContext(ctx, `SELECT uuid FROM TMTask WHERE type = 0 AND title = ? AND trashed = 0 ORDER BY creationDate DESC LIMIT 1`, pendingTitle)
+		if err := row.Scan(&taskUUID); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return Response{}, fmt.Errorf("find created Things task: %w", err)
+		}
 	}
 	if taskUUID == "" {
 		return Response{}, &OperationError{Code: "create_failed"}
 	}
 
-	// 6. Rename the pending marker to the final title while Things is still
-	// open, so the later FinaliseCapture step is a no-op and never has to
-	// relaunch Things. If this fails, the caller's retry reconciles via
-	// FindCapture on the pending title instead of creating a duplicate.
-	if err := c.FinaliseCapture(ctx, taskUUID, task.Title); err != nil {
-		return Response{}, fmt.Errorf("finalise Things capture title: %w", err)
-	}
-
-	// If Things 3 was not already running, quit it cleanly so no dock dot remains
-	if !wasRunning {
-		_, _, _ = runner.Run(ctx, "/usr/bin/osascript", []string{"-e", `tell application "Things3" to quit`})
-	}
+	// Keep the request marker until the caller has durably saved this UUID.
+	// FinaliseCapture is a separate step, matching the bundled Shortcut's
+	// capture/find/finalise contract. Renaming here loses crash recovery.
 
 	return Response{
 		OK:          true,
@@ -373,7 +392,7 @@ func (c *Client) FinaliseCapture(ctx context.Context, id, title string) error {
 	defer db.Close()
 
 	var currentTitle string
-	err = db.QueryRowContext(ctx, `SELECT title FROM TMTask WHERE uuid = ? AND trashed = 0`, id).Scan(&currentTitle)
+	err = db.QueryRowContext(ctx, `SELECT title FROM TMTask WHERE uuid = ? AND type = 0 AND trashed = 0`, id).Scan(&currentTitle)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return &OperationError{Code: "finalise_not_found"}
@@ -383,10 +402,29 @@ func (c *Client) FinaliseCapture(ctx context.Context, id, title string) error {
 	if currentTitle == title {
 		return nil
 	}
+	const pendingPrefix = "ThingsIndex pending ["
+	requestID := strings.TrimSuffix(strings.TrimPrefix(currentTitle, pendingPrefix), "]")
+	if !validRequestID(requestID) || currentTitle != pendingPrefix+requestID+"]" {
+		// A user may have renamed the task while the worker was stopped.
+		// A retry must not overwrite that change with the original request.
+		return &OperationError{Code: "finalise_conflict"}
+	}
 
-	runner := c.Runner
-	if runner == nil {
-		runner = ExecRunner{}
+	runner := c.commandRunner()
+	_, _, runningErr := runner.Run(ctx, "/usr/bin/pgrep", []string{"-x", "Things3"})
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if errors.Is(runningErr, context.DeadlineExceeded) || errors.Is(runningErr, context.Canceled) {
+		return fmt.Errorf("check Things running state: %w", runningErr)
+	}
+	if runningErr != nil {
+		defer restoreThingsStoppedState(ctx, runner)
+		if c.AuthToken == "" {
+			if _, _, err := runner.Run(ctx, "/usr/bin/open", []string{"-g", "-j", "-a", "/Applications/Things3.app"}); err != nil {
+				return fmt.Errorf("launch Things hidden for finalisation: %w", err)
+			}
+		}
 	}
 
 	if c.AuthToken != "" {
@@ -394,9 +432,10 @@ func (c *Client) FinaliseCapture(ctx context.Context, id, title string) error {
 			"id":         {id},
 			"title":      {title},
 			"auth-token": {c.AuthToken},
+			"reveal":     {"false"},
 		}
 		updateURL := "things:///update?" + strings.ReplaceAll(values.Encode(), "+", "%20")
-		if _, _, err := runner.Run(ctx, "/usr/bin/open", []string{"-g", updateURL}); err != nil {
+		if _, _, err := runner.Run(ctx, "/usr/bin/open", []string{"-g", "-j", updateURL}); err != nil {
 			return fmt.Errorf("run Things update URL: %w", err)
 		}
 	} else {
@@ -412,12 +451,31 @@ func (c *Client) FinaliseCapture(ctx context.Context, id, title string) error {
 	deadline := c.verifyDeadline()
 	for time.Now().Before(deadline) {
 		var updatedTitle string
-		if err := db.QueryRowContext(ctx, `SELECT title FROM TMTask WHERE uuid = ? AND trashed = 0`, id).Scan(&updatedTitle); err == nil && updatedTitle == title {
+		err := db.QueryRowContext(ctx, `SELECT title FROM TMTask WHERE uuid = ? AND trashed = 0`, id).Scan(&updatedTitle)
+		if err == nil && updatedTitle == title {
 			return nil
 		}
-		time.Sleep(50 * time.Millisecond)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("verify Things finalisation: %w", err)
+		}
+		if err := waitForPoll(ctx, min(50*time.Millisecond, time.Until(deadline))); err != nil {
+			return err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	return &OperationError{Code: "finalise_unverified"}
+}
+
+// Cleanup must still run after a deadline, but must not launch Things merely
+// to quit it when a failed dispatch never started the app.
+func restoreThingsStoppedState(ctx context.Context, runner CommandRunner) {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	if _, _, err := runner.Run(cleanupCtx, "/usr/bin/pgrep", []string{"-x", "Things3"}); err == nil {
+		_, _, _ = runner.Run(cleanupCtx, "/usr/bin/osascript", []string{"-e", `tell application "Things3" to quit`})
+	}
 }
 
 func buildAddURL(pendingTitle string, task capture.Request, appliedTags []string, authToken string, location *time.Location, now time.Time) string {
@@ -566,10 +624,7 @@ func runHelperShortcut(ctx context.Context, runner CommandRunner, request map[st
 // privacy grants persist per shortcut, not per invoking process, so a grant
 // earned here covers later daemon runs.
 func (c *Client) PingHelperShortcut(ctx context.Context) error {
-	runner := c.Runner
-	if runner == nil {
-		runner = ExecRunner{}
-	}
+	runner := c.commandRunner()
 	_, err := runHelperShortcut(ctx, runner, map[string]any{
 		"schemaVersion": 1,
 		"operation":     "ping",
@@ -583,27 +638,27 @@ func (c *Client) PingHelperShortcut(ctx context.Context) error {
 // TCC attributes the grant to the calling process, so the worker daemon must
 // run this itself; a wizard-run preflight would only grant the terminal.
 func (c *Client) AutomationPreflight(ctx context.Context) error {
-	runner := c.Runner
-	if runner == nil {
-		runner = ExecRunner{}
-	}
-	wasRunning := false
-	if _, _, err := runner.Run(ctx, "/usr/bin/pgrep", []string{"-x", "Things3"}); err == nil {
-		wasRunning = true
-	} else {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	preflightClient := *c
+	preflightClient.Timeout = 2 * time.Minute
+	runner := preflightClient.commandRunner()
+	if _, _, err := runner.Run(ctx, "/usr/bin/pgrep", []string{"-x", "Things3"}); err != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		defer restoreThingsStoppedState(ctx, runner)
 		// Launch hidden first so the Apple Event below does not surface a
 		// Things window.
-		_, _, _ = runner.Run(ctx, "/usr/bin/open", []string{"-g", "-j", "-a", "/Applications/Things3.app"})
+		if _, _, err := runner.Run(ctx, "/usr/bin/open", []string{"-g", "-j", "-a", "/Applications/Things3.app"}); err != nil {
+			return fmt.Errorf("launch Things hidden for Automation preflight: %w", err)
+		}
 	}
 	// Counting lists is answered by the running app, unlike properties such
 	// as name or version that AppleScript resolves from the bundle without
 	// ever sending an Apple Event (which would not raise the consent dialog).
 	if _, _, err := runner.Run(ctx, "/usr/bin/osascript", []string{"-e", `tell application "Things3" to count of lists`}); err != nil {
 		return fmt.Errorf("Things 3 automation consent is missing or was denied (System Settings > Privacy & Security > Automation): %w", err)
-	}
-	if !wasRunning {
-		time.Sleep(100 * time.Millisecond)
-		_, _, _ = runner.Run(ctx, "/usr/bin/osascript", []string{"-e", `tell application "Things3" to quit`})
 	}
 	return nil
 }
@@ -644,10 +699,7 @@ func (c *Client) CreateHeading(ctx context.Context, project, headingTitle string
 		return Response{OK: true, ID: existingHeadingUUID}, nil
 	}
 
-	runner := c.Runner
-	if runner == nil {
-		runner = ExecRunner{}
-	}
+	runner := c.commandRunner()
 
 	wasRunning := false
 	if _, _, err := runner.Run(ctx, "/usr/bin/pgrep", []string{"-x", "Things3"}); err == nil {
@@ -676,14 +728,18 @@ func (c *Client) CreateHeading(ctx context.Context, project, headingTitle string
 		if err := row.Scan(&headingUUID); err == nil && headingUUID != "" {
 			break
 		}
-		time.Sleep(100 * time.Millisecond)
+		if err := waitForPoll(ctx, 100*time.Millisecond); err != nil {
+			return Response{}, err
+		}
 	}
 	if headingUUID == "" {
 		return Response{}, &OperationError{Code: "create_failed"}
 	}
 
 	if !wasRunning {
-		time.Sleep(100 * time.Millisecond)
+		if err := waitForPoll(ctx, 100*time.Millisecond); err != nil {
+			return Response{}, err
+		}
 		_, _, _ = runner.Run(ctx, "/usr/bin/osascript", []string{"-e", `tell application "Things3" to quit`})
 	}
 
@@ -720,10 +776,7 @@ func (c *Client) ArchiveHeading(ctx context.Context, project, headingTitle strin
 		return Response{}, fmt.Errorf("query heading: %w", err)
 	}
 
-	runner := c.Runner
-	if runner == nil {
-		runner = ExecRunner{}
-	}
+	runner := c.commandRunner()
 
 	wasRunning := false
 	if _, _, err := runner.Run(ctx, "/usr/bin/pgrep", []string{"-x", "Things3"}); err == nil {
@@ -753,11 +806,15 @@ func (c *Client) ArchiveHeading(ctx context.Context, project, headingTitle strin
 			archived = true
 			break
 		}
-		time.Sleep(100 * time.Millisecond)
+		if err := waitForPoll(ctx, 100*time.Millisecond); err != nil {
+			return Response{}, err
+		}
 	}
 
 	if !wasRunning {
-		time.Sleep(100 * time.Millisecond)
+		if err := waitForPoll(ctx, 100*time.Millisecond); err != nil {
+			return Response{}, err
+		}
 		_, _, _ = runner.Run(ctx, "/usr/bin/osascript", []string{"-e", `tell application "Things3" to quit`})
 	}
 
@@ -800,10 +857,7 @@ func (c *Client) RenameHeading(ctx context.Context, project, oldHeadingTitle, ne
 		return Response{}, fmt.Errorf("query heading: %w", err)
 	}
 
-	runner := c.Runner
-	if runner == nil {
-		runner = ExecRunner{}
-	}
+	runner := c.commandRunner()
 
 	wasRunning := false
 	if _, _, err := runner.Run(ctx, "/usr/bin/pgrep", []string{"-x", "Things3"}); err == nil {
@@ -834,11 +888,15 @@ func (c *Client) RenameHeading(ctx context.Context, project, oldHeadingTitle, ne
 			renamed = true
 			break
 		}
-		time.Sleep(100 * time.Millisecond)
+		if err := waitForPoll(ctx, 100*time.Millisecond); err != nil {
+			return Response{}, err
+		}
 	}
 
 	if !wasRunning {
-		time.Sleep(100 * time.Millisecond)
+		if err := waitForPoll(ctx, 100*time.Millisecond); err != nil {
+			return Response{}, err
+		}
 		_, _, _ = runner.Run(ctx, "/usr/bin/osascript", []string{"-e", `tell application "Things3" to quit`})
 	}
 
@@ -881,145 +939,6 @@ func findProjectUUID(ctx context.Context, db *sql.DB, project string) (string, e
 		return "", &OperationError{Code: "destination_ambiguous"}
 	}
 	return uuids[0], nil
-}
-
-func (c *Client) ArchiveTask(ctx context.Context, id, title, project, action string) (Response, error) {
-	if strings.TrimSpace(id) == "" && strings.TrimSpace(title) == "" {
-		return Response{}, errors.New("task id or title is required")
-	}
-	db, err := c.openDB(ctx)
-	if err != nil {
-		return Response{}, err
-	}
-	defer db.Close()
-
-	taskUUID := id
-	if taskUUID == "" {
-		query := `SELECT uuid FROM TMTask WHERE type = 0 AND LOWER(title) = LOWER(?) AND trashed = 0 AND status = 0`
-		args := []any{title}
-		if project != "" {
-			projUUID, err := findProjectUUID(ctx, db, project)
-			if err != nil {
-				return Response{}, err
-			}
-			query += ` AND project = ?`
-			args = append(args, projUUID)
-		}
-		rows, err := db.QueryContext(ctx, query, args...)
-		if err != nil {
-			return Response{}, fmt.Errorf("query task: %w", err)
-		}
-		var found []string
-		for rows.Next() {
-			var uid string
-			if err := rows.Scan(&uid); err == nil {
-				found = append(found, uid)
-			}
-		}
-		rows.Close()
-		if len(found) == 0 {
-			return Response{}, &OperationError{Code: "task_not_found"}
-		}
-		if len(found) > 1 {
-			return Response{}, &OperationError{Code: "task_ambiguous"}
-		}
-		taskUUID = found[0]
-	}
-
-	runner := c.Runner
-	if runner == nil {
-		runner = ExecRunner{}
-	}
-
-	wasRunning := false
-	if _, _, err := runner.Run(ctx, "/usr/bin/pgrep", []string{"-x", "Things3"}); err == nil {
-		wasRunning = true
-	}
-
-	var script string
-	switch action {
-	case "cancel":
-		script = fmt.Sprintf(`tell application "Things3"
-  set aTask to (to do id %q)
-  set status of aTask to canceled
-end tell`, taskUUID)
-	case "trash":
-		script = fmt.Sprintf(`tell application "Things3"
-  set aTask to (to do id %q)
-  move aTask to list "Trash"
-end tell`, taskUUID)
-	default: // "complete"
-		script = fmt.Sprintf(`tell application "Things3"
-  set aTask to (to do id %q)
-  set status of aTask to completed
-end tell`, taskUUID)
-	}
-
-	if _, _, err := runner.Run(ctx, "/usr/bin/osascript", []string{"-e", script}); err != nil {
-		return Response{}, fmt.Errorf("archive task via AppleScript: %w", err)
-	}
-
-	if !wasRunning {
-		time.Sleep(50 * time.Millisecond)
-		_, _, _ = runner.Run(ctx, "/usr/bin/osascript", []string{"-e", `tell application "Things3" to quit`})
-	}
-
-	return Response{OK: true, ID: taskUUID}, nil
-}
-
-func (c *Client) ArchiveProject(ctx context.Context, id, name, action string) (Response, error) {
-	if strings.TrimSpace(id) == "" && strings.TrimSpace(name) == "" {
-		return Response{}, errors.New("project id or name is required")
-	}
-	db, err := c.openDB(ctx)
-	if err != nil {
-		return Response{}, err
-	}
-	defer db.Close()
-
-	projUUID := id
-	if projUUID == "" {
-		var err error
-		projUUID, err = findProjectUUID(ctx, db, name)
-		if err != nil {
-			return Response{}, err
-		}
-	}
-
-	runner := c.Runner
-	if runner == nil {
-		runner = ExecRunner{}
-	}
-
-	wasRunning := false
-	if _, _, err := runner.Run(ctx, "/usr/bin/pgrep", []string{"-x", "Things3"}); err == nil {
-		wasRunning = true
-	}
-
-	var script string
-	switch action {
-	case "cancel":
-		script = fmt.Sprintf(`tell application "Things3"
-  set aProj to (project id %q)
-  set status of aProj to canceled
-end tell`, projUUID)
-	default: // "complete"
-		script = fmt.Sprintf(`tell application "Things3"
-  set aProj to (project id %q)
-  set status of aProj to completed
-end tell`, projUUID)
-	}
-
-	if _, _, err := runner.Run(ctx, "/usr/bin/osascript", []string{"-e", script}); err != nil {
-		return Response{}, fmt.Errorf("archive project via AppleScript: %w", err)
-	}
-
-	if !wasRunning {
-		time.Sleep(50 * time.Millisecond)
-		_, _, _ = runner.Run(ctx, "/usr/bin/osascript", []string{"-e", `tell application "Things3" to quit`})
-	}
-
-	return Response{OK: true, ID: projUUID}, nil
 }
 
 type TaskItem struct {
@@ -1157,161 +1076,4 @@ func (c *Client) QueryTasks(ctx context.Context, req capture.QueryTasksRequest) 
 
 	dataBytes, _ := json.Marshal(tasks)
 	return Response{OK: true, ID: string(dataBytes)}, nil
-}
-
-func (c *Client) UpdateTask(ctx context.Context, req capture.UpdateTaskRequest) (Response, error) {
-	db, err := c.openDB(ctx)
-	if err != nil {
-		return Response{}, err
-	}
-	defer db.Close()
-
-	taskUUID := req.ID
-	if taskUUID == "" {
-		query := `SELECT uuid FROM TMTask WHERE type = 0 AND LOWER(title) = LOWER(?) AND trashed = 0 AND status = 0`
-		args := []any{req.Title}
-		if req.Project != "" {
-			projUUID, err := findProjectUUID(ctx, db, req.Project)
-			if err != nil {
-				return Response{}, err
-			}
-			query += ` AND project = ?`
-			args = append(args, projUUID)
-		}
-		rows, err := db.QueryContext(ctx, query, args...)
-		if err != nil {
-			return Response{}, fmt.Errorf("query task: %w", err)
-		}
-		var found []string
-		for rows.Next() {
-			var uid string
-			if err := rows.Scan(&uid); err == nil {
-				found = append(found, uid)
-			}
-		}
-		rows.Close()
-		if len(found) == 0 {
-			return Response{}, &OperationError{Code: "task_not_found"}
-		}
-		if len(found) > 1 {
-			return Response{}, &OperationError{Code: "task_ambiguous"}
-		}
-		taskUUID = found[0]
-	}
-
-	// AppleScript can only rename, edit notes, and reschedule to today; every
-	// other field needs the Things update URL, which requires the auth token.
-	needsURLScheme := req.Deadline != "" || len(req.AddTags) > 0 || len(req.AddChecklist) > 0 ||
-		(req.When != "" && req.When != "today")
-	if c.AuthToken == "" && needsURLScheme {
-		return Response{}, errors.New("updating deadline, tags, checklist, or non-today schedules requires the Things authorization token (set THINGS_INDEX_THINGS_AUTH_TOKEN)")
-	}
-
-	// Snapshot the row before dispatching so the verification poll below can
-	// tell whether Things actually applied the update; open exits 0 even when
-	// Things rejects the URL (for example on a revoked auth token).
-	var beforeMod float64
-	err = db.QueryRowContext(ctx, `SELECT COALESCE(userModificationDate, 0) FROM TMTask WHERE uuid = ? AND trashed = 0`, taskUUID).Scan(&beforeMod)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return Response{}, &OperationError{Code: "task_not_found"}
-		}
-		return Response{}, fmt.Errorf("read task before update: %w", err)
-	}
-
-	runner := c.Runner
-	if runner == nil {
-		runner = ExecRunner{}
-	}
-
-	wasRunning := false
-	if _, _, err := runner.Run(ctx, "/usr/bin/pgrep", []string{"-x", "Things3"}); err == nil {
-		wasRunning = true
-	}
-
-	if c.AuthToken != "" {
-		values := url.Values{}
-		values.Set("id", taskUUID)
-		values.Set("auth-token", c.AuthToken)
-		values.Set("reveal", "false")
-		if req.NewTitle != "" {
-			values.Set("title", req.NewTitle)
-		}
-		if req.Notes != "" {
-			values.Set("notes", req.Notes)
-		} else if req.AppendNotes != "" {
-			values.Set("append-notes", req.AppendNotes)
-		}
-		if req.When != "" {
-			values.Set("when", req.When)
-		}
-		if req.Deadline != "" {
-			values.Set("deadline", req.Deadline)
-		}
-		if len(req.AddTags) > 0 {
-			values.Set("add-tags", strings.Join(req.AddTags, ","))
-		}
-		if len(req.AddChecklist) > 0 {
-			values.Set("append-checklist-items", strings.Join(req.AddChecklist, "\n"))
-		}
-		updateURL := "things:///update?" + strings.ReplaceAll(values.Encode(), "+", "%20")
-		if _, _, err := runner.Run(ctx, "/usr/bin/open", []string{"-g", updateURL}); err != nil {
-			return Response{}, fmt.Errorf("dispatch Things update URL: %w", err)
-		}
-	} else {
-		var scriptLines []string
-		scriptLines = append(scriptLines, fmt.Sprintf(`set aTask to (to do id "%s")`, escapeAppleScriptString(taskUUID)))
-		if req.NewTitle != "" {
-			scriptLines = append(scriptLines, fmt.Sprintf(`set name of aTask to "%s"`, escapeAppleScriptString(req.NewTitle)))
-		}
-		if req.Notes != "" {
-			scriptLines = append(scriptLines, fmt.Sprintf(`set notes of aTask to "%s"`, escapeAppleScriptString(req.Notes)))
-		} else if req.AppendNotes != "" {
-			scriptLines = append(scriptLines, fmt.Sprintf(`set notes of aTask to (notes of aTask & "\n" & "%s")`, escapeAppleScriptString(req.AppendNotes)))
-		}
-		if req.When == "today" {
-			scriptLines = append(scriptLines, `schedule aTask for (current date)`)
-		}
-
-		fullScript := fmt.Sprintf("tell application \"Things3\"\n  %s\nend tell", strings.Join(scriptLines, "\n  "))
-
-		if _, _, err := runner.Run(ctx, "/usr/bin/osascript", []string{"-e", fullScript}); err != nil {
-			return Response{}, fmt.Errorf("update task via AppleScript: %w", err)
-		}
-	}
-
-	// Verify the update landed before reporting success: title and notes are
-	// compared directly; when, deadline, tag, and checklist changes are only
-	// observable through the row's modification stamp.
-	needsStamp := req.When != "" || req.Deadline != "" || len(req.AddTags) > 0 || len(req.AddChecklist) > 0
-	verified := false
-	deadline := c.verifyDeadline()
-	for time.Now().Before(deadline) {
-		var title, notes string
-		var mod float64
-		if err := db.QueryRowContext(ctx, `SELECT title, COALESCE(notes, ''), COALESCE(userModificationDate, 0) FROM TMTask WHERE uuid = ? AND trashed = 0`, taskUUID).Scan(&title, &notes, &mod); err == nil {
-			titleOK := req.NewTitle == "" || title == req.NewTitle
-			notesOK := true
-			if req.Notes != "" {
-				notesOK = notes == req.Notes
-			} else if req.AppendNotes != "" {
-				notesOK = strings.Contains(notes, req.AppendNotes)
-			}
-			if titleOK && notesOK && (!needsStamp || mod > beforeMod) {
-				verified = true
-				break
-			}
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-
-	if !wasRunning {
-		time.Sleep(50 * time.Millisecond)
-		_, _, _ = runner.Run(ctx, "/usr/bin/osascript", []string{"-e", `tell application "Things3" to quit`})
-	}
-
-	if !verified {
-		return Response{}, &OperationError{Code: "update_unverified"}
-	}
-	return Response{OK: true, ID: taskUUID}, nil
 }

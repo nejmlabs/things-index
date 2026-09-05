@@ -73,8 +73,20 @@ numbers of days:
 |---|---:|---|
 | `THINGS_INDEX_SUCCEEDED_RETENTION_DAYS` | 7 | Confirmed server jobs |
 | `THINGS_INDEX_FAILED_RETENTION_DAYS` | 30 | Terminally failed server jobs |
-| `THINGS_INDEX_JOURNAL_RETENTION_DAYS` | 30 | Mac deliveries already acknowledged by the server |
+| `THINGS_INDEX_JOURNAL_RETENTION_DAYS` | 7 | Mac writes already acknowledged by the server (example plists set 30) |
 
 Set a value to `0` to retain that category indefinitely. Queued jobs, active or
 expired leases, retryable failures, and incomplete Mac delivery records are
-never removed by retention cleanup.
+never removed by retention cleanup. Completed but unacknowledged writes and
+uncertain dispatches are also retained. Direct stdio writes have no durable
+delivery acknowledgement, so their results remain in the journal.
+
+Update the Mac worker before enabling new area/tag tools on the MCP server.
+When upgrading from a worker that did not journal non-capture writes, finish
+or review its outstanding writes before restarting them under the new worker;
+the new journal cannot reconstruct native writes already dispatched by an old
+binary.
+The existing signed Shortcut still handles heading operations; this update
+does not change its source or installed workflow. See the
+[write recovery contract](../README.md#write-recovery) for retry behaviour and
+the limits of reconciling native Things writes after an interruption.

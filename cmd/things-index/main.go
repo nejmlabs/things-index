@@ -200,14 +200,21 @@ func runStandaloneHTTP() error {
 				continue
 			}
 			outcome, processErr := processor.Process(ctx, worker.Job{ID: job.ID, Task: job.Task})
+			reportCtx, cancelReport := context.WithTimeout(ctx, 10*time.Second)
 			if processErr != nil {
-				_ = queueStore.Fail(ctx, job.ID, job.LeaseToken, processErr.Error(), worker.IsRetryable(processErr))
+				if err := queueStore.Fail(reportCtx, job.ID, job.LeaseToken, processErr.Error(), worker.IsRetryable(processErr)); err != nil {
+					log.Printf("report failed job %s: %v", job.ID, err)
+				}
 			} else {
-				_ = queueStore.Complete(ctx, job.ID, job.LeaseToken, outcome.ThingsID, outcome.Warnings)
-				if worker.UsesJournal(job.Task) {
-					_ = journalStore.MarkReported(ctx, job.ID)
+				if err := queueStore.Complete(reportCtx, job.ID, job.LeaseToken, outcome.ThingsID, outcome.Warnings); err != nil {
+					log.Printf("report completed job %s: %v", job.ID, err)
+				} else if worker.UsesJournal(job.Task) {
+					if err := processor.MarkReported(reportCtx, job.ID); err != nil {
+						log.Printf("record acknowledgement for job %s: %v", job.ID, err)
+					}
 				}
 			}
+			cancelReport()
 		}
 	}()
 
@@ -305,179 +312,53 @@ func runStdio() error {
 		Instructions: "Capture tasks directly in Things 3 on this Mac. " + toolschema.ProjectWorkflowInstructions,
 	})
 
-	mustAddTool(mcpServer, &mcp.Tool{
-		Name:        "capture_things_task",
-		Description: "Create one task in Things 3 on this Mac. Exact or clear fuzzy project matches use that project. Missing or ambiguous projects, including unavailable project IDs, save to Inbox with requested project and heading in notes and a warning. No clarification question is needed.",
-	}, func(callCtx context.Context, _ *mcp.CallToolRequest, input capture.TaskFields) (*mcp.CallToolResult, stdioCaptureResult, error) {
-		task := capture.Request{TaskFields: input}
-		if err := task.Validate(); err != nil {
-			return nil, stdioCaptureResult{}, fmt.Errorf("invalid Things task: %w", err)
-		}
-
-		reqID := randomHex(16)
-		resp, err := captureAdapter.Capture(callCtx, reqID, task)
-		if err != nil {
-			return nil, stdioCaptureResult{}, fmt.Errorf("capture task in Things 3: %w", err)
-		}
-
-		return nil, stdioCaptureResult{
-			RequestID: reqID,
-			Status:    "created",
-			ThingsID:  resp.ID,
-			Warnings:  resp.Warnings,
-		}, nil
-	})
-
-	mustAddTool(mcpServer, &mcp.Tool{
-		Name:        "create_things_heading",
-		Description: "Create a new section heading inside a Things 3 project.",
-	}, func(callCtx context.Context, _ *mcp.CallToolRequest, input capture.HeadingRequest) (*mcp.CallToolResult, struct {
-		Status   string `json:"status"`
-		ThingsID string `json:"things_id,omitempty"`
-	}, error) {
-		if err := input.Validate(); err != nil {
-			return nil, struct {
-				Status   string `json:"status"`
-				ThingsID string `json:"things_id,omitempty"`
-			}{}, fmt.Errorf("invalid heading request: %w", err)
-		}
-		resp, err := captureAdapter.CreateHeading(callCtx, input.Project, input.Heading)
-		if err != nil {
-			return nil, struct {
-				Status   string `json:"status"`
-				ThingsID string `json:"things_id,omitempty"`
-			}{}, fmt.Errorf("create heading: %w", err)
-		}
-		return nil, struct {
-			Status   string `json:"status"`
-			ThingsID string `json:"things_id,omitempty"`
-		}{
-			Status:   "created",
-			ThingsID: resp.ID,
-		}, nil
-	})
-
-	mustAddTool(mcpServer, &mcp.Tool{
-		Name:        "archive_things_heading",
-		Description: "Archive/hide a section heading from an active Things 3 project.",
-	}, func(callCtx context.Context, _ *mcp.CallToolRequest, input capture.HeadingRequest) (*mcp.CallToolResult, struct {
-		Status   string `json:"status"`
-		ThingsID string `json:"things_id,omitempty"`
-	}, error) {
-		if err := input.Validate(); err != nil {
-			return nil, struct {
-				Status   string `json:"status"`
-				ThingsID string `json:"things_id,omitempty"`
-			}{}, fmt.Errorf("invalid heading request: %w", err)
-		}
-		resp, err := captureAdapter.ArchiveHeading(callCtx, input.Project, input.Heading)
-		if err != nil {
-			return nil, struct {
-				Status   string `json:"status"`
-				ThingsID string `json:"things_id,omitempty"`
-			}{}, fmt.Errorf("archive heading: %w", err)
-		}
-		return nil, struct {
-			Status   string `json:"status"`
-			ThingsID string `json:"things_id,omitempty"`
-		}{
-			Status:   "archived",
-			ThingsID: resp.ID,
-		}, nil
-	})
-
-	mustAddTool(mcpServer, &mcp.Tool{
-		Name:        "rename_things_heading",
-		Description: "Rename an existing section heading inside a Things 3 project.",
-	}, func(callCtx context.Context, _ *mcp.CallToolRequest, input capture.HeadingRequest) (*mcp.CallToolResult, struct {
-		Status   string `json:"status"`
-		ThingsID string `json:"things_id,omitempty"`
-	}, error) {
-		if err := input.Validate(); err != nil {
-			return nil, struct {
-				Status   string `json:"status"`
-				ThingsID string `json:"things_id,omitempty"`
-			}{}, fmt.Errorf("invalid heading request: %w", err)
-		}
-		if strings.TrimSpace(input.NewTitle) == "" {
-			return nil, struct {
-				Status   string `json:"status"`
-				ThingsID string `json:"things_id,omitempty"`
-			}{}, errors.New("new_title is required when renaming a heading")
-		}
-		resp, err := captureAdapter.RenameHeading(callCtx, input.Project, input.Heading, input.NewTitle)
-		if err != nil {
-			return nil, struct {
-				Status   string `json:"status"`
-				ThingsID string `json:"things_id,omitempty"`
-			}{}, fmt.Errorf("rename heading: %w", err)
-		}
-		return nil, struct {
-			Status   string `json:"status"`
-			ThingsID string `json:"things_id,omitempty"`
-		}{
-			Status:   "renamed",
-			ThingsID: resp.ID,
-		}, nil
-	})
-
-	mustAddTool(mcpServer, &mcp.Tool{
-		Name:        "archive_things_task",
-		Description: "Archive a task in Things 3 (mark completed, canceled, or move to trash).",
-	}, func(callCtx context.Context, _ *mcp.CallToolRequest, input capture.ArchiveTaskRequest) (*mcp.CallToolResult, struct {
-		Status   string `json:"status"`
-		ThingsID string `json:"things_id,omitempty"`
-	}, error) {
-		if err := input.Validate(); err != nil {
-			return nil, struct {
-				Status   string `json:"status"`
-				ThingsID string `json:"things_id,omitempty"`
-			}{}, fmt.Errorf("invalid archive task request: %w", err)
-		}
-		resp, err := captureAdapter.ArchiveTask(callCtx, input.ID, input.Title, input.Project, input.Action)
-		if err != nil {
-			return nil, struct {
-				Status   string `json:"status"`
-				ThingsID string `json:"things_id,omitempty"`
-			}{}, fmt.Errorf("archive task: %w", err)
-		}
-		return nil, struct {
-			Status   string `json:"status"`
-			ThingsID string `json:"things_id,omitempty"`
-		}{
-			Status:   "archived",
-			ThingsID: resp.ID,
-		}, nil
-	})
-
-	mustAddTool(mcpServer, &mcp.Tool{
-		Name:        "archive_things_project",
-		Description: "Archive an entire project in Things 3 (mark completed or canceled).",
-	}, func(callCtx context.Context, _ *mcp.CallToolRequest, input capture.ArchiveProjectRequest) (*mcp.CallToolResult, struct {
-		Status   string `json:"status"`
-		ThingsID string `json:"things_id,omitempty"`
-	}, error) {
-		if err := input.Validate(); err != nil {
-			return nil, struct {
-				Status   string `json:"status"`
-				ThingsID string `json:"things_id,omitempty"`
-			}{}, fmt.Errorf("invalid archive project request: %w", err)
-		}
-		resp, err := captureAdapter.ArchiveProject(callCtx, input.ID, input.Name, input.Action)
-		if err != nil {
-			return nil, struct {
-				Status   string `json:"status"`
-				ThingsID string `json:"things_id,omitempty"`
-			}{}, fmt.Errorf("archive project: %w", err)
-		}
-		return nil, struct {
-			Status   string `json:"status"`
-			ThingsID string `json:"things_id,omitempty"`
-		}{
-			Status:   "archived",
-			ThingsID: resp.ID,
-		}, nil
-	})
+	journalPath, err := workerapp.JournalPath()
+	if err != nil {
+		return err
+	}
+	localJournal, err := journal.Open(journalPath)
+	if err != nil {
+		return err
+	}
+	defer localJournal.Close()
+	writer := newLocalWriter(&worker.Processor{Helper: captureAdapter, Journal: localJournal})
+	addLocalWriteTool(mcpServer, writer, "capture_things_task",
+		"Create one task in Things 3 on this Mac. Exact or clear fuzzy project matches use that project. Missing or ambiguous projects, including unavailable project IDs, save to Inbox with requested project and heading in notes and a warning. No clarification question is needed.",
+		"created", func(input capture.TaskFields) capture.Request { return capture.Request{TaskFields: input} })
+	addLocalWriteTool(mcpServer, writer, "create_things_heading", "Create a new section heading inside a Things 3 project.", "created",
+		func(input capture.HeadingRequest) capture.Request {
+			return capture.Request{HeadingOperation: "create", HeadingRequest: &input}
+		})
+	addLocalWriteTool(mcpServer, writer, "archive_things_heading", "Archive/hide a section heading from an active Things 3 project.", "archived",
+		func(input capture.HeadingRequest) capture.Request {
+			return capture.Request{HeadingOperation: "archive", HeadingRequest: &input}
+		})
+	addLocalWriteTool(mcpServer, writer, "rename_things_heading", "Rename an existing section heading inside a Things 3 project.", "renamed",
+		func(input capture.HeadingRequest) capture.Request {
+			return capture.Request{HeadingOperation: "rename", HeadingRequest: &input}
+		})
+	addLocalWriteTool(mcpServer, writer, "archive_things_task", "Archive a task in Things 3 (mark completed, canceled, or move to trash).", "archived",
+		func(input capture.ArchiveTaskRequest) capture.Request {
+			return capture.Request{ArchiveTaskRequest: &input}
+		})
+	addLocalWriteTool(mcpServer, writer, "archive_things_project", "Archive an entire project in Things 3 (mark completed or canceled).", "archived",
+		func(input capture.ArchiveProjectRequest) capture.Request {
+			return capture.Request{ArchiveProjectRequest: &input}
+		})
+	addLocalWriteTool(mcpServer, writer, "create_things_project", "Create a Things 3 project with an optional area, notes, start, deadline, and existing tags. Returns its things_id to use as destination.id for tasks. An existing exact title and area is reused with warnings about fields that differ.", "created",
+		func(input capture.CreateProjectRequest) capture.Request {
+			return capture.Request{CreateProjectRequest: &input}
+		})
+	addLocalWriteTool(mcpServer, writer, "update_things_task", "Update, reschedule, or add notes/checklists to an existing task in Things 3. Reuse an idempotency_key for retries of the same request.", "updated",
+		func(input capture.UpdateTaskRequest) capture.Request {
+			return capture.Request{UpdateTaskRequest: &input}
+		})
+	addLocalWriteTool(mcpServer, writer, "create_things_area", toolschema.AreaCreationDescription, "created",
+		func(input capture.CreateAreaRequest) capture.Request {
+			return capture.Request{CreateAreaRequest: &input}
+		})
+	addLocalWriteTool(mcpServer, writer, "create_things_tag", toolschema.TagCreationDescription, "created",
+		func(input capture.CreateTagRequest) capture.Request { return capture.Request{CreateTagRequest: &input} })
 
 	mustAddTool(mcpServer, &mcp.Tool{
 		Name:        "get_things_today",
@@ -488,7 +369,9 @@ func runStdio() error {
 			return nil, nil, fmt.Errorf("get today: %w", err)
 		}
 		var items any
-		_ = json.Unmarshal([]byte(resp.ID), &items)
+		if err := json.Unmarshal([]byte(resp.ID), &items); err != nil {
+			return nil, nil, fmt.Errorf("invalid Things query result: %w", err)
+		}
 		return nil, items, nil
 	})
 
@@ -501,7 +384,9 @@ func runStdio() error {
 			return nil, nil, fmt.Errorf("get inbox: %w", err)
 		}
 		var items any
-		_ = json.Unmarshal([]byte(resp.ID), &items)
+		if err := json.Unmarshal([]byte(resp.ID), &items); err != nil {
+			return nil, nil, fmt.Errorf("invalid Things query result: %w", err)
+		}
 		return nil, items, nil
 	})
 
@@ -514,7 +399,9 @@ func runStdio() error {
 			return nil, nil, fmt.Errorf("list projects: %w", err)
 		}
 		var items any
-		_ = json.Unmarshal([]byte(resp.ID), &items)
+		if err := json.Unmarshal([]byte(resp.ID), &items); err != nil {
+			return nil, nil, fmt.Errorf("invalid Things query result: %w", err)
+		}
 		return nil, items, nil
 	})
 
@@ -527,66 +414,10 @@ func runStdio() error {
 			return nil, nil, fmt.Errorf("search tasks: %w", err)
 		}
 		var items any
-		_ = json.Unmarshal([]byte(resp.ID), &items)
+		if err := json.Unmarshal([]byte(resp.ID), &items); err != nil {
+			return nil, nil, fmt.Errorf("invalid Things query result: %w", err)
+		}
 		return nil, items, nil
-	})
-
-	mustAddTool(mcpServer, &mcp.Tool{
-		Name:        "create_things_project",
-		Description: "Create a project in Things 3 using the requested title and optional area. After creation succeeds, use its things_id as destination.id when adding tasks to it.",
-	}, func(callCtx context.Context, _ *mcp.CallToolRequest, input capture.CreateProjectRequest) (*mcp.CallToolResult, struct {
-		Status   string `json:"status"`
-		ThingsID string `json:"things_id,omitempty"`
-	}, error) {
-		if err := input.Validate(); err != nil {
-			return nil, struct {
-				Status   string `json:"status"`
-				ThingsID string `json:"things_id,omitempty"`
-			}{}, fmt.Errorf("invalid create project request: %w", err)
-		}
-		resp, err := captureAdapter.CreateProject(callCtx, input)
-		if err != nil {
-			return nil, struct {
-				Status   string `json:"status"`
-				ThingsID string `json:"things_id,omitempty"`
-			}{}, fmt.Errorf("create project: %w", err)
-		}
-		return nil, struct {
-			Status   string `json:"status"`
-			ThingsID string `json:"things_id,omitempty"`
-		}{
-			Status:   "created",
-			ThingsID: resp.ID,
-		}, nil
-	})
-
-	mustAddTool(mcpServer, &mcp.Tool{
-		Name:        "update_things_task",
-		Description: "Update, reschedule, or add notes/checklists to an existing task in Things 3.",
-	}, func(callCtx context.Context, _ *mcp.CallToolRequest, input capture.UpdateTaskRequest) (*mcp.CallToolResult, struct {
-		Status   string `json:"status"`
-		ThingsID string `json:"things_id,omitempty"`
-	}, error) {
-		if err := input.Validate(); err != nil {
-			return nil, struct {
-				Status   string `json:"status"`
-				ThingsID string `json:"things_id,omitempty"`
-			}{}, fmt.Errorf("invalid update task request: %w", err)
-		}
-		resp, err := captureAdapter.UpdateTask(callCtx, input)
-		if err != nil {
-			return nil, struct {
-				Status   string `json:"status"`
-				ThingsID string `json:"things_id,omitempty"`
-			}{}, fmt.Errorf("update task: %w", err)
-		}
-		return nil, struct {
-			Status   string `json:"status"`
-			ThingsID string `json:"things_id,omitempty"`
-		}{
-			Status:   "updated",
-			ThingsID: resp.ID,
-		}, nil
 	})
 
 	return mcpServer.Run(ctx, &mcp.StdioTransport{})
@@ -787,10 +618,13 @@ func runWorkerSetup() (resultErr error) {
 		defer cancelTest()
 		const testTitle = "ThingsIndex setup test — safe to delete"
 		testID := randomHex(16)
-		_, err := verifier.Capture(testCtx, testID, capture.Request{TaskFields: capture.TaskFields{
+		testResult, err := verifier.Capture(testCtx, testID, capture.Request{TaskFields: capture.TaskFields{
 			Title: testTitle,
 			Notes: "Created by things-index worker --setup to validate the Things auth token.",
 		}})
+		if err == nil {
+			err = verifier.FinaliseCapture(testCtx, testResult.ID, testTitle)
+		}
 		if err != nil {
 			// A slow first launch can outlast the capture poll; reconcile the
 			// pending task the same way the worker does before giving up.

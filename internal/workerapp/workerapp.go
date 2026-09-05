@@ -20,7 +20,57 @@ import (
 	"github.com/nejmlabs/things-index/internal/worker"
 )
 
-const journalCleanupInterval = 6 * time.Hour
+const (
+	journalCleanupInterval = 6 * time.Hour
+	// The server leases jobs for 90 seconds. Leave time for native-command
+	// cancellation, cleanup, and reporting before another worker can retry.
+	jobTimeout    = worker.JobTimeout
+	reportTimeout = 10 * time.Second
+)
+
+type jobRunner struct {
+	process       func(context.Context, worker.Job) (worker.Outcome, error)
+	complete      func(context.Context, worker.Lease, worker.Outcome) error
+	fail          func(context.Context, worker.Lease, error, bool) error
+	markReported  func(context.Context, string) error
+	jobTimeout    time.Duration
+	reportTimeout time.Duration
+}
+
+func (r jobRunner) run(ctx context.Context, lease worker.Lease) error {
+	jobCtx, cancelJob := context.WithTimeout(ctx, r.jobTimeout)
+	outcome, processErr := r.process(jobCtx, lease.Job)
+	cancelJob()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	// A job deadline must not prevent reporting its failure. Derive this
+	// separate bound from the worker context so shutdown still cancels it.
+	reportCtx, cancelReport := context.WithTimeout(ctx, r.reportTimeout)
+	defer cancelReport()
+	var reportErr error
+	if processErr != nil {
+		log.Printf("Job %s failed: %v", lease.ID, processErr)
+		reportErr = r.fail(reportCtx, lease, processErr, worker.IsRetryable(processErr))
+	} else {
+		if worker.UsesJournal(lease.Task) {
+			log.Printf("Job %s succeeded (things_id=%s)", lease.ID, outcome.ThingsID)
+		} else {
+			log.Printf("Read job %s succeeded", lease.ID)
+		}
+		reportErr = r.complete(reportCtx, lease, outcome)
+	}
+	if reportErr != nil {
+		return fmt.Errorf("report job result: %w", reportErr)
+	}
+	if processErr == nil && worker.UsesJournal(lease.Task) {
+		if err := r.markReported(reportCtx, lease.ID); err != nil {
+			return fmt.Errorf("record report state: %w", err)
+		}
+	}
+	return nil
+}
 
 // Run starts the worker loop and blocks until ctx is canceled.
 func Run(ctx context.Context) error {
@@ -88,6 +138,10 @@ func Run(ctx context.Context) error {
 		<-cleanupDone
 	}()
 	processor := &worker.Processor{Helper: captureAdapter, Journal: journalStore}
+	jobs := jobRunner{
+		process: processor.Process, complete: serverClient.Complete, fail: serverClient.Fail,
+		markReported: processor.MarkReported, jobTimeout: jobTimeout, reportTimeout: reportTimeout,
+	}
 
 	log.Printf("ThingsIndex worker ready (native Things 3 URL & SQLite engine); polling %s", serverURL)
 	for ctx.Err() == nil {
@@ -104,23 +158,11 @@ func Run(ctx context.Context) error {
 		}
 		log.Printf("Received leased job: %s (attempts: %d)", lease.ID, lease.Attempts)
 
-		outcome, processErr := processor.Process(ctx, lease.Job)
-		var reportErr error
-		if processErr != nil {
-			log.Printf("Job %s failed: %v", lease.ID, processErr)
-			reportErr = serverClient.Fail(ctx, *lease, processErr, worker.IsRetryable(processErr))
-		} else {
-			log.Printf("Job %s succeeded (things_id=%s)", lease.ID, outcome.ThingsID)
-			reportErr = serverClient.Complete(ctx, *lease, outcome)
-		}
-		if reportErr != nil {
-			log.Printf("report job %s: %v", lease.ID, reportErr)
-			continue
-		}
-		if processErr == nil && worker.UsesJournal(lease.Job.Task) {
-			if err := journalStore.MarkReported(ctx, lease.ID); err != nil {
-				log.Printf("record report state for job %s: %v", lease.ID, err)
+		if err := jobs.run(ctx, *lease); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
 			}
+			log.Printf("finish job %s: %v", lease.ID, err)
 		}
 	}
 	return ctx.Err()

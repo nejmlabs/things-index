@@ -82,8 +82,10 @@ For 24/7 homelab infrastructure where the MCP server runs on Linux and leases jo
 | `search_things_tasks` | Read | Search tasks across any scope (`today`, `inbox`, `anytime`, `someday`, `all`) by text query, project, area, or tag. |
 | `capture_things_task` | Write | Create a task in Inbox, Project, Area, or under a Heading with notes, tags, checklists, deadlines, and reminders. |
 | `create_things_project` | Write | Create a new project inside an Area with notes, tags, start schedule, and deadline. |
+| `create_things_area` | Write | Create an area, or reuse one unique exact name (ignoring case) with a warning. |
+| `create_things_tag` | Write | Create a tag with an optional existing parent tag; reuse requires the same parent. |
 | `update_things_task` | Write | Update an open task’s title or notes, reschedule it, or add deadlines, tags, and checklists (deadline/tags/checklist/non-today schedules need the Things auth token). |
-| `create_things_heading` | Write | Create a new section heading inside an existing project (runs the bundled ThingsIndex Helper shortcut; idempotent, verified via SQLite before reporting success). |
+| `create_things_heading` | Write | Create a new section heading inside an existing project (runs the bundled ThingsIndex Helper shortcut; verified via SQLite before reporting success). |
 | `rename_things_heading` | Write | Rename an existing section heading inside a project (runs the bundled ThingsIndex Helper shortcut; verified via SQLite before reporting success). |
 | `archive_things_heading` | Write | Archive a section heading from an active project (runs the bundled ThingsIndex Helper shortcut; verified via SQLite before reporting success). |
 | `archive_things_task` | Write | Archive a task: mark `completed` (Logbook), `canceled` (Logbook), or move to `trash`. |
@@ -98,7 +100,9 @@ Index 01 handles each spoken command without a clarification exchange. Say
 
 `create_things_project` creates the requested title in an optional exact area.
 It reuses an active exact-name project only in that same area; omitting the area
-means an unfiled project. After creation succeeds, the returned `things_id` can
+means an unfiled project. If requested notes, tags, or dates differ on a reused
+project, it returns a warning describing which fields were not applied. After
+creation succeeds, the returned `things_id` can
 be used directly in a task's destination:
 
 ```json
@@ -132,6 +136,51 @@ for clarification.
 In server mode, check `things_capture_status` until a queued project creation
 succeeds before adding tasks using its ID. A queued result means the Mac has
 not yet confirmed the operation.
+
+Area and tag creation also work without a clarification exchange. For example,
+`create_things_area` accepts `{"title":"Work"}`, and `create_things_tag` accepts
+`{"title":"Waiting","parent":"Work"}` when the parent tag already exists.
+Missing or ambiguous parent names fail before creation. Existing tags are never
+moved to a different parent implicitly. Tag names cannot contain commas because
+Things' tag application interface uses comma-separated names.
+
+### Write recovery
+
+All write tools accept an optional `idempotency_key`. Reuse the same key and
+identical input when retrying a command; use a new key for a new intentional
+change. The same key with different input is rejected. Both direct stdio MCP
+and the queued Mac worker keep a durable local write journal.
+
+Task capture keeps its unique pending title until its Things UUID is saved in
+the journal, then finalises the title. A restart can recover that marker and
+preserve any placement or missing-tag warnings. Completed writes retain their
+result so a lost server acknowledgement does not repeat the mutation.
+
+Task updates save their intended before/after values before dispatch. Appending
+notes becomes an exact replacement computed once; retries check for conflicting
+edits. Checklists are appended once and verified against the existing item IDs,
+titles, and statuses. An uncertain checklist or native creation is reconciled
+where possible and otherwise reported as uncertain without repeating it. Things
+does not provide an atomic transaction with this journal, so some interrupted
+writes require checking the item in Things. Concurrent edits to the same fields
+can still race with the native write.
+
+Ordinary native commands have a 30-second deadline, each job has 45 seconds,
+and reporting has a separate 10-second allowance within the 90-second lease.
+Initial attended Automation setup retains its two-minute allowance. Date checks
+use public Things calendar properties; SQLite remains read-only. The Evening
+check also depends on Things' current read-only bucket schema and rejects
+unrecognised values.
+
+Only server-acknowledged journal entries are eligible for retention cleanup.
+Uncertain writes and unacknowledged results remain available for recovery;
+stdio results are retained because stdio has no durable delivery acknowledgement.
+Server idempotency protection is bounded by retained queue and journal history.
+The existing signed Shortcut remains the implementation for heading operations.
+
+For an upgrade that adds area/tag tools, update the Mac worker before the MCP
+server. Older workers cannot execute the new operations. See
+[deployment profiles](docs/deployment.md) for signing, setup, and retention.
 
 ---
 
