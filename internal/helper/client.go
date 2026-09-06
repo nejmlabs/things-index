@@ -954,7 +954,72 @@ type ProjectItem struct {
 	OpenCount int    `json:"open_count"`
 }
 
+// Calendar list membership belongs to Things' public API. Private scheduling
+// columns do not reliably distinguish Today, Anytime, Someday, or Upcoming.
+const queryTaskListIDsScript = `on run argv
+    if (count of argv) is not 1 then error "Invalid list arguments"
+    set requestedScope to item 1 of argv
+    tell application "Things3"
+        if requestedScope is "today" then
+            set taskIDs to id of every to do of list "Today"
+        else if requestedScope is "anytime" then
+            set taskIDs to id of every to do of list "Anytime"
+        else if requestedScope is "someday" then
+            set taskIDs to id of every to do of list "Someday"
+        else
+            error "Invalid list scope"
+        end if
+    end tell
+    set AppleScript's text item delimiters to linefeed
+    return taskIDs as text
+end run`
+
+func (c *Client) queryTaskListIDs(ctx context.Context, scope string) (map[string]bool, error) {
+	switch scope {
+	case "today", "anytime", "someday":
+	default:
+		return nil, errors.New("unsupported Things list scope")
+	}
+	runner := c.commandRunner()
+	_, _, runningErr := runner.Run(ctx, "/usr/bin/pgrep", []string{"-x", "Things3"})
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if errors.Is(runningErr, context.Canceled) || errors.Is(runningErr, context.DeadlineExceeded) {
+		return nil, runningErr
+	}
+	if runningErr != nil {
+		defer restoreThingsStoppedState(ctx, runner)
+		if _, _, err := runner.Run(ctx, "/usr/bin/open", []string{"-g", "-j", "-a", "/Applications/Things3.app"}); err != nil {
+			return nil, fmt.Errorf("start Things hidden for list query: %w", err)
+		}
+	}
+	stdout, _, err := runner.Run(ctx, "/usr/bin/osascript", []string{"-e", queryTaskListIDsScript, "--", scope})
+	if err != nil {
+		return nil, fmt.Errorf("read Things list membership: %w", err)
+	}
+	ids := make(map[string]bool)
+	output := strings.TrimRight(string(stdout), "\r\n")
+	if output == "" {
+		return ids, nil
+	}
+	for _, id := range strings.Split(output, "\n") {
+		id = strings.TrimSuffix(id, "\r")
+		if !validOrganizationID(id) {
+			return nil, errors.New("invalid Things list identity response")
+		}
+		ids[id] = true
+	}
+	return ids, nil
+}
+
 func (c *Client) QueryTasks(ctx context.Context, req capture.QueryTasksRequest) (Response, error) {
+	timeout := c.Timeout
+	if timeout <= 0 {
+		timeout = defaultCommandTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	db, err := c.openDB(ctx)
 	if err != nil {
 		return Response{}, err
@@ -963,6 +1028,17 @@ func (c *Client) QueryTasks(ctx context.Context, req capture.QueryTasksRequest) 
 
 	if req.Limit <= 0 || req.Limit > 200 {
 		req.Limit = 50
+	}
+	var listIDs map[string]bool
+	switch req.Scope {
+	case "today", "anytime", "someday":
+		listIDs, err = c.queryTaskListIDs(ctx, req.Scope)
+		if err != nil {
+			return Response{}, err
+		}
+		if len(listIDs) == 0 {
+			return Response{OK: true, ID: "[]"}, nil
+		}
 	}
 
 	if req.Scope == "projects" {
@@ -1006,12 +1082,6 @@ func (c *Client) QueryTasks(ctx context.Context, req capture.QueryTasksRequest) 
 	switch req.Scope {
 	case "inbox":
 		whereClauses = append(whereClauses, "t.start = 0 AND t.project IS NULL AND t.area IS NULL")
-	case "today":
-		whereClauses = append(whereClauses, "(t.start = 1 AND t.todayIndex IS NOT NULL)")
-	case "anytime":
-		whereClauses = append(whereClauses, "t.start = 1 AND t.todayIndex IS NULL")
-	case "someday":
-		whereClauses = append(whereClauses, "t.start = 2")
 	}
 
 	if req.Query != "" {
@@ -1043,8 +1113,11 @@ func (c *Client) QueryTasks(ctx context.Context, req capture.QueryTasksRequest) 
 		baseQuery += " AND " + strings.Join(whereClauses, " AND ")
 	}
 
-	baseQuery += " ORDER BY t.status ASC, t.`index` ASC, t.creationDate DESC LIMIT ?"
-	args = append(args, req.Limit)
+	baseQuery += " ORDER BY t.status ASC, t.`index` ASC, t.creationDate DESC"
+	if listIDs == nil {
+		baseQuery += " LIMIT ?"
+		args = append(args, req.Limit)
+	}
 
 	rows, err := db.QueryContext(ctx, baseQuery, args...)
 	if err != nil {
@@ -1056,17 +1129,29 @@ func (c *Client) QueryTasks(ctx context.Context, req capture.QueryTasksRequest) 
 	for rows.Next() {
 		var item TaskItem
 		var statusInt int
-		if err := rows.Scan(&item.ID, &item.Title, &item.Notes, &statusInt, &item.Project, &item.Area, &item.Heading); err == nil {
-			switch statusInt {
-			case 3:
-				item.Status = "completed"
-			case 2:
-				item.Status = "canceled"
-			default:
-				item.Status = "open"
-			}
-			tasks = append(tasks, item)
+		if err := rows.Scan(&item.ID, &item.Title, &item.Notes, &statusInt, &item.Project, &item.Area, &item.Heading); err != nil {
+			return Response{}, fmt.Errorf("read queried task: %w", err)
 		}
+		if listIDs != nil && !listIDs[item.ID] {
+			continue
+		}
+		switch statusInt {
+		case 3:
+			item.Status = "completed"
+		case 2:
+			item.Status = "canceled"
+		default:
+			item.Status = "open"
+		}
+		tasks = append(tasks, item)
+		// Apply the limit after public membership. Stream SQLite rows rather
+		// than bind the full list, which may exceed SQLite's parameter limit.
+		if len(tasks) >= req.Limit {
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return Response{}, fmt.Errorf("read queried tasks: %w", err)
 	}
 
 	dataBytes, _ := json.Marshal(tasks)

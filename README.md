@@ -185,7 +185,7 @@ server. Older workers cannot execute the new operations. See
 ---
 
 ## 🔒 Aims
-* **Unattended Execution**: Uses Things URLs for writes and SQLite for reads. Background operation across restarts requires Full Disk Access for the worker, separate Things Automation permission for AppleScript, and the **ThingsIndex Helper** shortcut's permissions for headings. Release signing and updater identity checks preserve the identity used by those grants; existing ad hoc installations need a one-time migration and verification. See [Mac worker permissions](docs/homelab.md#mac-worker).
+* **Unattended Execution**: Uses native Things automation for writes and read-only SQLite for item details. Today, Anytime, and Someday membership comes from Things' public lists. Background operation across restarts requires Full Disk Access for the worker, separate Things Automation permission for AppleScript, and the **ThingsIndex Helper** shortcut's permissions for headings. Release signing and updater identity checks preserve the identity used by those grants; existing ad hoc installations need a one-time migration and verification. See [Mac worker permissions](docs/homelab.md#mac-worker).
 * **Zero Foreground Steal**: Suppresses window focus and automatically quits Things 3 (no Dock dot) if it was closed before capture.
 * **Strictly Read-Only SQLite (`_query_only=1`)**: Never performs raw SQL writes to Cultured Code's database; Cultured Code's official engine handles writing and Things Cloud sync.
 * **Durable Queue**: In server mode, If the Mac is asleep or rebooting, tasks wait safely in the server queue and process immediately on wakeup.
