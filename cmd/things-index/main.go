@@ -259,9 +259,9 @@ func runStandaloneHTTP() error {
 	return nil
 }
 
-// runInstallShortcut installs the bundled ThingsIndex Helper shortcut and
-// settles its privacy dialogs — the local-mode path to enabling the heading
-// tools, which the worker wizard otherwise handles as its steps 9-10.
+// runInstallShortcut installs the bundled helper and checks basic input and
+// Things lookup access. Heading writes may need separate first-use approval;
+// verify background heading operations before unattended use.
 func runInstallShortcut() error {
 	if runtime.GOOS != "darwin" {
 		return errors.New("the ThingsIndex Helper shortcut runs in the macOS Shortcuts app; install it on the Mac that runs Things 3")
@@ -269,14 +269,14 @@ func runInstallShortcut() error {
 	if err := installHelperShortcut(); err != nil {
 		return err
 	}
-	fmt.Println("• Verifying the helper shortcut (choose “Always Allow” on any privacy dialogs)...")
+	fmt.Println("• Verifying the helper shortcut (choose “Always Allow” if offered)...")
 	captureAdapter := helper.NewClient(os.Getenv("THINGS_INDEX_THINGS_AUTH_TOKEN"))
 	shortcutCtx, cancelShortcut := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancelShortcut()
 	if err := captureAdapter.PingHelperShortcut(shortcutCtx); err != nil {
 		return fmt.Errorf("the helper shortcut did not answer its ping (approve its privacy dialogs and rerun install-shortcut): %w", err)
 	}
-	fmt.Println("  ✓ Helper shortcut verified; heading tools are ready.")
+	fmt.Println("  ✓ Helper input and Things lookup verified. Verify background heading actions during attended setup.")
 	return nil
 }
 
@@ -648,17 +648,17 @@ func runWorkerSetup() (resultErr error) {
 		return err
 	}
 
-	// 10. Settle the Shortcut's one-time privacy dialogs now via its harmless
-	// ping; the grants are stored per shortcut, so they cover the daemon's
-	// runs too.
-	fmt.Println("• Verifying the helper shortcut (choose “Always Allow” on any privacy dialogs)...")
+	// 10. Check the Shortcut's basic input and Things lookup with a harmless
+	// ping. Heading writes may need separate first-use approval during
+	// attended setup; ping alone does not verify their background permissions.
+	fmt.Println("• Verifying the helper shortcut (choose “Always Allow” if offered)...")
 	shortcutCtx, cancelShortcut := context.WithTimeout(ctx, 3*time.Minute)
 	err = captureAdapter.PingHelperShortcut(shortcutCtx)
 	cancelShortcut()
 	if err != nil {
 		return fmt.Errorf("the helper shortcut did not answer its ping (approve its privacy dialogs and rerun the wizard): %w", err)
 	}
-	fmt.Println("  ✓ Helper shortcut verified; its privacy grants are settled.")
+	fmt.Println("  ✓ Helper input and Things lookup verified. Verify background heading actions during attended setup.")
 
 	// 11. Install Background Launcher Script (carries the secrets, hence 0700)
 	binDir := filepath.Join(home, ".local", "bin")

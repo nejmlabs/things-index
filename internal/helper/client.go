@@ -613,11 +613,9 @@ func runHelperShortcut(ctx context.Context, runner CommandRunner, request map[st
 	return response, nil
 }
 
-// PingHelperShortcut runs the bundled Shortcut's harmless ping operation (it
-// looks up one impossible Things ID) so setup can settle the Shortcut's
-// one-time privacy dialogs before the background worker needs it. Shortcut
-// privacy grants persist per shortcut, not per invoking process, so a grant
-// earned here covers later daemon runs.
+// PingHelperShortcut checks external input and a harmless Things lookup.
+// Heading writes may need separate first-use approval during attended setup;
+// a successful ping does not verify background heading permissions.
 func (c *Client) PingHelperShortcut(ctx context.Context) error {
 	runner := c.commandRunner()
 	_, err := runHelperShortcut(ctx, runner, map[string]any{

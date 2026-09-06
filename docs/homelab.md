@@ -194,7 +194,7 @@ Command Line Tools are not required. The installer retains the original binary
 in a private backup directory and prints its path.
 The wizard verifies the server URL and worker token against the live server, validates
 the optional Things auth token with one disposable test task, installs the
-bundled ThingsIndex Helper shortcut and settles its privacy dialogs, and
+bundled ThingsIndex Helper shortcut and checks basic input and Things lookup access, and
 installs the LaunchAgent. Before accessing Things, it checks the executable's
 signing identity and guides the Full Disk Access step with the worker stopped.
 It then checks fresh database access, Automation consent, and readiness through
@@ -223,8 +223,10 @@ The worker reads Things' protected database at startup. Approving the ordinary
 “access data from other apps” dialog only lasts until the worker process quits;
 Full Disk Access suppresses that prompt across restarts. It is a broad file
 access permission. Things Automation permission is separate: approve the
-worker's request to control Things, and settle the Helper shortcut's own
-privacy dialogs during setup. [Apple explains App Data permission lifetime and
+worker's request to control Things. The Helper shortcut's setup ping checks
+basic input and Things lookup access; heading writes may need separate
+first-use approval. Verify heading operations through the background worker
+during attended setup before unattended use. [Apple explains App Data permission lifetime and
 Full Disk Access](https://developer.apple.com/videos/play/wwdc2023/10053/).
 
 Releases through v0.2.5 use ad hoc signing. Their Full Disk Access entry can

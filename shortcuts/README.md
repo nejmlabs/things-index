@@ -21,12 +21,12 @@ things-index worker --setup
 
 The wizard installs the Shortcut from the copy embedded in the binary (no
 extra download or network request), waits for your one **Add Shortcut**
-click, then runs the `ping` operation once so the Shortcut's privacy dialogs
-are settled before the background worker ever needs it.
+click, then runs `ping` to check basic external input and Things lookup access.
+Heading writes may need separate first-use approval during attended setup.
 
 On first use, macOS can present separate privacy dialogs for external
-dictionary input and for Things actions. Choose **Always Allow** during this
-deliberate setup. Apple documents that this choice persists for later runs.
+dictionary input and for Things actions. Choose **Always Allow**, if offered,
+during this deliberate setup. Apple documents that this choice persists for later runs.
 Replacing the Shortcut or resetting its Privacy details can require those
 grants again.
 
@@ -271,11 +271,11 @@ output, unsupported versions, and `ok: false` results.
 
 ## First-run verification
 
-The `ping` operation performs one harmless lookup for an impossible Things ID;
-it does not create or edit anything. The setup wizard runs this check
-automatically right after installing the Shortcut, so its privacy grants are
-settled during deliberate onboarding rather than during the first background
-heading operation.
+The `ping` operation checks external input and performs one harmless lookup
+for an impossible Things ID; it does not create or edit anything. The setup
+wizard runs this check automatically after installing the Shortcut. A successful
+ping does not establish permission for heading writes, which may need separate
+first-use approval.
 
 For manual verification, run it once from Terminal and approve the Shortcut's
 Things access during this deliberate setup run:
@@ -286,8 +286,10 @@ Things access during this deliberate setup run:
   --output-type public.json
 ```
 
-Run the same command a second time and confirm that it returns the three
-capabilities without a prompt. Only then load the worker LaunchAgent.
+Run the same command a second time and confirm that it returns its capabilities
+without a prompt. Then verify heading creation, renaming, and archiving through
+the background worker using a disposable project during attended setup. Resolve
+any first-use approval and verify background operations again before unattended use.
 
 The optional `capture-task.json` and `finalise-capture.json` fixtures exercise
 the two-step create/finalise contract. The capture fixture creates one clearly

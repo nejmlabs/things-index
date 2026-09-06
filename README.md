@@ -53,7 +53,7 @@ For 24/7 homelab infrastructure where the MCP server runs on Linux and leases jo
    * Verifies the server connection **and** the worker token before configuring the background worker.
    * Validates your optional Things auth token with a disposable test task (the token unlocks deadline/tag/checklist updates).
    * Auto-detects the Things 3 SQLite database and verifies read-only connectivity.
-   * Installs the bundled **ThingsIndex Helper** shortcut and settles its privacy dialogs.
+   * Installs the bundled **ThingsIndex Helper** shortcut and checks basic input and Things lookup access. Heading writes may need separate first-use approval; verify them through the background worker during attended setup before unattended use.
    * Installs a launchd LaunchAgent that starts at login, auto-restarts the worker if it crashes, and logs to `~/Library/Logs/ThingsIndex/`.
    * Checks the worker's signing identity and guides **Full Disk Access** setup before querying Things or starting the worker. It opens the settings and shows the actual executable to add; an old entry may need to be removed and added again.
    * Verifies fresh database access and Things Automation consent through the background worker, then repeats startup after a restart. A failed check leaves the worker stopped and reports setup as incomplete. macOS still requires you to approve the initial permissions; see [Mac worker permissions](docs/homelab.md#mac-worker).
