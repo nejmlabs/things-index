@@ -313,11 +313,11 @@ func (c *Client) readTaskUpdateState(ctx context.Context, db *sql.DB, plan TaskU
 		}
 	}
 	if plan.Schedule != nil || plan.Deadline != nil {
-		var recurrenceSize int
-		if err := db.QueryRowContext(ctx, `SELECT COALESCE(length(recurrenceRule),0) FROM TMTask WHERE uuid=?`, plan.ID).Scan(&recurrenceSize); err != nil {
+		repeating, err := taskUpdateRepeats(ctx, db, plan.ID)
+		if err != nil {
 			return state, fmt.Errorf("read recurrence schema: %w", err)
 		}
-		if recurrenceSize != 0 {
+		if repeating {
 			return state, taskUpdateError("invalid_request", "Things does not support schedule or deadline updates on repeating to-dos")
 		}
 		if plan.Schedule != nil {
@@ -347,6 +347,49 @@ func (c *Client) readTaskUpdateState(ctx context.Context, db *sql.DB, plan TaskU
 		}
 	}
 	return state, nil
+}
+
+// Things has used several recurrence representations. Only inspect whether
+// recognized fields contain data; their private contents are not decoded.
+func taskUpdateRepeats(ctx context.Context, db *sql.DB, id string) (bool, error) {
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(TMTask)`)
+	if err != nil {
+		return false, err
+	}
+	columns := make(map[string]bool)
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue sql.NullString
+		if err = rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			break
+		}
+		columns[name] = true
+	}
+	rowErr := rows.Err()
+	rows.Close()
+	if err != nil {
+		return false, err
+	}
+	if rowErr != nil {
+		return false, rowErr
+	}
+	var predicates []string
+	for _, name := range []string{"recurrenceRule", "rt1_recurrenceRule", "repeater"} {
+		if columns[name] {
+			predicates = append(predicates, `COALESCE(length("`+name+`"),0)>0`)
+		}
+	}
+	if len(predicates) == 0 {
+		return false, errors.New("no recognized recurrence representation")
+	}
+	// A linked template also identifies an instance of a repeating to-do.
+	if columns["rt1_repeatingTemplate"] {
+		predicates = append(predicates, `COALESCE(length("rt1_repeatingTemplate"),0)>0`)
+	}
+	var repeating bool
+	err = db.QueryRowContext(ctx, `SELECT `+strings.Join(predicates, " OR ")+` FROM TMTask WHERE uuid=?`, id).Scan(&repeating)
+	return repeating, err
 }
 
 func desiredTaskUpdateTags(ctx context.Context, db *sql.DB, before []TaskUpdateTag, requested []string) ([]TaskUpdateTag, error) {

@@ -393,6 +393,122 @@ func TestPreparedTaskUpdateCalendarRefusesFalseProof(t *testing.T) {
 	}
 }
 
+func useCurrentTaskRecurrenceSchema(t *testing.T, db *sql.DB) {
+	t.Helper()
+	for _, statement := range []string{
+		`ALTER TABLE TMTask DROP COLUMN recurrenceRule`,
+		`ALTER TABLE TMTask ADD COLUMN rt1_repeatingTemplate TEXT`,
+		`ALTER TABLE TMTask ADD COLUMN rt1_recurrenceRule BLOB`,
+		`ALTER TABLE TMTask ADD COLUMN rt1_instanceCreationStartDate INTEGER`,
+		`ALTER TABLE TMTask ADD COLUMN repeater BLOB`,
+		`ALTER TABLE TMTask ADD COLUMN repeaterMigrationDate REAL`,
+	} {
+		updateTestExec(t, db, statement)
+	}
+}
+
+func TestTaskUpdateCurrentRecurrenceSchema(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name      string
+		values    string
+		repeating bool
+	}{
+		{name: "ordinary null metadata"},
+		{name: "ordinary empty metadata", values: `rt1_recurrenceRule=X'',repeater=X'',rt1_repeatingTemplate=''`},
+		{name: "migration timestamp alone", values: `repeaterMigrationDate=1788662741.866847`},
+		{name: "current rule", values: `rt1_recurrenceRule=X'00FF'`, repeating: true},
+		{name: "repeater", values: `repeater=X'00FF'`, repeating: true},
+		{name: "template instance", values: `rt1_repeatingTemplate='template-id'`, repeating: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client, runner := newTaskUpdateTestClient(t)
+			useCurrentTaskRecurrenceSchema(t, runner.db)
+			if tc.values != "" {
+				updateTestExec(t, runner.db, `UPDATE TMTask SET `+tc.values+` WHERE uuid='task-1'`)
+			}
+			for _, req := range []capture.UpdateTaskRequest{
+				{ID: "task-1", When: "2026-09-13"},
+				{ID: "task-1", Deadline: "2026-09-20"},
+			} {
+				_, err := client.PrepareTaskUpdate(context.Background(), req)
+				if tc.repeating {
+					requireUpdateError(t, err, "invalid_request")
+				} else if err != nil {
+					t.Fatalf("ordinary task calendar preflight: %v", err)
+				}
+			}
+			if len(runner.dispatches) != 0 {
+				t.Fatal("calendar preflight dispatched a write")
+			}
+			// Recurrence restrictions apply only to the requested calendar fields.
+			prepareTestUpdate(t, client, capture.UpdateTaskRequest{NewTitle: "Updated title"})
+		})
+	}
+}
+
+func TestTaskUpdateRecurrenceSchemaVariants(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name       string
+		definition string
+		recognized bool
+	}{
+		{name: "legacy rule", definition: `recurrenceRule BLOB`, recognized: true},
+		{name: "current rule only", definition: `rt1_recurrenceRule BLOB`, recognized: true},
+		{name: "repeater only", definition: `repeater BLOB`, recognized: true},
+		{name: "unknown rule", definition: `unknownRecurrence BLOB`},
+		{name: "template reference alone", definition: `rt1_repeatingTemplate TEXT`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client, runner := newTaskUpdateTestClient(t)
+			updateTestExec(t, runner.db, `ALTER TABLE TMTask DROP COLUMN recurrenceRule`)
+			updateTestExec(t, runner.db, `ALTER TABLE TMTask ADD COLUMN `+tc.definition)
+			_, err := client.PrepareTaskUpdate(context.Background(), capture.UpdateTaskRequest{ID: "task-1", Deadline: "2026-09-20"})
+			if tc.recognized {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), "no recognized recurrence representation") {
+				t.Fatalf("unknown schema should fail closed: %v", err)
+			}
+			plan := prepareTestUpdate(t, client, capture.UpdateTaskRequest{NewTitle: "Updated title"})
+			runner.onDispatch = func(q url.Values) error {
+				_, err := runner.db.Exec(`UPDATE TMTask SET title=? WHERE uuid='task-1'`, q.Get("title"))
+				return err
+			}
+			if _, err := client.ApplyTaskUpdate(context.Background(), plan); err != nil {
+				t.Fatalf("unrelated title update: %v", err)
+			}
+			if len(runner.dispatches) != 1 {
+				t.Fatalf("dispatches = %d; want only title write", len(runner.dispatches))
+			}
+		})
+	}
+}
+
+func TestTaskUpdateCurrentRecurrenceSchemaReconcilesCalendarWrite(t *testing.T) {
+	t.Parallel()
+	client, runner := newTaskUpdateTestClient(t)
+	useCurrentTaskRecurrenceSchema(t, runner.db)
+	plan := prepareTestUpdate(t, client, capture.UpdateTaskRequest{When: "2026-09-13", Deadline: "2026-09-20"})
+	lostReply := errors.New("native response lost after dispatch")
+	runner.onDispatch = func(q url.Values) error {
+		runner.activation, runner.due = q.Get("when"), q.Get("deadline")
+		updateTestExec(t, runner.db, `UPDATE TMTask SET start=2,todayIndex=0,startDate=132814464 WHERE uuid='task-1'`)
+		return lostReply
+	}
+	if _, err := client.ApplyTaskUpdate(context.Background(), plan); !errors.Is(err, lostReply) {
+		t.Fatalf("expected lost native reply: %v", err)
+	}
+	if done, err := client.CheckTaskUpdate(context.Background(), plan); err != nil || !done {
+		t.Fatalf("calendar reconciliation = %v, %v", done, err)
+	}
+	if _, err := client.ApplyTaskUpdate(context.Background(), plan); err != nil || len(runner.dispatches) != 1 {
+		t.Fatalf("calendar replay = %v, dispatches = %d", err, len(runner.dispatches))
+	}
+}
+
 func TestPreparedTaskUpdateValidationAndTargetResolution(t *testing.T) {
 	t.Parallel()
 	c, runner := newTaskUpdateTestClient(t)
