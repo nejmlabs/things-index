@@ -56,14 +56,16 @@ type TaskUpdateChecklistChange struct {
 	Append []string                  `json:"append"`
 }
 
-// Packed startDate values are deliberately opaque. Public AppleScript date
-// properties supply calendar dates; SQLite supplies membership and conflicts.
+// Packed startDate values are deliberately opaque. Public AppleScript reads
+// supply calendar dates and Today membership; SQLite supplies buckets and
+// snapshots for detecting conflicting edits.
 type TaskUpdateScheduleState struct {
-	Start          int      `json:"start"`
-	Today          bool     `json:"today"`
-	StartDate      *float64 `json:"start_date,omitempty"`
-	StartBucket    *int64   `json:"start_bucket,omitempty"`
-	ActivationDate string   `json:"activation_date"`
+	Start           int      `json:"start"`
+	Today           bool     `json:"today"` // Legacy raw index presence; only a conflict snapshot.
+	TodayMembership *bool    `json:"today_membership,omitempty"`
+	StartDate       *float64 `json:"start_date,omitempty"`
+	StartBucket     *int64   `json:"start_bucket,omitempty"`
+	ActivationDate  string   `json:"activation_date"`
 }
 
 type TaskUpdateScheduleChange struct {
@@ -336,6 +338,13 @@ func (c *Client) readTaskUpdateState(ctx context.Context, db *sql.DB, plan TaskU
 			return state, err
 		}
 		state.deadline, state.schedule.ActivationDate = due, activation
+		if needsTodayMembership(plan.Schedule, activation) {
+			member, err := c.readTaskUpdateTodayMembership(ctx, plan.ID)
+			if err != nil {
+				return state, err
+			}
+			state.schedule.TodayMembership = &member
+		}
 	}
 	return state, nil
 }
@@ -426,9 +435,34 @@ return my isoDate(dueValue) & "|" & my isoDate(activationValue)`
 	return parts[0], parts[1], nil
 }
 
-func (c *Client) scheduleUpdateMatches(change *TaskUpdateScheduleChange, state TaskUpdateScheduleState) bool {
+func needsTodayMembership(change *TaskUpdateScheduleChange, activation string) bool {
+	return change != nil && (change.When == "today" || change.When == "evening" || change.When == "anytime") && activation == ""
+}
+
+func (c *Client) readTaskUpdateTodayMembership(ctx context.Context, id string) (bool, error) {
+	output, _, err := c.commandRunner().Run(ctx, "/usr/bin/osascript", []string{"-e", taskUpdateTodayMembershipScript, "--", id})
+	if err != nil {
+		return false, fmt.Errorf("read public Things Today membership: %w", err)
+	}
+	switch strings.TrimSpace(string(output)) {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	default:
+		return false, taskUpdateError("update_unverified", "Things Today membership response is not a boolean")
+	}
+}
+
+const taskUpdateTodayMembershipScript = `on run argv
+  if (count of argv) is not 1 then error "Invalid membership arguments"
+  set requestedID to item 1 of argv
+  tell application "Things3" to return requestedID is in (get id of every to do of list "Today")
+end run`
+
+func (c *Client) scheduleUpdateMatches(change *TaskUpdateScheduleChange, state TaskUpdateScheduleState, due string) bool {
 	matchesDay := state.ActivationDate == change.Date ||
-		(state.ActivationDate == "" && change.Date == c.updateToday() && state.Today)
+		(state.ActivationDate == "" && change.Date == c.updateToday() && state.TodayMembership != nil && *state.TodayMembership)
 	switch change.When {
 	case "evening":
 		// Things' bundled model/demo data and its native eveningBucket property
@@ -439,11 +473,28 @@ func (c *Client) scheduleUpdateMatches(change *TaskUpdateScheduleChange, state T
 	case "someday":
 		return state.Start == 2 && state.ActivationDate == ""
 	case "anytime":
-		return state.Start == 1 && !state.Today && state.ActivationDate == ""
+		if state.Start != 1 || state.ActivationDate != "" || state.TodayMembership == nil {
+			return false
+		}
+		if !*state.TodayMembership {
+			return true
+		}
+		// With no activation date, manual Today placement would otherwise look
+		// identical to Anytime. A due/overdue deadline may independently keep a
+		// cleared task in Today, so only that documented case accepts membership.
+		// Due is separate from the schedule snapshot: a combined deadline change
+		// must not itself create a schedule conflict.
+		if _, err := time.Parse("2006-01-02", due); err != nil {
+			return false
+		}
+		return due <= c.updateToday()
 	case "today":
 		return state.StartBucket != nil && *state.StartBucket == 0 && state.Start == 1 && matchesDay
 	default:
-		return state.Start == 1 && state.ActivationDate == change.Date
+		// Explicit dates are verified through Things' public calendar property.
+		// Future tasks/projects can have start=2 (the same raw value used by
+		// Someday), so the private start enum cannot establish this outcome.
+		return state.ActivationDate == change.Date
 	}
 }
 
@@ -488,7 +539,7 @@ func (c *Client) taskUpdateStatus(plan TaskUpdatePlan, state taskUpdateState) (b
 			return false, taskUpdateError("update_conflict", "task checklist changed or only part of the append is visible")
 		}
 	}
-	if plan.Schedule != nil && !c.scheduleUpdateMatches(plan.Schedule, state.schedule) {
+	if plan.Schedule != nil && !c.scheduleUpdateMatches(plan.Schedule, state.schedule, state.deadline) {
 		done = false
 		if !reflect.DeepEqual(state.schedule, plan.Schedule.Before) {
 			return false, taskUpdateError("update_conflict", "task schedule changed after this update was prepared")
@@ -619,9 +670,20 @@ func (c *Client) ApplyTaskUpdate(ctx context.Context, plan TaskUpdatePlan) (Resp
 	if plan.Deadline != nil && state.deadline != plan.Deadline.After {
 		values.Set("deadline", plan.Deadline.After)
 	}
-	if plan.Schedule != nil && !c.scheduleUpdateMatches(plan.Schedule, state.schedule) {
+	scheduleDue := state.deadline
+	if plan.Deadline != nil {
+		// Moving a deadline into the future can remove the reason an Anytime
+		// task was allowed in Today. Include the requested start-date clear in
+		// the same update when that resulting deadline requires Today absence.
+		scheduleDue = plan.Deadline.After
+	}
+	if plan.Schedule != nil && (!c.scheduleUpdateMatches(plan.Schedule, state.schedule, state.deadline) || !c.scheduleUpdateMatches(plan.Schedule, state.schedule, scheduleDue)) {
 		when := plan.Schedule.When
-		if when != "evening" && plan.Schedule.Date != "" {
+		if when == "anytime" {
+			// The documented update URL clears a field with a present empty
+			// parameter; "anytime" is not a documented update.when value.
+			when = ""
+		} else if when != "evening" && plan.Schedule.Date != "" {
 			when = plan.Schedule.Date
 		}
 		values.Set("when", when)

@@ -221,13 +221,16 @@ func TestCreateProjectVerifiesEveryRequestedField(t *testing.T) {
 		t.Run(missing, func(t *testing.T) {
 			client, runner := newTaskUpdateTestClient(t)
 			insertProjectFixture(t, runner.db, `INSERT INTO TMTag VALUES ('tag','Holiday')`)
-			req := capture.CreateProjectRequest{Title: "Trip", Notes: "Itinerary", Tags: []string{"Holiday"}, Deadline: "2026-09-10", When: "2026-09-09"}
+			req := capture.CreateProjectRequest{Title: "Trip", Notes: "Itinerary", Tags: []string{"Holiday"}, Deadline: "2026-09-20", When: "2026-09-13"}
 			runner.onDispatch = func(q url.Values) error {
 				notes := q.Get("notes")
 				if missing == "notes" {
 					notes = "Wrong notes"
 				}
-				insertProjectFixture(t, runner.db, `INSERT INTO TMTask (uuid,type,title,notes,start,creationDate) VALUES ('project',1,?,?,1,?)`, q.Get("title"), notes, macEpochSeconds(time.Now()))
+				// Real future project shape from acceptance: start=2 and a
+				// non-null zero todayIndex. The packed value stays opaque; only
+				// the public activation date can prove the requested day.
+				insertProjectFixture(t, runner.db, `INSERT INTO TMTask (uuid,type,title,notes,start,todayIndex,startDate,startBucket,creationDate) VALUES ('project',1,?,?,2,0,132814464,0,?)`, q.Get("title"), notes, float64(time.Now().UnixMilli())/1000)
 				if missing != "tags" {
 					insertProjectFixture(t, runner.db, `INSERT INTO TMTaskTag VALUES ('project','tag')`)
 				}

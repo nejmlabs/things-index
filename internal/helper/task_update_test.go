@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/url"
 	"reflect"
 	"strings"
@@ -17,21 +18,38 @@ import (
 // This runner only reads/writes each test's temporary SQLite database. No
 // installed Things application, automation command, or user database is used.
 type taskUpdateTestRunner struct {
-	t          *testing.T
-	db         *sql.DB
-	due        string
-	activation string
-	dateOutput *string
-	dispatches []url.Values
-	onDispatch func(url.Values) error
-	scripts    []string
-	onScript   func(string) error
-	readError  error
+	t                *testing.T
+	db               *sql.DB
+	due              string
+	activation       string
+	dateOutput       *string
+	dispatches       []url.Values
+	onDispatch       func(url.Values) error
+	scripts          []string
+	onScript         func(string) error
+	readError        error
+	todayMember      bool
+	membershipReads  int
+	membershipError  error
+	membershipOutput *string
 }
 
 func (r *taskUpdateTestRunner) Run(_ context.Context, executable string, args []string) ([]byte, []byte, error) {
 	if executable == "/usr/bin/pgrep" {
 		return nil, nil, nil
+	}
+	if executable == "/usr/bin/osascript" && len(args) == 4 && args[1] == taskUpdateTodayMembershipScript {
+		r.membershipReads++
+		if args[2] != "--" || args[3] == "" {
+			r.t.Fatalf("invalid membership argument: %v", args)
+		}
+		if r.membershipError != nil {
+			return nil, nil, r.membershipError
+		}
+		if r.membershipOutput != nil {
+			return []byte(*r.membershipOutput), nil, nil
+		}
+		return []byte(fmt.Sprintf("%t\n", r.todayMember)), nil, nil
 	}
 	if executable == "/usr/bin/osascript" && len(args) == 2 && strings.Contains(args[1], "on isoDate(d)") {
 		if r.readError != nil {
@@ -453,7 +471,7 @@ func TestPreparedTaskUpdateEveningRequiresKnownBucketAndIntendedDay(t *testing.T
 	plan := prepareTestUpdate(t, c, capture.UpdateTaskRequest{When: "evening"})
 	for _, bucket := range []int64{0, 2, 987} {
 		state := TaskUpdateScheduleState{Start: 1, Today: true, StartBucket: &bucket, ActivationDate: plan.Schedule.Date}
-		if c.scheduleUpdateMatches(plan.Schedule, state) {
+		if c.scheduleUpdateMatches(plan.Schedule, state, "") {
 			t.Fatalf("bucket %d falsely proved evening", bucket)
 		}
 	}
@@ -489,22 +507,316 @@ func TestPreparedTaskUpdateTodayDoesNotAcceptEveningOrStaleTodayIndex(t *testing
 			bucket = 1
 		}
 		state := TaskUpdateScheduleState{Start: 1, Today: true, StartBucket: &bucket, ActivationDate: "2026-10-01"}
-		if c.scheduleUpdateMatches(change, state) {
+		if c.scheduleUpdateMatches(change, state, "") {
 			t.Fatalf("%s accepted a wrong nonempty activation date with stale todayIndex", when)
 		}
 		state.ActivationDate = ""
-		if !c.scheduleUpdateMatches(change, state) {
+		if c.scheduleUpdateMatches(change, state, "") {
+			t.Fatalf("%s accepted stale todayIndex without public membership", when)
+		}
+		member := false
+		state.TodayMembership = &member
+		if c.scheduleUpdateMatches(change, state, "") {
+			t.Fatalf("%s accepted an item absent from public Today", when)
+		}
+		member = true
+		if !c.scheduleUpdateMatches(change, state, "") {
 			t.Fatalf("%s did not accept verified current-day membership", when)
 		}
 		otherBucket := int64(1) - bucket
 		state.StartBucket = &otherBucket
 		state.ActivationDate = change.Date
-		if c.scheduleUpdateMatches(change, state) {
+		if c.scheduleUpdateMatches(change, state, "") {
 			t.Fatalf("%s accepted the other Today/Evening bucket", when)
 		}
 		state.StartBucket = nil
-		if c.scheduleUpdateMatches(change, state) {
+		if c.scheduleUpdateMatches(change, state, "") {
 			t.Fatalf("%s accepted an unknown bucket", when)
 		}
+	}
+}
+
+func TestFutureTaskUpdateReconcilesObservedUpcomingState(t *testing.T) {
+	t.Parallel()
+	client, runner := newTaskUpdateTestClient(t)
+	plan := prepareTestUpdate(t, client, capture.UpdateTaskRequest{When: "2026-09-13", Deadline: "2026-09-20"})
+	runner.onDispatch = func(q url.Values) error {
+		if q.Get("when") != "2026-09-13" || q.Get("deadline") != "2026-09-20" {
+			t.Fatalf("requested calendar dates changed: %v", q)
+		}
+		// Mirror the actual native result, including the misleading non-null
+		// zero todayIndex. Never decode the packed startDate to verify it.
+		updateTestExec(t, runner.db, `UPDATE TMTask SET start=2,todayIndex=0,startDate=132814464,startBucket=0 WHERE uuid='task-1'`)
+		runner.activation, runner.due = "2026-09-13", "2026-09-20"
+		return context.DeadlineExceeded // Native write landed; its reply was lost.
+	}
+	if _, err := client.ApplyTaskUpdate(context.Background(), plan); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected an interrupted native result, got %v", err)
+	}
+	done, err := client.CheckTaskUpdate(context.Background(), plan)
+	if err != nil || !done || len(runner.dispatches) != 1 {
+		t.Fatalf("correct future schedule not reconciled: done=%t, err=%v, writes=%d", done, err, len(runner.dispatches))
+	}
+	response, err := client.ApplyTaskUpdate(context.Background(), plan)
+	if err != nil || !response.OK || response.ID != "task-1" || len(runner.dispatches) != 1 {
+		t.Fatalf("already applied future schedule repeated: response=%+v, err=%v, writes=%d", response, err, len(runner.dispatches))
+	}
+	// The same raw database fields cannot prove a different or absent public
+	// date. These must still fail reconciliation rather than claim success.
+	for _, activation := range []string{"2026-09-14", ""} {
+		runner.activation = activation
+		done, err := client.CheckTaskUpdate(context.Background(), plan)
+		if done {
+			t.Fatalf("accepted incorrect public activation date %q", activation)
+		}
+		requireUpdateError(t, err, "update_conflict")
+		if len(runner.dispatches) != 1 {
+			t.Fatal("read-only reconciliation dispatched another update")
+		}
+	}
+}
+
+func TestAnytimeTaskUpdateClearsDateWithoutRequiringEmptyTodayIndex(t *testing.T) {
+	t.Parallel()
+	for _, todayIndex := range []int{0, 17, -17} {
+		t.Run(fmt.Sprintf("todayIndex=%d", todayIndex), func(t *testing.T) {
+			client, runner := newTaskUpdateTestClient(t)
+			runner.activation, runner.due = "2026-09-13", "2026-09-05"
+			runner.todayMember = true // Deadline independently retains Today membership.
+			updateTestExec(t, runner.db, `UPDATE TMTask SET start=2,todayIndex=?,startDate=132814464 WHERE uuid='task-1'`, todayIndex)
+			plan := prepareTestUpdate(t, client, capture.UpdateTaskRequest{When: "anytime"})
+			runner.onDispatch = func(q url.Values) error {
+				if !q.Has("when") || q.Get("when") != "" || q.Has("deadline") {
+					t.Fatalf("clear-start request changed: %v", q)
+				}
+				runner.activation = ""
+				// Keep the ordering index and today's deadline: neither should
+				// prevent verification that Things cleared the start date.
+				updateTestExec(t, runner.db, `UPDATE TMTask SET start=1,startDate=NULL WHERE uuid='task-1'`)
+				return nil
+			}
+			response, err := client.ApplyTaskUpdate(context.Background(), plan)
+			if err != nil || !response.OK || response.ID != "task-1" {
+				t.Fatalf("Anytime update was not verified: response=%+v, err=%v", response, err)
+			}
+			done, err := client.CheckTaskUpdate(context.Background(), plan)
+			if err != nil || !done || len(runner.dispatches) != 1 {
+				t.Fatalf("Anytime reconciliation failed: done=%t, err=%v, writes=%d", done, err, len(runner.dispatches))
+			}
+			if runner.due != "2026-09-05" {
+				t.Fatal("Anytime update changed the deadline")
+			}
+			// A nonempty date or a different start mode must still fail.
+			runner.activation = "2026-09-14"
+			if done, _ := client.CheckTaskUpdate(context.Background(), plan); done {
+				t.Fatal("Anytime accepted a scheduled activation date")
+			}
+			runner.activation = ""
+			for _, start := range []int{0, 2} {
+				updateTestExec(t, runner.db, `UPDATE TMTask SET start=? WHERE uuid='task-1'`, start)
+				if done, _ := client.CheckTaskUpdate(context.Background(), plan); done {
+					t.Fatalf("Anytime accepted start mode %d", start)
+				}
+			}
+		})
+	}
+}
+
+func TestTodayAndEveningRequirePublicMembershipWhenActivationIsEmpty(t *testing.T) {
+	t.Parallel()
+	for _, when := range []string{"today", "evening"} {
+		for _, memberAfter := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/member=%t", when, memberAfter), func(t *testing.T) {
+				client, runner := newTaskUpdateTestClient(t)
+				bucket := 0
+				if when == "evening" {
+					bucket = 1
+				}
+				// An Anytime task may retain both an ordering index and an old
+				// evening bucket. Neither proves membership in the public list.
+				updateTestExec(t, runner.db, `UPDATE TMTask SET start=1,todayIndex=0,startBucket=? WHERE uuid='task-1'`, bucket)
+				plan := prepareTestUpdate(t, client, capture.UpdateTaskRequest{When: when})
+				if plan.Schedule.Before.TodayMembership == nil || *plan.Schedule.Before.TodayMembership || runner.membershipReads != 1 {
+					t.Fatalf("before state lacks explicit public membership: %+v", plan.Schedule.Before)
+				}
+				runner.onDispatch = func(url.Values) error {
+					runner.todayMember = memberAfter
+					return nil
+				}
+				response, err := client.ApplyTaskUpdate(context.Background(), plan)
+				if memberAfter {
+					if err != nil || !response.OK || response.ID != "task-1" {
+						t.Fatalf("public Today result was not verified: %+v, %v", response, err)
+					}
+				} else {
+					requireUpdateError(t, err, "update_unverified")
+					if response.OK {
+						t.Fatal("stale index falsely proved the requested result")
+					}
+				}
+				done, err := client.CheckTaskUpdate(context.Background(), plan)
+				if err != nil || done != memberAfter || len(runner.dispatches) != 1 {
+					t.Fatalf("membership reconciliation = %t, %v, writes=%d", done, err, len(runner.dispatches))
+				}
+			})
+		}
+	}
+}
+
+func TestTodayMembershipReadIsBoundedAndPassesIdentityAsData(t *testing.T) {
+	t.Parallel()
+	requestedID := `id " & do shell script "unexpected"`
+	client := &Client{Runner: captureContextRunner(func(ctx context.Context, executable string, args []string) ([]byte, []byte, error) {
+		if executable != "/usr/bin/osascript" || !reflect.DeepEqual(args, []string{"-e", taskUpdateTodayMembershipScript, "--", requestedID}) {
+			t.Fatalf("unexpected membership read: %s %q", executable, args)
+		}
+		if _, bounded := ctx.Deadline(); !bounded || strings.Contains(args[1], requestedID) {
+			t.Fatal("membership read is unbounded or interpolates request data")
+		}
+		return []byte("true\n"), nil, nil
+	})}
+	member, err := client.readTaskUpdateTodayMembership(context.Background(), requestedID)
+	if err != nil || !member {
+		t.Fatalf("membership read = %t, %v", member, err)
+	}
+}
+
+func TestTodayMembershipInvalidReadStopsBeforeDispatch(t *testing.T) {
+	t.Parallel()
+	for _, output := range []string{"", "1", "TRUE", "true\nfalse", "private malformed response"} {
+		t.Run(output, func(t *testing.T) {
+			client, runner := newTaskUpdateTestClient(t)
+			runner.membershipOutput = &output
+			_, err := client.PrepareTaskUpdate(context.Background(), capture.UpdateTaskRequest{ID: "task-1", When: "today"})
+			requireUpdateError(t, err, "update_unverified")
+			if strings.Contains(err.Error(), "private malformed response") || len(runner.dispatches) != 0 {
+				t.Fatalf("invalid native output leaked or dispatched: %v", err)
+			}
+		})
+	}
+	for _, readError := range []error{errors.New("native read failed"), context.DeadlineExceeded, context.Canceled} {
+		t.Run(readError.Error(), func(t *testing.T) {
+			client, runner := newTaskUpdateTestClient(t)
+			runner.membershipError = readError
+			_, err := client.PrepareTaskUpdate(context.Background(), capture.UpdateTaskRequest{ID: "task-1", When: "today"})
+			if !errors.Is(err, readError) || len(runner.dispatches) != 0 {
+				t.Fatalf("failed membership read = %v, writes=%d", err, len(runner.dispatches))
+			}
+		})
+	}
+}
+
+func TestUnrelatedCalendarReadsDoNotRequireTodayMembership(t *testing.T) {
+	t.Parallel()
+	for _, req := range []capture.UpdateTaskRequest{
+		{When: "2026-09-13"}, {When: "someday"}, {Deadline: "2026-09-20"},
+	} {
+		t.Run(req.When+req.Deadline, func(t *testing.T) {
+			client, runner := newTaskUpdateTestClient(t)
+			runner.membershipError = errors.New("must not read Today")
+			prepareTestUpdate(t, client, req)
+			if runner.membershipReads != 0 {
+				t.Fatal("unrelated date operation read Today membership")
+			}
+		})
+	}
+}
+
+func TestLegacyBlankDatePlanDoesNotReinterpretTodayIndexAsMembership(t *testing.T) {
+	t.Parallel()
+	client, runner := newTaskUpdateTestClient(t)
+	updateTestExec(t, runner.db, `UPDATE TMTask SET start=1,todayIndex=0,startBucket=0 WHERE uuid='task-1'`)
+	plan := prepareTestUpdate(t, client, capture.UpdateTaskRequest{When: "today"})
+	plan.Schedule.Before.TodayMembership = nil // Saved by the older verifier.
+	done, err := client.CheckTaskUpdate(context.Background(), plan)
+	if done {
+		t.Fatal("legacy non-null index was silently accepted as public membership")
+	}
+	requireUpdateError(t, err, "update_conflict")
+	if len(runner.dispatches) != 0 {
+		t.Fatal("legacy ambiguous state caused a new write")
+	}
+}
+
+func TestAnytimeClearsManualTodayWithNoActivationDate(t *testing.T) {
+	t.Parallel()
+	for _, due := range []string{"", "2026-09-13"} {
+		t.Run("due="+due, func(t *testing.T) {
+			client, runner := newTaskUpdateTestClient(t)
+			runner.todayMember, runner.due = true, due
+			updateTestExec(t, runner.db, `UPDATE TMTask SET start=1,todayIndex=0,startBucket=0 WHERE uuid='task-1'`)
+			plan := prepareTestUpdate(t, client, capture.UpdateTaskRequest{When: "anytime"})
+			if done, err := client.CheckTaskUpdate(context.Background(), plan); err != nil || done {
+				t.Fatalf("manual Today falsely satisfied Anytime before dispatch: %t, %v", done, err)
+			}
+			runner.onDispatch = func(q url.Values) error {
+				if !q.Has("when") || q.Get("when") != "" || q.Has("deadline") {
+					t.Fatalf("Anytime must send the documented present-empty clear: %v", q)
+				}
+				runner.todayMember = false
+				return nil
+			}
+			response, err := client.ApplyTaskUpdate(context.Background(), plan)
+			if err != nil || !response.OK || len(runner.dispatches) != 1 {
+				t.Fatalf("manual Today was not cleared: %+v, %v, writes=%d", response, err, len(runner.dispatches))
+			}
+			if _, err := client.ApplyTaskUpdate(context.Background(), plan); err != nil || len(runner.dispatches) != 1 {
+				t.Fatalf("verified clear was repeated: %v, writes=%d", err, len(runner.dispatches))
+			}
+		})
+	}
+}
+
+func TestAnytimeAllowsVerifiedTodayMembershipFromDueDeadline(t *testing.T) {
+	t.Parallel()
+	for _, due := range []string{"2026-09-04", "2026-09-05"} {
+		t.Run(due, func(t *testing.T) {
+			client, runner := newTaskUpdateTestClient(t)
+			runner.todayMember, runner.due = true, due
+			plan := prepareTestUpdate(t, client, capture.UpdateTaskRequest{When: "anytime"})
+			response, err := client.ApplyTaskUpdate(context.Background(), plan)
+			if err != nil || !response.OK || len(runner.dispatches) != 0 {
+				t.Fatalf("deadline-driven Today prevented Anytime verification: %+v, %v, writes=%d", response, err, len(runner.dispatches))
+			}
+		})
+	}
+}
+
+func TestCombinedAnytimeAndDeadlineUsesCurrentPublicDatesWithoutFalseConflict(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, activation, beforeDue, afterDue string
+		start                                 int
+		memberBefore, memberAfter             bool
+	}{
+		{"future start and deadline to Today", "2026-09-13", "2026-09-20", "2026-09-05", 2, false, true},
+		{"manual Today with new future deadline", "", "", "2026-09-20", 1, true, false},
+		{"manual Today with new due deadline", "", "", "2026-09-05", 1, true, true},
+		{"move due deadline into future while clearing Today", "", "2026-09-05", "2026-09-20", 1, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client, runner := newTaskUpdateTestClient(t)
+			runner.activation, runner.due, runner.todayMember = tc.activation, tc.beforeDue, tc.memberBefore
+			updateTestExec(t, runner.db, `UPDATE TMTask SET start=?,todayIndex=0,startBucket=0 WHERE uuid='task-1'`, tc.start)
+			plan := prepareTestUpdate(t, client, capture.UpdateTaskRequest{When: "anytime", Deadline: tc.afterDue})
+			runner.onDispatch = func(q url.Values) error {
+				if !q.Has("when") || q.Get("when") != "" || q.Get("deadline") != tc.afterDue {
+					t.Fatalf("combined update omitted date clear or changed deadline: %v", q)
+				}
+				runner.activation, runner.due, runner.todayMember = "", tc.afterDue, tc.memberAfter
+				updateTestExec(t, runner.db, `UPDATE TMTask SET start=1,startDate=NULL WHERE uuid='task-1'`)
+				return context.DeadlineExceeded
+			}
+			if _, err := client.ApplyTaskUpdate(context.Background(), plan); !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("expected interrupted native reply: %v", err)
+			}
+			done, err := client.CheckTaskUpdate(context.Background(), plan)
+			if err != nil || !done || len(runner.dispatches) != 1 {
+				t.Fatalf("requested deadline change became a schedule conflict: %t, %v, writes=%d", done, err, len(runner.dispatches))
+			}
+			if _, err := client.ApplyTaskUpdate(context.Background(), plan); err != nil || len(runner.dispatches) != 1 {
+				t.Fatalf("combined update repeated after reconciliation: %v, writes=%d", err, len(runner.dispatches))
+			}
+		})
 	}
 }

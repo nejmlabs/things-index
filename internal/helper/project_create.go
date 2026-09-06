@@ -64,7 +64,7 @@ func (c *Client) CreateProject(ctx context.Context, req capture.CreateProjectReq
 
 	// A retry may reuse a project only in the requested area. Omitting the
 	// area means an unfiled project, not a match from any area.
-	existingUUID, err := projectCreationMatch(ctx, db, req.Title, areaUUID, nil)
+	existingUUID, err := projectCreationMatch(ctx, db, req.Title, areaUUID)
 	if err != nil {
 		return Response{}, err
 	}
@@ -121,16 +121,17 @@ func (c *Client) CreateProject(ctx context.Context, req capture.CreateProjectReq
 	}
 	addURL := "things:///add-project?" + strings.ReplaceAll(values.Encode(), "+", "%20")
 
-	minCreationDate := macEpochSeconds(time.Now().Add(-time.Second))
 	if _, _, err := runner.Run(ctx, "/usr/bin/open", []string{"-g", "-j", addURL}); err != nil {
 		return Response{}, fmt.Errorf("dispatch add-project URL: %w", err)
 	}
 
 	// Confirm the new active project is in the resolved area, rather than
-	// accepting a same-title row elsewhere or an archived project.
+	// accepting a same-title row elsewhere or an archived project. The exact
+	// match was absent before dispatch; creationDate's private encoding and
+	// another device's clock cannot establish the identity of this write.
 	deadline := c.verifyDeadline()
 	for {
-		projectUUID, err := projectCreationMatch(ctx, db, req.Title, areaUUID, &minCreationDate)
+		projectUUID, err := projectCreationMatch(ctx, db, req.Title, areaUUID)
 		if err != nil {
 			return Response{}, err
 		}
@@ -213,6 +214,13 @@ func (c *Client) projectCreationFields(ctx context.Context, db *sql.DB, id, area
 		}
 		if schedule != nil {
 			state := TaskUpdateScheduleState{ActivationDate: activation}
+			if needsTodayMembership(schedule, activation) {
+				inToday, err := c.readTaskUpdateTodayMembership(ctx, id)
+				if err != nil {
+					return nil, err
+				}
+				state.TodayMembership = &inToday
+			}
 			var startDate sql.NullFloat64
 			var bucket sql.NullInt64
 			if err := db.QueryRowContext(ctx, `SELECT COALESCE(start,0),todayIndex IS NOT NULL,startDate,startBucket FROM TMTask WHERE uuid=?`, id).Scan(&state.Start, &state.Today, &startDate, &bucket); err != nil {
@@ -224,7 +232,7 @@ func (c *Client) projectCreationFields(ctx context.Context, db *sql.DB, id, area
 			if bucket.Valid {
 				state.StartBucket = &bucket.Int64
 			}
-			if !c.scheduleUpdateMatches(schedule, state) {
+			if !c.scheduleUpdateMatches(schedule, state, due) {
 				mismatches = append(mismatches, "schedule")
 			}
 		}
@@ -265,15 +273,11 @@ func projectCreationArea(ctx context.Context, db *sql.DB, area string) (string, 
 	}
 }
 
-func projectCreationMatch(ctx context.Context, db *sql.DB, title, areaUUID string, minCreationDate *float64) (string, error) {
+func projectCreationMatch(ctx context.Context, db *sql.DB, title, areaUUID string) (string, error) {
 	query := `SELECT uuid FROM TMTask
 		WHERE type = 1 AND LOWER(title) = LOWER(?) AND COALESCE(area, '') = ?
 		AND trashed = 0 AND status = 0`
 	args := []any{title, areaUUID}
-	if minCreationDate != nil {
-		query += " AND creationDate >= ?"
-		args = append(args, *minCreationDate)
-	}
 	rows, err := db.QueryContext(ctx, query+" LIMIT 2", args...)
 	if err != nil {
 		return "", fmt.Errorf("query project in requested area: %w", err)

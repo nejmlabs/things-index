@@ -149,10 +149,13 @@ func (c *Client) FindCapture(ctx context.Context, requestID string) ([]string, e
 	defer db.Close()
 
 	pendingTitle := fmt.Sprintf("ThingsIndex pending [%s]", requestID)
+	return findPendingCapture(ctx, db, pendingTitle)
+}
+
+func findPendingCapture(ctx context.Context, db *sql.DB, pendingTitle string) ([]string, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT uuid FROM TMTask
 		WHERE type = 0 AND title = ? AND trashed = 0
-		ORDER BY creationDate DESC
 		LIMIT 2`, pendingTitle)
 	if err != nil {
 		return nil, fmt.Errorf("find pending Things capture: %w", err)
@@ -320,8 +323,6 @@ func (c *Client) Capture(ctx context.Context, requestID string, task capture.Req
 	// 3. Construct Things URL with the pending marker title. The marker is what
 	// lets FindCapture reconcile an uncertain outcome after a crash or retry
 	// without creating a duplicate; FinaliseCapture renames it afterwards.
-	minCreationDate := macEpochSeconds(time.Now().Add(-1 * time.Second))
-
 	pendingTitle := fmt.Sprintf("ThingsIndex pending [%s]", requestID)
 	addURL := buildAddURL(pendingTitle, task, appliedTags, c.AuthToken, location, time.Now())
 
@@ -340,26 +341,26 @@ func (c *Client) Capture(ctx context.Context, requestID string, task capture.Req
 		}
 	}
 
-	// 5. Poll SQLite for created task UUID
+	// 5. Poll by the unique request marker, without interpreting Things'
+	// private creationDate representation or choosing among duplicate markers.
 	var taskUUID string
 	deadline := c.verifyDeadline()
-	for time.Now().Before(deadline) {
-		row := db.QueryRowContext(ctx, `SELECT uuid FROM TMTask WHERE type = 0 AND title = ? AND creationDate >= ? AND trashed = 0 ORDER BY creationDate DESC LIMIT 1`, pendingTitle, minCreationDate)
-		err := row.Scan(&taskUUID)
-		if err == nil && taskUUID != "" {
-			break
-		}
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+	for {
+		ids, err := findPendingCapture(ctx, db, pendingTitle)
+		if err != nil {
 			return Response{}, fmt.Errorf("verify created Things task: %w", err)
+		}
+		switch len(ids) {
+		case 1:
+			taskUUID = ids[0]
+		case 2:
+			return Response{}, taskUpdateError("capture_ambiguous", "multiple Things tasks have this request marker; review them before retrying")
+		}
+		if taskUUID != "" || !time.Now().Before(deadline) {
+			break
 		}
 		if err := waitForPoll(ctx, min(50*time.Millisecond, time.Until(deadline))); err != nil {
 			return Response{}, err
-		}
-	}
-	if taskUUID == "" {
-		row := db.QueryRowContext(ctx, `SELECT uuid FROM TMTask WHERE type = 0 AND title = ? AND trashed = 0 ORDER BY creationDate DESC LIMIT 1`, pendingTitle)
-		if err := row.Scan(&taskUUID); err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return Response{}, fmt.Errorf("find created Things task: %w", err)
 		}
 	}
 	if taskUUID == "" {
@@ -549,12 +550,6 @@ func validRequestID(value string) bool {
 	}
 	_, err := hex.DecodeString(value)
 	return err == nil
-}
-
-// macEpochSeconds converts t to seconds since Things' Cocoa reference date
-// (2001-01-01 UTC), the encoding TMTask.creationDate uses.
-func macEpochSeconds(t time.Time) float64 {
-	return t.UTC().Sub(time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC)).Seconds()
 }
 
 // HelperShortcutName is the required library name of the bundled Shortcut;

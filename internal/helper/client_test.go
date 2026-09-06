@@ -423,6 +423,31 @@ func TestCaptureInterruptedDispatchRemainsRecoverableAndRestoresApp(t *testing.T
 	}
 }
 
+// Older fixtures used Cocoa timestamps. Retain them to prove that capture
+// identity does not depend on interpreting Things' private timestamp format.
+func macEpochSeconds(t time.Time) float64 {
+	return t.UTC().Sub(time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC)).Seconds()
+}
+
+func TestCaptureRejectsDuplicatePendingMarkers(t *testing.T) {
+	t.Parallel()
+	client, db, _ := projectCaptureFixture(t)
+	dispatches := 0
+	client.Runner = &scriptedRunner{handler: func(executable string, args []string) ([]byte, []byte, error) {
+		if executable == "/usr/bin/open" {
+			dispatches++
+			_, err := db.Exec(`INSERT INTO TMTask (uuid,type,title,creationDate) VALUES ('one',0,?,1),('two',0,?,1788662741)`, "ThingsIndex pending ["+testRequestID+"]", "ThingsIndex pending ["+testRequestID+"]")
+			return nil, nil, err
+		}
+		return nil, nil, nil
+	}}
+	response, err := client.Capture(context.Background(), testRequestID, capture.Request{TaskFields: capture.TaskFields{Title: "Task"}})
+	requireUpdateError(t, err, "capture_ambiguous")
+	if response.ID != "" || dispatches != 1 {
+		t.Fatalf("duplicate marker selected or creation repeated: response=%+v dispatches=%d", response, dispatches)
+	}
+}
+
 func TestClientFinaliseCapture(t *testing.T) {
 	t.Parallel()
 
