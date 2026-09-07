@@ -49,6 +49,7 @@ func main() {
 
 	command := os.Args[1]
 	var err error
+	interactiveCommand := false
 	switch command {
 	case "start", "run", "local":
 		err = runStandaloneHTTP()
@@ -58,6 +59,7 @@ func main() {
 		err = runDedicatedServer()
 	case "worker":
 		if len(os.Args) >= 3 && (os.Args[2] == "--setup" || os.Args[2] == "setup" || os.Args[2] == "-s") {
+			interactiveCommand = true
 			err = runWorkerSetup()
 		} else {
 			err = runDedicatedWorker()
@@ -66,6 +68,9 @@ func main() {
 		err = printConfig()
 	case "update":
 		err = runUpdate(os.Args[2:])
+	case "install-worker":
+		interactiveCommand = true
+		err = runWorkerInstall(os.Args[2:])
 	case "install-shortcut":
 		err = runInstallShortcut()
 	case "uninstall", "teardown":
@@ -80,7 +85,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err != nil && !errors.Is(err, context.Canceled) {
+	if err != nil && (interactiveCommand || !errors.Is(err, context.Canceled)) {
 		log.Fatal(err)
 	}
 }
@@ -195,14 +200,21 @@ func runStandaloneHTTP() error {
 				continue
 			}
 			outcome, processErr := processor.Process(ctx, worker.Job{ID: job.ID, Task: job.Task})
+			reportCtx, cancelReport := context.WithTimeout(ctx, 10*time.Second)
 			if processErr != nil {
-				_ = queueStore.Fail(ctx, job.ID, job.LeaseToken, processErr.Error(), worker.IsRetryable(processErr))
+				if err := queueStore.Fail(reportCtx, job.ID, job.LeaseToken, processErr.Error(), worker.IsRetryable(processErr)); err != nil {
+					log.Printf("report failed job %s: %v", job.ID, err)
+				}
 			} else {
-				_ = queueStore.Complete(ctx, job.ID, job.LeaseToken, outcome.ThingsID, outcome.Warnings)
-				if worker.UsesJournal(job.Task) {
-					_ = journalStore.MarkReported(ctx, job.ID)
+				if err := queueStore.Complete(reportCtx, job.ID, job.LeaseToken, outcome.ThingsID, outcome.Warnings); err != nil {
+					log.Printf("report completed job %s: %v", job.ID, err)
+				} else if worker.UsesJournal(job.Task) {
+					if err := processor.MarkReported(reportCtx, job.ID); err != nil {
+						log.Printf("record acknowledgement for job %s: %v", job.ID, err)
+					}
 				}
 			}
+			cancelReport()
 		}
 	}()
 
@@ -247,9 +259,9 @@ func runStandaloneHTTP() error {
 	return nil
 }
 
-// runInstallShortcut installs the bundled ThingsIndex Helper shortcut and
-// settles its privacy dialogs — the local-mode path to enabling the heading
-// tools, which the worker wizard otherwise handles as its steps 9-10.
+// runInstallShortcut installs the bundled helper and checks basic input and
+// Things lookup access. Heading writes may need separate first-use approval;
+// verify background heading operations before unattended use.
 func runInstallShortcut() error {
 	if runtime.GOOS != "darwin" {
 		return errors.New("the ThingsIndex Helper shortcut runs in the macOS Shortcuts app; install it on the Mac that runs Things 3")
@@ -257,14 +269,14 @@ func runInstallShortcut() error {
 	if err := installHelperShortcut(); err != nil {
 		return err
 	}
-	fmt.Println("• Verifying the helper shortcut (choose “Always Allow” on any privacy dialogs)...")
+	fmt.Println("• Verifying the helper shortcut (choose “Always Allow” if offered)...")
 	captureAdapter := helper.NewClient(os.Getenv("THINGS_INDEX_THINGS_AUTH_TOKEN"))
 	shortcutCtx, cancelShortcut := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancelShortcut()
 	if err := captureAdapter.PingHelperShortcut(shortcutCtx); err != nil {
 		return fmt.Errorf("the helper shortcut did not answer its ping (approve its privacy dialogs and rerun install-shortcut): %w", err)
 	}
-	fmt.Println("  ✓ Helper shortcut verified; heading tools are ready.")
+	fmt.Println("  ✓ Helper input and Things lookup verified. Verify background heading actions during attended setup.")
 	return nil
 }
 
@@ -300,179 +312,53 @@ func runStdio() error {
 		Instructions: "Capture tasks directly in Things 3 on this Mac. " + toolschema.ProjectWorkflowInstructions,
 	})
 
-	mustAddTool(mcpServer, &mcp.Tool{
-		Name:        "capture_things_task",
-		Description: "Create one task in Things 3 on this Mac. Exact or clear fuzzy project matches use that project. Missing or ambiguous projects, including unavailable project IDs, save to Inbox with requested project and heading in notes and a warning. No clarification question is needed.",
-	}, func(callCtx context.Context, _ *mcp.CallToolRequest, input capture.TaskFields) (*mcp.CallToolResult, stdioCaptureResult, error) {
-		task := capture.Request{TaskFields: input}
-		if err := task.Validate(); err != nil {
-			return nil, stdioCaptureResult{}, fmt.Errorf("invalid Things task: %w", err)
-		}
-
-		reqID := randomHex(16)
-		resp, err := captureAdapter.Capture(callCtx, reqID, task)
-		if err != nil {
-			return nil, stdioCaptureResult{}, fmt.Errorf("capture task in Things 3: %w", err)
-		}
-
-		return nil, stdioCaptureResult{
-			RequestID: reqID,
-			Status:    "created",
-			ThingsID:  resp.ID,
-			Warnings:  resp.Warnings,
-		}, nil
-	})
-
-	mustAddTool(mcpServer, &mcp.Tool{
-		Name:        "create_things_heading",
-		Description: "Create a new section heading inside a Things 3 project.",
-	}, func(callCtx context.Context, _ *mcp.CallToolRequest, input capture.HeadingRequest) (*mcp.CallToolResult, struct {
-		Status   string `json:"status"`
-		ThingsID string `json:"things_id,omitempty"`
-	}, error) {
-		if err := input.Validate(); err != nil {
-			return nil, struct {
-				Status   string `json:"status"`
-				ThingsID string `json:"things_id,omitempty"`
-			}{}, fmt.Errorf("invalid heading request: %w", err)
-		}
-		resp, err := captureAdapter.CreateHeading(callCtx, input.Project, input.Heading)
-		if err != nil {
-			return nil, struct {
-				Status   string `json:"status"`
-				ThingsID string `json:"things_id,omitempty"`
-			}{}, fmt.Errorf("create heading: %w", err)
-		}
-		return nil, struct {
-			Status   string `json:"status"`
-			ThingsID string `json:"things_id,omitempty"`
-		}{
-			Status:   "created",
-			ThingsID: resp.ID,
-		}, nil
-	})
-
-	mustAddTool(mcpServer, &mcp.Tool{
-		Name:        "archive_things_heading",
-		Description: "Archive/hide a section heading from an active Things 3 project.",
-	}, func(callCtx context.Context, _ *mcp.CallToolRequest, input capture.HeadingRequest) (*mcp.CallToolResult, struct {
-		Status   string `json:"status"`
-		ThingsID string `json:"things_id,omitempty"`
-	}, error) {
-		if err := input.Validate(); err != nil {
-			return nil, struct {
-				Status   string `json:"status"`
-				ThingsID string `json:"things_id,omitempty"`
-			}{}, fmt.Errorf("invalid heading request: %w", err)
-		}
-		resp, err := captureAdapter.ArchiveHeading(callCtx, input.Project, input.Heading)
-		if err != nil {
-			return nil, struct {
-				Status   string `json:"status"`
-				ThingsID string `json:"things_id,omitempty"`
-			}{}, fmt.Errorf("archive heading: %w", err)
-		}
-		return nil, struct {
-			Status   string `json:"status"`
-			ThingsID string `json:"things_id,omitempty"`
-		}{
-			Status:   "archived",
-			ThingsID: resp.ID,
-		}, nil
-	})
-
-	mustAddTool(mcpServer, &mcp.Tool{
-		Name:        "rename_things_heading",
-		Description: "Rename an existing section heading inside a Things 3 project.",
-	}, func(callCtx context.Context, _ *mcp.CallToolRequest, input capture.HeadingRequest) (*mcp.CallToolResult, struct {
-		Status   string `json:"status"`
-		ThingsID string `json:"things_id,omitempty"`
-	}, error) {
-		if err := input.Validate(); err != nil {
-			return nil, struct {
-				Status   string `json:"status"`
-				ThingsID string `json:"things_id,omitempty"`
-			}{}, fmt.Errorf("invalid heading request: %w", err)
-		}
-		if strings.TrimSpace(input.NewTitle) == "" {
-			return nil, struct {
-				Status   string `json:"status"`
-				ThingsID string `json:"things_id,omitempty"`
-			}{}, errors.New("new_title is required when renaming a heading")
-		}
-		resp, err := captureAdapter.RenameHeading(callCtx, input.Project, input.Heading, input.NewTitle)
-		if err != nil {
-			return nil, struct {
-				Status   string `json:"status"`
-				ThingsID string `json:"things_id,omitempty"`
-			}{}, fmt.Errorf("rename heading: %w", err)
-		}
-		return nil, struct {
-			Status   string `json:"status"`
-			ThingsID string `json:"things_id,omitempty"`
-		}{
-			Status:   "renamed",
-			ThingsID: resp.ID,
-		}, nil
-	})
-
-	mustAddTool(mcpServer, &mcp.Tool{
-		Name:        "archive_things_task",
-		Description: "Archive a task in Things 3 (mark completed, canceled, or move to trash).",
-	}, func(callCtx context.Context, _ *mcp.CallToolRequest, input capture.ArchiveTaskRequest) (*mcp.CallToolResult, struct {
-		Status   string `json:"status"`
-		ThingsID string `json:"things_id,omitempty"`
-	}, error) {
-		if err := input.Validate(); err != nil {
-			return nil, struct {
-				Status   string `json:"status"`
-				ThingsID string `json:"things_id,omitempty"`
-			}{}, fmt.Errorf("invalid archive task request: %w", err)
-		}
-		resp, err := captureAdapter.ArchiveTask(callCtx, input.ID, input.Title, input.Project, input.Action)
-		if err != nil {
-			return nil, struct {
-				Status   string `json:"status"`
-				ThingsID string `json:"things_id,omitempty"`
-			}{}, fmt.Errorf("archive task: %w", err)
-		}
-		return nil, struct {
-			Status   string `json:"status"`
-			ThingsID string `json:"things_id,omitempty"`
-		}{
-			Status:   "archived",
-			ThingsID: resp.ID,
-		}, nil
-	})
-
-	mustAddTool(mcpServer, &mcp.Tool{
-		Name:        "archive_things_project",
-		Description: "Archive an entire project in Things 3 (mark completed or canceled).",
-	}, func(callCtx context.Context, _ *mcp.CallToolRequest, input capture.ArchiveProjectRequest) (*mcp.CallToolResult, struct {
-		Status   string `json:"status"`
-		ThingsID string `json:"things_id,omitempty"`
-	}, error) {
-		if err := input.Validate(); err != nil {
-			return nil, struct {
-				Status   string `json:"status"`
-				ThingsID string `json:"things_id,omitempty"`
-			}{}, fmt.Errorf("invalid archive project request: %w", err)
-		}
-		resp, err := captureAdapter.ArchiveProject(callCtx, input.ID, input.Name, input.Action)
-		if err != nil {
-			return nil, struct {
-				Status   string `json:"status"`
-				ThingsID string `json:"things_id,omitempty"`
-			}{}, fmt.Errorf("archive project: %w", err)
-		}
-		return nil, struct {
-			Status   string `json:"status"`
-			ThingsID string `json:"things_id,omitempty"`
-		}{
-			Status:   "archived",
-			ThingsID: resp.ID,
-		}, nil
-	})
+	journalPath, err := workerapp.JournalPath()
+	if err != nil {
+		return err
+	}
+	localJournal, err := journal.Open(journalPath)
+	if err != nil {
+		return err
+	}
+	defer localJournal.Close()
+	writer := newLocalWriter(&worker.Processor{Helper: captureAdapter, Journal: localJournal})
+	addLocalWriteTool(mcpServer, writer, "capture_things_task",
+		"Create one task in Things 3 on this Mac. Exact or clear fuzzy project matches use that project. Missing or ambiguous projects, including unavailable project IDs, save to Inbox with requested project and heading in notes and a warning. No clarification question is needed.",
+		"created", func(input capture.TaskFields) capture.Request { return capture.Request{TaskFields: input} })
+	addLocalWriteTool(mcpServer, writer, "create_things_heading", "Create a new section heading inside a Things 3 project.", "created",
+		func(input capture.HeadingRequest) capture.Request {
+			return capture.Request{HeadingOperation: "create", HeadingRequest: &input}
+		})
+	addLocalWriteTool(mcpServer, writer, "archive_things_heading", "Archive/hide a section heading from an active Things 3 project.", "archived",
+		func(input capture.HeadingRequest) capture.Request {
+			return capture.Request{HeadingOperation: "archive", HeadingRequest: &input}
+		})
+	addLocalWriteTool(mcpServer, writer, "rename_things_heading", "Rename an existing section heading inside a Things 3 project.", "renamed",
+		func(input capture.HeadingRequest) capture.Request {
+			return capture.Request{HeadingOperation: "rename", HeadingRequest: &input}
+		})
+	addLocalWriteTool(mcpServer, writer, "archive_things_task", "Archive a task in Things 3 (mark completed, canceled, or move to trash).", "archived",
+		func(input capture.ArchiveTaskRequest) capture.Request {
+			return capture.Request{ArchiveTaskRequest: &input}
+		})
+	addLocalWriteTool(mcpServer, writer, "archive_things_project", "Archive an entire project in Things 3 (mark completed or canceled).", "archived",
+		func(input capture.ArchiveProjectRequest) capture.Request {
+			return capture.Request{ArchiveProjectRequest: &input}
+		})
+	addLocalWriteTool(mcpServer, writer, "create_things_project", "Create a Things 3 project with an optional area, notes, start, deadline, and existing tags. Returns its things_id to use as destination.id for tasks. An existing exact title and area is reused with warnings about fields that differ.", "created",
+		func(input capture.CreateProjectRequest) capture.Request {
+			return capture.Request{CreateProjectRequest: &input}
+		})
+	addLocalWriteTool(mcpServer, writer, "update_things_task", "Update, reschedule, or add notes/checklists to an existing task in Things 3. Reuse an idempotency_key for retries of the same request.", "updated",
+		func(input capture.UpdateTaskRequest) capture.Request {
+			return capture.Request{UpdateTaskRequest: &input}
+		})
+	addLocalWriteTool(mcpServer, writer, "create_things_area", toolschema.AreaCreationDescription, "created",
+		func(input capture.CreateAreaRequest) capture.Request {
+			return capture.Request{CreateAreaRequest: &input}
+		})
+	addLocalWriteTool(mcpServer, writer, "create_things_tag", toolschema.TagCreationDescription, "created",
+		func(input capture.CreateTagRequest) capture.Request { return capture.Request{CreateTagRequest: &input} })
 
 	mustAddTool(mcpServer, &mcp.Tool{
 		Name:        "get_things_today",
@@ -483,7 +369,9 @@ func runStdio() error {
 			return nil, nil, fmt.Errorf("get today: %w", err)
 		}
 		var items any
-		_ = json.Unmarshal([]byte(resp.ID), &items)
+		if err := json.Unmarshal([]byte(resp.ID), &items); err != nil {
+			return nil, nil, fmt.Errorf("invalid Things query result: %w", err)
+		}
 		return nil, items, nil
 	})
 
@@ -496,7 +384,9 @@ func runStdio() error {
 			return nil, nil, fmt.Errorf("get inbox: %w", err)
 		}
 		var items any
-		_ = json.Unmarshal([]byte(resp.ID), &items)
+		if err := json.Unmarshal([]byte(resp.ID), &items); err != nil {
+			return nil, nil, fmt.Errorf("invalid Things query result: %w", err)
+		}
 		return nil, items, nil
 	})
 
@@ -509,7 +399,9 @@ func runStdio() error {
 			return nil, nil, fmt.Errorf("list projects: %w", err)
 		}
 		var items any
-		_ = json.Unmarshal([]byte(resp.ID), &items)
+		if err := json.Unmarshal([]byte(resp.ID), &items); err != nil {
+			return nil, nil, fmt.Errorf("invalid Things query result: %w", err)
+		}
 		return nil, items, nil
 	})
 
@@ -522,66 +414,10 @@ func runStdio() error {
 			return nil, nil, fmt.Errorf("search tasks: %w", err)
 		}
 		var items any
-		_ = json.Unmarshal([]byte(resp.ID), &items)
+		if err := json.Unmarshal([]byte(resp.ID), &items); err != nil {
+			return nil, nil, fmt.Errorf("invalid Things query result: %w", err)
+		}
 		return nil, items, nil
-	})
-
-	mustAddTool(mcpServer, &mcp.Tool{
-		Name:        "create_things_project",
-		Description: "Create a project in Things 3 using the requested title and optional area. After creation succeeds, use its things_id as destination.id when adding tasks to it.",
-	}, func(callCtx context.Context, _ *mcp.CallToolRequest, input capture.CreateProjectRequest) (*mcp.CallToolResult, struct {
-		Status   string `json:"status"`
-		ThingsID string `json:"things_id,omitempty"`
-	}, error) {
-		if err := input.Validate(); err != nil {
-			return nil, struct {
-				Status   string `json:"status"`
-				ThingsID string `json:"things_id,omitempty"`
-			}{}, fmt.Errorf("invalid create project request: %w", err)
-		}
-		resp, err := captureAdapter.CreateProject(callCtx, input)
-		if err != nil {
-			return nil, struct {
-				Status   string `json:"status"`
-				ThingsID string `json:"things_id,omitempty"`
-			}{}, fmt.Errorf("create project: %w", err)
-		}
-		return nil, struct {
-			Status   string `json:"status"`
-			ThingsID string `json:"things_id,omitempty"`
-		}{
-			Status:   "created",
-			ThingsID: resp.ID,
-		}, nil
-	})
-
-	mustAddTool(mcpServer, &mcp.Tool{
-		Name:        "update_things_task",
-		Description: "Update, reschedule, or add notes/checklists to an existing task in Things 3.",
-	}, func(callCtx context.Context, _ *mcp.CallToolRequest, input capture.UpdateTaskRequest) (*mcp.CallToolResult, struct {
-		Status   string `json:"status"`
-		ThingsID string `json:"things_id,omitempty"`
-	}, error) {
-		if err := input.Validate(); err != nil {
-			return nil, struct {
-				Status   string `json:"status"`
-				ThingsID string `json:"things_id,omitempty"`
-			}{}, fmt.Errorf("invalid update task request: %w", err)
-		}
-		resp, err := captureAdapter.UpdateTask(callCtx, input)
-		if err != nil {
-			return nil, struct {
-				Status   string `json:"status"`
-				ThingsID string `json:"things_id,omitempty"`
-			}{}, fmt.Errorf("update task: %w", err)
-		}
-		return nil, struct {
-			Status   string `json:"status"`
-			ThingsID string `json:"things_id,omitempty"`
-		}{
-			Status:   "updated",
-			ThingsID: resp.ID,
-		}, nil
 	})
 
 	return mcpServer.Run(ctx, &mcp.StdioTransport{})
@@ -603,10 +439,30 @@ func runDedicatedWorker() error {
 // the deploy/launchd example documents.
 const workerLaunchAgentLabel = "com.nejmlabs.things-index-worker"
 
-func runWorkerSetup() error {
+func runWorkerSetup() (resultErr error) {
 	if runtime.GOOS != "darwin" {
 		return errors.New("the Mac worker setup wizard must be run on macOS")
 	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	defer stop()
+	lifecycle, err := newWorkerSetupLifecycle()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if resultErr != nil && lifecycle.touched {
+			cleanup, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			if err := lifecycle.stop(cleanup); err != nil {
+				resultErr = errors.Join(resultErr, fmt.Errorf("worker stop cleanup failed: %w", err))
+			}
+		}
+	}()
+	if err := verifySetupSigning(ctx, lifecycle.executable); err != nil {
+		return err
+	}
+	home, exePath := lifecycle.home, lifecycle.executable
 
 	reader := bufio.NewReader(os.Stdin)
 	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -620,7 +476,10 @@ func runWorkerSetup() error {
 		defaultServer = "http://127.0.0.1:8080"
 	}
 	fmt.Printf("• Enter Server URL [%s]: ", defaultServer)
-	serverURLInput, _ := reader.ReadString('\n')
+	serverURLInput, err := readSetupLineContext(ctx, reader)
+	if err != nil {
+		return err
+	}
 	serverURL := strings.TrimSpace(serverURLInput)
 	if serverURL == "" {
 		serverURL = defaultServer
@@ -629,7 +488,10 @@ func runWorkerSetup() error {
 	// 2. Prompt for Worker Token
 	defaultToken := os.Getenv("THINGS_INDEX_WORKER_TOKEN")
 	fmt.Print("• Enter Worker Token: ")
-	tokenInput, _ := reader.ReadString('\n')
+	tokenInput, err := readSetupLineContext(ctx, reader)
+	if err != nil {
+		return err
+	}
 	workerToken := strings.TrimSpace(tokenInput)
 	if workerToken == "" {
 		workerToken = defaultToken
@@ -658,7 +520,7 @@ func runWorkerSetup() error {
 	// 4. Verify the connection and the token against the authenticated worker
 	// API, so a mistyped token fails here instead of invisibly at boot.
 	fmt.Printf("• Checking server connection to %s...\n", serverURL)
-	pingCtx, cancelPing := context.WithTimeout(context.Background(), 5*time.Second)
+	pingCtx, cancelPing := context.WithTimeout(ctx, 5*time.Second)
 	pingErr := serverClient.Ping(pingCtx)
 	cancelPing()
 	switch {
@@ -688,7 +550,10 @@ func runWorkerSetup() error {
 		thingsTokenPrompt += " [detected in environment]"
 	}
 	fmt.Print(thingsTokenPrompt + ": ")
-	thingsTokenInput, _ := reader.ReadString('\n')
+	thingsTokenInput, err := readSetupLineContext(ctx, reader)
+	if err != nil {
+		return err
+	}
 	thingsAuthToken := strings.TrimSpace(thingsTokenInput)
 	if thingsAuthToken == "" {
 		thingsAuthToken = defaultThingsToken
@@ -702,6 +567,12 @@ func runWorkerSetup() error {
 		fmt.Println("    General > Enable Things URLs > Manage to unlock the rest.")
 	}
 
+	// Resolve permissions before even discovering the protected Things data
+	// container. Only the launched daemon can prove its own TCC access.
+	if err := lifecycle.prepareFDA(ctx, reader, os.Stdout); err != nil {
+		return err
+	}
+
 	// 6. Auto-detect Things 3 SQLite Database
 	fmt.Println("• Detecting Things 3 SQLite database...")
 	thingsDB, err := helper.FindThingsDatabase()
@@ -713,9 +584,9 @@ func runWorkerSetup() error {
 	// 7. Test Things 3 Access
 	captureAdapter := helper.NewClient("")
 	captureAdapter.DBPath = thingsDB
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	if err := captureAdapter.Ping(ctx); err != nil {
+	databaseCtx, cancelDatabase := context.WithTimeout(ctx, 3*time.Second)
+	defer cancelDatabase()
+	if err := captureAdapter.Ping(databaseCtx); err != nil {
 		return fmt.Errorf("failed to query Things 3 database: %w", err)
 	}
 	fmt.Println("  ✓ Things 3 database query verified (Read-Only OK)")
@@ -728,29 +599,38 @@ func runWorkerSetup() error {
 	// must belong to the daemon, not this terminal.
 	if thingsAuthToken != "" {
 		fmt.Println("• Validating the Things auth token with a disposable test task...")
-		_ = exec.Command("/usr/bin/open", "-g", "-j", "-a", "/Applications/Things3.app").Run()
+		_, _ = lifecycle.run(ctx, "/usr/bin/open", "-g", "-j", "-a", "/Applications/Things3.app")
 		for attempt := 0; attempt < 20; attempt++ {
-			if exec.Command("/usr/bin/pgrep", "-x", "Things3").Run() == nil {
+			if _, err := lifecycle.run(ctx, "/usr/bin/pgrep", "-x", "Things3"); err == nil {
 				break
 			}
-			time.Sleep(500 * time.Millisecond)
+			if err := lifecycle.wait(ctx, 500*time.Millisecond); err != nil {
+				return err
+			}
 		}
-		time.Sleep(time.Second)
+		if err := lifecycle.wait(ctx, time.Second); err != nil {
+			return err
+		}
 
 		verifier := helper.NewClient(thingsAuthToken)
 		verifier.DBPath = thingsDB
-		testCtx, cancelTest := context.WithTimeout(context.Background(), 45*time.Second)
+		testCtx, cancelTest := context.WithTimeout(ctx, 45*time.Second)
 		defer cancelTest()
 		const testTitle = "ThingsIndex setup test — safe to delete"
 		testID := randomHex(16)
-		_, err := verifier.Capture(testCtx, testID, capture.Request{TaskFields: capture.TaskFields{
+		testResult, err := verifier.Capture(testCtx, testID, capture.Request{TaskFields: capture.TaskFields{
 			Title: testTitle,
 			Notes: "Created by things-index worker --setup to validate the Things auth token.",
 		}})
+		if err == nil {
+			err = verifier.FinaliseCapture(testCtx, testResult.ID, testTitle)
+		}
 		if err != nil {
 			// A slow first launch can outlast the capture poll; reconcile the
 			// pending task the same way the worker does before giving up.
-			time.Sleep(3 * time.Second)
+			if err := lifecycle.wait(ctx, 3*time.Second); err != nil {
+				return err
+			}
 			if ids, findErr := verifier.FindCapture(testCtx, testID); findErr == nil && len(ids) == 1 {
 				err = verifier.FinaliseCapture(testCtx, ids[0], testTitle)
 			}
@@ -764,35 +644,31 @@ func runWorkerSetup() error {
 	// 9. Install the bundled ThingsIndex Helper shortcut — heading operations
 	// run through it, and Apple's CLI cannot install shortcuts silently, so
 	// this needs one click in the Shortcuts app.
-	if err := installHelperShortcut(); err != nil {
+	if err := installHelperShortcutContext(ctx); err != nil {
 		return err
 	}
 
-	// 10. Settle the Shortcut's one-time privacy dialogs now via its harmless
-	// ping; the grants are stored per shortcut, so they cover the daemon's
-	// runs too.
-	fmt.Println("• Verifying the helper shortcut (choose “Always Allow” on any privacy dialogs)...")
-	shortcutCtx, cancelShortcut := context.WithTimeout(context.Background(), 3*time.Minute)
+	// 10. Check the Shortcut's basic input and Things lookup with a harmless
+	// ping. Heading writes may need separate first-use approval during
+	// attended setup; ping alone does not verify their background permissions.
+	fmt.Println("• Verifying the helper shortcut (choose “Always Allow” if offered)...")
+	shortcutCtx, cancelShortcut := context.WithTimeout(ctx, 3*time.Minute)
 	err = captureAdapter.PingHelperShortcut(shortcutCtx)
 	cancelShortcut()
 	if err != nil {
 		return fmt.Errorf("the helper shortcut did not answer its ping (approve its privacy dialogs and rerun the wizard): %w", err)
 	}
-	fmt.Println("  ✓ Helper shortcut verified; its privacy grants are settled.")
+	fmt.Println("  ✓ Helper input and Things lookup verified. Verify background heading actions during attended setup.")
 
 	// 11. Install Background Launcher Script (carries the secrets, hence 0700)
-	home, _ := os.UserHomeDir()
 	binDir := filepath.Join(home, ".local", "bin")
-	_ = os.MkdirAll(binDir, 0o755)
-
-	exePath, err := os.Executable()
-	if err != nil {
-		exePath = "/usr/local/bin/things-index"
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		return fmt.Errorf("create worker binary directory: %w", err)
 	}
 
 	launcherScript := filepath.Join(binDir, "run-things-worker.sh")
 	scriptContent := buildLauncherScript(home, serverURL, workerToken, thingsDB, thingsAuthToken, exePath)
-	if err := os.WriteFile(launcherScript, []byte(scriptContent), 0o700); err != nil {
+	if err := writeSetupFile(launcherScript, []byte(scriptContent), 0o700); err != nil {
 		return fmt.Errorf("write launcher script: %w", err)
 	}
 	fmt.Printf("  ✓ Created launcher script: %s\n", launcherScript)
@@ -800,80 +676,40 @@ func runWorkerSetup() error {
 	// 12. Install the LaunchAgent: starts at login, KeepAlive restarts the
 	// worker if it ever crashes, and logs land in ~/Library/Logs/ThingsIndex.
 	logDir := filepath.Join(home, "Library", "Logs", "ThingsIndex")
-	_ = os.MkdirAll(logDir, 0o755)
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		return fmt.Errorf("create worker log directory: %w", err)
+	}
 	agentsDir := filepath.Join(home, "Library", "LaunchAgents")
 	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
 		return fmt.Errorf("create LaunchAgents directory: %w", err)
 	}
 	plistPath := filepath.Join(agentsDir, workerLaunchAgentLabel+".plist")
-	if err := os.WriteFile(plistPath, []byte(buildLaunchAgentPlist(launcherScript, logDir)), 0o644); err != nil {
+	if err := writeSetupFile(plistPath, []byte(buildLaunchAgentPlist(launcherScript, logDir)), 0o644); err != nil {
 		return fmt.Errorf("write LaunchAgent: %w", err)
 	}
 	fmt.Printf("  ✓ Created LaunchAgent: %s\n", plistPath)
 
-	// 13. Replace any previous install (LaunchAgent or the cron+screen
-	// mechanism earlier wizard versions used) and start the agent. Deleting
-	// the consent marker forces the daemon to re-run its automation
-	// preflight, so the Things 3 grant lands on this (possibly rebuilt)
-	// binary rather than being assumed from an older install.
-	if markerPath, err := workerapp.AutomationConsentMarkerPath(); err == nil {
-		_ = os.Remove(markerPath)
+	// Earn Automation permission as the real launchd worker, with a fresh
+	// marker and log segment. Existing markers are archived for diagnostics.
+	fmt.Println("• Starting the signed worker; approve its request to control Things3 if shown...")
+	firstCtx, cancelFirst := context.WithTimeout(ctx, 3*time.Minute)
+	_, err = lifecycle.startVerified(firstCtx, plistPath)
+	cancelFirst()
+	if err != nil {
+		return fmt.Errorf("first worker startup failed: %w", err)
 	}
-	fmt.Println("• Starting background worker via launchd...")
-	fmt.Println("  For unattended restarts, open System Settings > Privacy & Security > Full Disk Access.")
-	fmt.Printf("  Add and enable this worker executable: %s\n", exePath)
-	fmt.Println("  If that path is a symlink, select its resolved executable.")
-	fmt.Println("  App Data dialog approval lasts only until the worker process quits.")
-	fmt.Println("  Separately approve this worker's request to control Things3.")
-	fmt.Println("  When moving from an ad hoc build to a signed release, renew these grants once.")
-	fmt.Println("  Future updates must preserve the worker's signing identity.")
-	domainTarget := fmt.Sprintf("gui/%d", os.Getuid())
-	_ = exec.Command("launchctl", "bootout", domainTarget+"/"+workerLaunchAgentLabel).Run()
-	_ = exec.Command("/bin/sh", "-c", `(crontab -l 2>/dev/null | grep -v "things-worker") | crontab - 2>/dev/null || true`).Run()
-	_ = exec.Command("/bin/sh", "-c", `screen -S things-worker -X quit 2>/dev/null || true`).Run()
-	_ = exec.Command("/bin/sh", "-c", `pkill -f "things-index worker" 2>/dev/null || true`).Run()
-	if output, err := exec.Command("launchctl", "bootstrap", domainTarget, plistPath).CombinedOutput(); err != nil {
-		return fmt.Errorf("start LaunchAgent in %s: %w: %s", domainTarget, err, strings.TrimSpace(string(output)))
+	fmt.Println("  ✓ Fresh database access, Things Automation and worker startup verified.")
+	fmt.Println("• Restarting once to verify permissions survive a new worker process...")
+	if err := lifecycle.stop(ctx); err != nil {
+		return err
 	}
-
-	// 14. Confirm the worker is running AND has recorded its automation
-	// consent before declaring success. macOS pgrep excludes this wizard (an
-	// ancestor), so only the daemon matches.
-	fmt.Println("• Waiting for the worker to start and record its automation consent...")
-	markerPath, markerErr := workerapp.AutomationConsentMarkerPath()
-	running := false
-	consented := false
-	deadline := time.Now().Add(3 * time.Minute)
-	for time.Now().Before(deadline) {
-		time.Sleep(2 * time.Second)
-		running = exec.Command("/usr/bin/pgrep", "-f", "things-index worker").Run() == nil
-		if markerErr == nil {
-			if _, err := os.Stat(markerPath); err == nil {
-				consented = true
-			}
-		}
-		if running && consented {
-			break
-		}
+	secondCtx, cancelSecond := context.WithTimeout(ctx, 45*time.Second)
+	_, err = lifecycle.startVerified(secondCtx, plistPath)
+	cancelSecond()
+	if err != nil {
+		return fmt.Errorf("worker restart verification failed; review Full Disk Access and Automation before rerunning setup: %w", err)
 	}
-
 	fmt.Println()
-	if !running || !consented {
-		fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-		fmt.Println("  ⚠️  Setup finished, but the worker is not fully confirmed yet.")
-		if !running {
-			fmt.Println("  • The worker process has not been seen running.")
-		}
-		if !consented {
-			fmt.Println("  • Things 3 automation consent has not been recorded — approve")
-			fmt.Println("    the “control Things3” dialog if it is still on screen.")
-		}
-		fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-		fmt.Printf("  • Check logs:   %s\n", filepath.Join(logDir, "worker-error.log"))
-		fmt.Printf("  • Check status: launchctl print %s/%s\n", domainTarget, workerLaunchAgentLabel)
-		fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-		return nil
-	}
 	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 	fmt.Println("  🎉 ThingsIndex Mac Worker Successfully Configured & Active!")
 	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -881,11 +717,16 @@ func runWorkerSetup() error {
 	fmt.Printf("  • Things Database: %s\n", thingsDB)
 	fmt.Printf("  • LaunchAgent:     %s (starts at login, auto-restarts)\n", workerLaunchAgentLabel)
 	fmt.Printf("  • Logs:            %s\n", logDir)
-	fmt.Println("  • Permissions:     startup and Automation checks passed.")
-	fmt.Println("                     Verify Full Disk Access in System Settings for unattended restarts.")
+	fmt.Println("  • Permissions:     fresh database and Automation checks passed across two worker processes.")
+	if lifecycle.grant == fdaMatched {
+		fmt.Println("                     The stored Full Disk Access grant matches this signed executable.")
+	} else {
+		fmt.Println("                     You confirmed Full Disk Access; its stored grant was not readable here.")
+	}
+	fmt.Println("                     Future updates must retain the same signing certificate and identifier.")
 	fmt.Println("────────────────────────────────────────────────────────────")
 	fmt.Println("  The worker is now actively listening in the background")
-	fmt.Println("  Full Disk Access prepares it for unattended restarts.")
+	fmt.Println("  Fresh startup checks passed after a controlled restart.")
 	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 	return nil
 }
@@ -894,7 +735,11 @@ func runWorkerSetup() error {
 // library. Apple's shortcuts CLI cannot install (only run/list/view/sign), so
 // this opens the import dialog and waits for the user's one Add click.
 func installHelperShortcut() error {
-	if helperShortcutInstalled() {
+	return installHelperShortcutContext(context.Background())
+}
+
+func installHelperShortcutContext(ctx context.Context) error {
+	if helperShortcutInstalledContext(ctx) {
 		fmt.Printf("  ✓ %q shortcut already installed.\n", helper.HelperShortcutName)
 		return nil
 	}
@@ -911,23 +756,29 @@ func installHelperShortcut() error {
 	if err := os.WriteFile(tempPath, shortcutasset.Helper(), 0o600); err != nil {
 		return fmt.Errorf("write helper shortcut: %w", err)
 	}
-	if err := exec.Command("/usr/bin/open", tempPath).Run(); err != nil {
+	if _, err := runSetupCommand(ctx, "/usr/bin/open", tempPath); err != nil {
 		return fmt.Errorf("open helper shortcut in Shortcuts: %w", err)
 	}
 	fmt.Println("  Shortcuts opened an import dialog — click “Add Shortcut”. Waiting...")
 	deadline := time.Now().Add(3 * time.Minute)
 	for time.Now().Before(deadline) {
-		if helperShortcutInstalled() {
+		if helperShortcutInstalledContext(ctx) {
 			fmt.Printf("  ✓ %q shortcut installed.\n", helper.HelperShortcutName)
 			return nil
 		}
-		time.Sleep(2 * time.Second)
+		if err := waitSetupContext(ctx, 2*time.Second); err != nil {
+			return err
+		}
 	}
 	return fmt.Errorf("the %q shortcut did not appear within 3 minutes; click “Add Shortcut” in the Shortcuts app and rerun the wizard (if it imported under a different name, rename it to %q first)", helper.HelperShortcutName, helper.HelperShortcutName)
 }
 
 func helperShortcutInstalled() bool {
-	output, err := exec.Command("/usr/bin/shortcuts", "list").Output()
+	return helperShortcutInstalledContext(context.Background())
+}
+
+func helperShortcutInstalledContext(ctx context.Context) bool {
+	output, err := runSetupCommand(ctx, "/usr/bin/shortcuts", "list")
 	return err == nil && slices.Contains(strings.Split(string(output), "\n"), helper.HelperShortcutName)
 }
 

@@ -159,8 +159,11 @@ func TestCaptureSavesUnclearProjectToInbox(t *testing.T) {
 			if err := db.QueryRow(`SELECT title, project, notes FROM TMTask WHERE uuid = 'new-task'`).Scan(&title, &project, &notes); err != nil {
 				t.Fatal(err)
 			}
-			if title != task.Title || project != "" || notes != add.Get("notes") {
+			if title != "ThingsIndex pending ["+testRequestID+"]" || project != "" || notes != add.Get("notes") {
 				t.Fatalf("incorrect saved task: title=%q project=%q notes=%q", title, project, notes)
+			}
+			if err := client.FinaliseCapture(context.Background(), response.ID, task.Title); err != nil {
+				t.Fatal(err)
 			}
 			after, _ := task.Hash()
 			if after != before || destination != originalDestination || task.Notes != "Original notes" {

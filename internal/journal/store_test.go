@@ -124,14 +124,14 @@ func TestPruneReportedRetainsIncompleteDeliveries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if count != 2 {
-		t.Fatalf("pruned %d deliveries, want 2", count)
+	if count != 1 {
+		t.Fatalf("pruned %d deliveries, want 1", count)
 	}
 	if _, err := store.Get(ctx, "reported"); err == nil {
 		t.Fatal("expired reported delivery was retained")
 	}
-	if _, err := store.Get(ctx, "finalised-unacked"); err == nil {
-		t.Fatal("expired finalised delivery was retained")
+	if _, err := store.Get(ctx, "finalised-unacked"); err != nil {
+		t.Fatal("unacknowledged finalised delivery was pruned")
 	}
 	if _, err := store.Get(ctx, "incomplete"); err != nil {
 		t.Fatalf("incomplete delivery was pruned: %v", err)

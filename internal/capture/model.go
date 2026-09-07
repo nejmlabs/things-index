@@ -50,12 +50,16 @@ type Schedule struct {
 }
 
 type HeadingRequest struct {
-	Project  string `json:"project" jsonschema:"Required exact name of the project."`
-	Heading  string `json:"heading" jsonschema:"Required heading title."`
-	NewTitle string `json:"new_title,omitempty" jsonschema:"Optional new heading title (when renaming)."`
+	IdempotencyKey string `json:"idempotency_key,omitempty" jsonschema:"Optional key to reuse for retries of this exact write."`
+	Project        string `json:"project" jsonschema:"Required exact name of the project."`
+	Heading        string `json:"heading" jsonschema:"Required heading title."`
+	NewTitle       string `json:"new_title,omitempty" jsonschema:"Optional new heading title (when renaming)."`
 }
 
 func (h HeadingRequest) Validate() error {
+	if err := ValidateIdempotencyKey(h.IdempotencyKey); err != nil {
+		return err
+	}
 	if strings.TrimSpace(h.Project) == "" {
 		return errors.New("project name is required")
 	}
@@ -66,13 +70,17 @@ func (h HeadingRequest) Validate() error {
 }
 
 type ArchiveTaskRequest struct {
-	ID      string `json:"id,omitempty" jsonschema:"Optional Things task UUID."`
-	Title   string `json:"title,omitempty" jsonschema:"Optional task title to look up if ID is omitted."`
-	Project string `json:"project,omitempty" jsonschema:"Optional project name to disambiguate the task title."`
-	Action  string `json:"action,omitempty" jsonschema:"Archive action: complete (default), cancel, or trash."`
+	IdempotencyKey string `json:"idempotency_key,omitempty" jsonschema:"Optional key to reuse for retries of this exact write."`
+	ID             string `json:"id,omitempty" jsonschema:"Optional Things task UUID."`
+	Title          string `json:"title,omitempty" jsonschema:"Optional task title to look up if ID is omitted."`
+	Project        string `json:"project,omitempty" jsonschema:"Optional project name to disambiguate the task title."`
+	Action         string `json:"action,omitempty" jsonschema:"Archive action: complete (default), cancel, or trash."`
 }
 
 func (r ArchiveTaskRequest) Validate() error {
+	if err := ValidateIdempotencyKey(r.IdempotencyKey); err != nil {
+		return err
+	}
 	if strings.TrimSpace(r.ID) == "" && strings.TrimSpace(r.Title) == "" {
 		return errors.New("either task id or title is required")
 	}
@@ -85,12 +93,16 @@ func (r ArchiveTaskRequest) Validate() error {
 }
 
 type ArchiveProjectRequest struct {
-	ID     string `json:"id,omitempty" jsonschema:"Optional Things project UUID."`
-	Name   string `json:"name,omitempty" jsonschema:"Optional project name to look up if ID is omitted."`
-	Action string `json:"action,omitempty" jsonschema:"Archive action: complete (default) or cancel."`
+	IdempotencyKey string `json:"idempotency_key,omitempty" jsonschema:"Optional key to reuse for retries of this exact write."`
+	ID             string `json:"id,omitempty" jsonschema:"Optional Things project UUID."`
+	Name           string `json:"name,omitempty" jsonschema:"Optional project name to look up if ID is omitted."`
+	Action         string `json:"action,omitempty" jsonschema:"Archive action: complete (default) or cancel."`
 }
 
 func (r ArchiveProjectRequest) Validate() error {
+	if err := ValidateIdempotencyKey(r.IdempotencyKey); err != nil {
+		return err
+	}
 	if strings.TrimSpace(r.ID) == "" && strings.TrimSpace(r.Name) == "" {
 		return errors.New("either project id or name is required")
 	}
@@ -117,35 +129,77 @@ func (q QueryTasksRequest) Validate() error {
 }
 
 type CreateProjectRequest struct {
-	Title    string   `json:"title" jsonschema:"Required title of the new project."`
-	Area     string   `json:"area,omitempty" jsonschema:"Optional name of the area to place the project in."`
-	Notes    string   `json:"notes,omitempty" jsonschema:"Optional project notes."`
-	Deadline string   `json:"deadline,omitempty" jsonschema:"Optional deadline in YYYY-MM-DD form."`
-	When     string   `json:"when,omitempty" jsonschema:"Optional start time: today, someday, or YYYY-MM-DD."`
-	Tags     []string `json:"tags,omitempty" jsonschema:"Optional tag names."`
+	IdempotencyKey string   `json:"idempotency_key,omitempty" jsonschema:"Optional key to reuse for retries of this exact write."`
+	Title          string   `json:"title" jsonschema:"Required title of the new project."`
+	Area           string   `json:"area,omitempty" jsonschema:"Optional name of the area to place the project in."`
+	Notes          string   `json:"notes,omitempty" jsonschema:"Optional project notes."`
+	Deadline       string   `json:"deadline,omitempty" jsonschema:"Optional deadline in YYYY-MM-DD form."`
+	When           string   `json:"when,omitempty" jsonschema:"Optional start time: today, evening, anytime, someday, or YYYY-MM-DD."`
+	Tags           []string `json:"tags,omitempty" jsonschema:"Optional tag names."`
 }
 
 func (c CreateProjectRequest) Validate() error {
-	if strings.TrimSpace(c.Title) == "" {
-		return errors.New("project title is required")
+	if err := ValidateIdempotencyKey(c.IdempotencyKey); err != nil {
+		return err
+	}
+	if err := validateUniqueStrings("project title", []string{c.Title}, MaxTitleBytes); err != nil {
+		return err
+	}
+	if c.Title != strings.TrimSpace(c.Title) || strings.ContainsRune(c.Title, 0) {
+		return errors.New("project title must not contain NUL or leading/trailing whitespace")
+	}
+	if c.Area != "" {
+		if err := validateOrganizationName("area", c.Area); err != nil {
+			return err
+		}
+	}
+	if !utf8.ValidString(c.Notes) || len(c.Notes) > MaxNotesBytes || strings.ContainsRune(c.Notes, 0) {
+		return errors.New("project notes must be valid UTF-8 without NUL and within the notes limit")
+	}
+	if c.Deadline != "" {
+		if err := validateDate(c.Deadline); err != nil {
+			return fmt.Errorf("invalid deadline: %w", err)
+		}
+	}
+	switch c.When {
+	case "", "today", "evening", "anytime", "someday":
+	default:
+		if err := validateDate(c.When); err != nil {
+			return fmt.Errorf("invalid project start: %w", err)
+		}
+	}
+	if len(c.Tags) > MaxTagCount {
+		return fmt.Errorf("no more than %d tags are allowed", MaxTagCount)
+	}
+	if err := validateUniqueStrings("tag", c.Tags, MaxDestinationLen); err != nil {
+		return err
+	}
+	for _, tag := range c.Tags {
+		if strings.ContainsAny(tag, ",\x00") {
+			return errors.New("tag names must not contain commas or NUL")
+		}
 	}
 	return nil
 }
 
 type UpdateTaskRequest struct {
-	ID           string   `json:"id,omitempty" jsonschema:"Things task UUID (optional if title is provided)."`
-	Title        string   `json:"title,omitempty" jsonschema:"Task title to find if ID is omitted."`
-	Project      string   `json:"project,omitempty" jsonschema:"Optional project name to disambiguate the task title."`
-	NewTitle     string   `json:"new_title,omitempty" jsonschema:"Optional new title for the task."`
-	Notes        string   `json:"notes,omitempty" jsonschema:"Replace existing notes."`
-	AppendNotes  string   `json:"append_notes,omitempty" jsonschema:"Append to existing notes."`
-	Deadline     string   `json:"deadline,omitempty" jsonschema:"New deadline in YYYY-MM-DD form."`
-	When         string   `json:"when,omitempty" jsonschema:"Reschedule task: today, evening, someday, anytime, or YYYY-MM-DD."`
-	AddTags      []string `json:"add_tags,omitempty" jsonschema:"Tags to add."`
-	AddChecklist []string `json:"add_checklist,omitempty" jsonschema:"Checklist lines to append."`
+	IdempotencyKey string   `json:"idempotency_key,omitempty" jsonschema:"Optional key to reuse for retries of this exact write."`
+	ID             string   `json:"id,omitempty" jsonschema:"Things task UUID (optional if title is provided)."`
+	Title          string   `json:"title,omitempty" jsonschema:"Task title to find if ID is omitted."`
+	Project        string   `json:"project,omitempty" jsonschema:"Optional project name to disambiguate the task title."`
+	NewTitle       string   `json:"new_title,omitempty" jsonschema:"Optional new title for the task."`
+	Notes          string   `json:"notes,omitempty" jsonschema:"Replace existing notes."`
+	AppendNotes    string   `json:"append_notes,omitempty" jsonschema:"Append to existing notes."`
+	Deadline       string   `json:"deadline,omitempty" jsonschema:"New deadline in YYYY-MM-DD form."`
+	When           string   `json:"when,omitempty" jsonschema:"Reschedule task: today, evening, someday, anytime, or YYYY-MM-DD."`
+	AddTags        []string `json:"add_tags,omitempty" jsonschema:"Tags to add."`
+	AddChecklist   []string `json:"add_checklist,omitempty" jsonschema:"Checklist lines to append."`
 }
 
 func (u UpdateTaskRequest) Validate() error {
+	if err := ValidateIdempotencyKey(u.IdempotencyKey); err != nil {
+		return err
+	}
 	if strings.TrimSpace(u.ID) == "" && strings.TrimSpace(u.Title) == "" {
 		return errors.New("either task id or title is required")
 	}
@@ -179,9 +233,43 @@ type Request struct {
 	QueryTasksRequest     *QueryTasksRequest     `json:"query_tasks_request,omitempty"`
 	CreateProjectRequest  *CreateProjectRequest  `json:"create_project_request,omitempty"`
 	UpdateTaskRequest     *UpdateTaskRequest     `json:"update_task_request,omitempty"`
+	CreateAreaRequest     *CreateAreaRequest     `json:"create_area_request,omitempty"`
+	CreateTagRequest      *CreateTagRequest      `json:"create_tag_request,omitempty"`
 }
 
 func (r Request) Validate() error {
+	if err := ValidateIdempotencyKey(r.IdempotencyKey); err != nil {
+		return err
+	}
+	if key := r.OperationKey(); key != "" && r.IdempotencyKey != "" && key != r.IdempotencyKey {
+		return errors.New("conflicting idempotency keys in job")
+	}
+	operations := 0
+	for _, present := range []bool{r.QueryTasksRequest != nil, r.CreateProjectRequest != nil,
+		r.UpdateTaskRequest != nil, r.ArchiveTaskRequest != nil, r.ArchiveProjectRequest != nil,
+		r.HeadingOperation != "", r.CreateAreaRequest != nil, r.CreateTagRequest != nil} {
+		if present {
+			operations++
+		}
+	}
+	if operations > 1 {
+		return errors.New("a job must contain exactly one operation")
+	}
+	if r.HeadingRequest != nil && r.HeadingOperation == "" {
+		return errors.New("heading_request requires a heading operation")
+	}
+	if r.HeadingOperation != "" && r.HeadingOperation != "create" && r.HeadingOperation != "rename" && r.HeadingOperation != "archive" {
+		return errors.New("invalid heading operation")
+	}
+	if operations != 0 && (r.Title != "" || r.Notes != "" || r.Destination != nil || r.Schedule != nil || r.Deadline != "" || len(r.Tags) != 0 || len(r.Checklist) != 0) {
+		return errors.New("task capture fields cannot be combined with another operation")
+	}
+	if r.CreateAreaRequest != nil {
+		return r.CreateAreaRequest.Validate()
+	}
+	if r.CreateTagRequest != nil {
+		return r.CreateTagRequest.Validate()
+	}
 	if r.QueryTasksRequest != nil {
 		return r.QueryTasksRequest.Validate()
 	}
@@ -201,19 +289,15 @@ func (r Request) Validate() error {
 		if r.HeadingRequest == nil {
 			return errors.New("heading_request is required when heading_operation is set")
 		}
+		if r.HeadingOperation == "rename" && strings.TrimSpace(r.HeadingRequest.NewTitle) == "" {
+			return errors.New("new_title is required when renaming a heading")
+		}
 		return r.HeadingRequest.Validate()
 	}
 	if strings.TrimSpace(r.Title) == "" {
 		return errors.New("title is required")
 	}
-	if r.IdempotencyKey != "" {
-		if !utf8.ValidString(r.IdempotencyKey) || len(r.IdempotencyKey) > 128 {
-			return errors.New("idempotency_key must be valid UTF-8 and at most 128 bytes")
-		}
-		if strings.ContainsAny(r.IdempotencyKey, "\r\n") {
-			return errors.New("idempotency_key must be a single line")
-		}
-	}
+
 	if !utf8.ValidString(r.Title) || len(r.Title) > MaxTitleBytes {
 		return fmt.Errorf("title must be valid UTF-8 and at most %d bytes", MaxTitleBytes)
 	}

@@ -3,21 +3,30 @@
 #
 #   bash -c "$(curl -fsSL https://raw.githubusercontent.com/nejmlabs/things-index/main/deploy/mac-worker-install.sh)"
 #
-# Downloads the latest released universal binary (Apple Silicon + Intel) to
-# ~/.local/bin, verifies its GitHub build-provenance attestation when the gh
-# CLI is available, and launches the interactive setup wizard. To install the
-# binary only, pass --no-setup after a placeholder argv[0]:
+# Downloads and verifies the signed release, then lets its Go installer preserve
+# the old binary, check signing continuity, and run interactive worker setup.
+# Uses macOS system tools; no Python or developer tools are required.
+# --no-setup installs the binary but leaves the worker stopped and disabled:
 #
 #   bash -c "$(curl -fsSL .../mac-worker-install.sh)" install --no-setup
 
 set -euo pipefail
+umask 077
+
+fail() { printf '✗ %s\n' "$1" >&2; exit 1; }
+
+if [ "$#" -gt 1 ] || { [ "$#" -eq 1 ] && [ "$1" != "--no-setup" ]; }; then
+    fail 'Usage: mac-worker-install.sh [--no-setup]'
+fi
 
 REPO="nejmlabs/things-index"
 ASSET="things-index-darwin-universal"
+# Public release-certificate fingerprint, deliberately pinned before executing
+# downloaded code. Changing this trust anchor requires an explicit source edit.
+MACOS_RELEASE_CERTIFICATE_SHA1="411458A567FC772FF286B076E379703960D71231"
 
 if [ "$(uname -s)" != "Darwin" ]; then
-    echo "✗ This installer is for macOS (the Mac that runs Things 3)." >&2
-    exit 1
+    fail 'This installer is for macOS (the Mac that runs Things 3).'
 fi
 
 BIN_DIR="${HOME}/.local/bin"
@@ -28,18 +37,25 @@ echo "  ⬇️  ThingsIndex Mac Worker Installer"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 mkdir -p "${BIN_DIR}"
-# Keep each download private and fresh; a reused file can retain metadata
-# from an earlier download. Staging beside the binary preserves atomic rename.
+# Fresh private staging avoids inheriting metadata from an earlier download.
+# Keep it until the Go installer returns; it reads and verifies this source.
 DOWNLOAD_DIR="$(mktemp -d "${BIN_DIR}/.things-index-download.XXXXXX")"
 DOWNLOAD_PATH="${DOWNLOAD_DIR}/things-index"
-trap 'rm -rf -- "${DOWNLOAD_DIR}"' EXIT
+cleanup() {
+    result=$?
+    trap - EXIT
+    rm -rf -- "${DOWNLOAD_DIR}"
+    exit "${result}"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
 echo "• Downloading the latest things-index release..."
 curl -fL --progress-bar -o "${DOWNLOAD_PATH}" \
     "https://github.com/${REPO}/releases/latest/download/${ASSET}"
 
-# Verify GitHub's build-provenance attestation when possible: proof the
-# binary was built by this repository's release workflow on GitHub's
-# runners, not on someone's laptop.
 if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
     echo "• Verifying build provenance attestation..."
     gh attestation verify "${DOWNLOAD_PATH}" --repo "${REPO}" >/dev/null
@@ -49,23 +65,19 @@ else
     echo "    To verify by hand later: gh attestation verify ${BINARY} --repo ${REPO}"
 fi
 
+# Inspect attribute names only. Never remove quarantine or change system trust.
+ATTRIBUTES="$(/usr/bin/xattr "${DOWNLOAD_PATH}")" || fail 'Could not inspect downloaded executable metadata.'
+while IFS= read -r attribute; do
+    if [ "${attribute}" = "com.apple.quarantine" ]; then
+        fail 'Downloaded executable is quarantined; it will not be run or installed. Review its origin and macOS security status manually.'
+    fi
+done <<< "${ATTRIBUTES}"
+
+echo "• Verifying the release signature and pinned certificate..."
+REQUIREMENT="=identifier \"com.nejmlabs.things-index\" and certificate leaf = H\"${MACOS_RELEASE_CERTIFICATE_SHA1}\""
+LC_ALL=C /usr/bin/codesign --verify --strict --all-architectures \
+    --test-requirement "${REQUIREMENT}" "${DOWNLOAD_PATH}" ||
+    fail 'Release signature or certificate does not match the trusted ThingsIndex release identity.'
+
 chmod 0755 "${DOWNLOAD_PATH}"
-mv "${DOWNLOAD_PATH}" "${BINARY}"
-rmdir "${DOWNLOAD_DIR}"
-trap - EXIT
-echo "  ✓ Installed ${BINARY} ($("${BINARY}" version))"
-
-case ":${PATH}:" in
-    *":${BIN_DIR}:"*) ;;
-    *)
-        echo "  • Note: ${BIN_DIR} is not on your PATH. The background daemon"
-        echo "    does not need it, but add it to run things-index by name."
-        ;;
-esac
-
-if [ "${1:-}" = "--no-setup" ]; then
-    echo "• Install complete. Run '${BINARY} worker --setup' when ready."
-    exit 0
-fi
-
-exec "${BINARY}" worker --setup
+"${DOWNLOAD_PATH}" install-worker "$@"

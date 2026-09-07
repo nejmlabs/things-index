@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/nejmlabs/things-index/internal/capture"
@@ -200,13 +201,135 @@ func TestIsRetryable(t *testing.T) {
 	if !IsRetryable(&helper.OperationError{Code: "finalise_unverified"}) {
 		t.Fatal("finalise_unverified should be retryable")
 	}
-	if IsRetryable(&helper.OperationError{Code: "update_unverified"}) {
-		t.Fatal("update_unverified must not retry; a second dispatch could double-apply notes")
+	if !IsRetryable(&helper.OperationError{Code: "update_unverified"}) {
+		t.Fatal("update_unverified must allow reconciliation using the durable prepared plan")
 	}
 	if IsRetryable(&helper.OperationError{Code: "invalid_request"}) {
 		t.Fatal("invalid_request should not be retryable")
 	}
 	if IsRetryable(&helper.OperationError{Code: "destination_not_found"}) {
 		t.Fatal("destination_not_found should not be retryable")
+	}
+}
+
+type captureJournalFailure struct {
+	*journal.Store
+	failCreated bool
+}
+
+func (s *captureJournalFailure) MarkCreated(ctx context.Context, jobID, thingsID, notes string) error {
+	if s.failCreated {
+		s.failCreated = false
+		return errors.New("interrupted before saving returned UUID")
+	}
+	return s.Store.MarkCreated(ctx, jobID, thingsID, notes)
+}
+
+type recoverableCaptureHelper struct {
+	fakeHelper
+	actualNotes string
+	warnings    []string
+	readError   error
+	finalise    func(context.Context, string, string) error
+}
+
+func (h *recoverableCaptureHelper) Capture(ctx context.Context, id string, task capture.Request) (helper.Response, error) {
+	response, err := h.fakeHelper.Capture(ctx, id, task)
+	if err == nil {
+		h.findIDs = []string{response.ID}
+		response.Warnings = h.warnings
+	}
+	return response, err
+}
+
+func (h *recoverableCaptureHelper) ReadCaptureNotes(context.Context, string) (string, error) {
+	return h.actualNotes, h.readError
+}
+
+func (h *recoverableCaptureHelper) FinaliseCapture(ctx context.Context, id, title string) error {
+	if h.finalise != nil {
+		if err := h.finalise(ctx, id, title); err != nil {
+			return err
+		}
+	}
+	return h.fakeHelper.FinaliseCapture(ctx, id, title)
+}
+
+func TestCaptureRecoveryKeepsWarningsAndSavesUUIDBeforeFinalising(t *testing.T) {
+	t.Parallel()
+	store, _ := mutationStore(t)
+	wrapped := &captureJournalFailure{Store: store, failCreated: true}
+	warnings := []string{
+		`ThingsIndex warning: requested project "Kitchen" did not match an active project; captured in Inbox.`,
+		`ThingsIndex warning: tag "Missing" did not exist and was not applied.`,
+	}
+	notes := "Original notes\n\n" + strings.Join(warnings, "\n\n")
+	h := &recoverableCaptureHelper{fakeHelper: fakeHelper{createdID: "created-once", appliedTags: []string{}}, actualNotes: notes, warnings: warnings}
+	job := Job{ID: projectJob().ID, Task: capture.Request{TaskFields: capture.TaskFields{Title: "Task", Notes: "Original notes", Tags: []string{"Missing"}}}}
+	h.finalise = func(ctx context.Context, id, _ string) error {
+		entry, err := store.Get(ctx, job.ID)
+		if err != nil || entry.State != journal.StateCreated || entry.ThingsID != id || entry.Notes != notes {
+			t.Fatalf("marker removed before durable identity/warnings: entry=%+v error=%v", entry, err)
+		}
+		return nil
+	}
+	p := &Processor{Helper: h, Journal: wrapped}
+	if _, err := p.Process(context.Background(), job); err == nil || h.finalisedID != "" {
+		t.Fatalf("capture was finalised despite journal failure: error=%v helper=%+v", err, h)
+	}
+	// A protected-database read failure must not discard the actual warnings.
+	h.readError = errors.New("notes read failed")
+	if _, err := p.Process(context.Background(), job); !errors.Is(err, h.readError) || h.finalisedID != "" {
+		t.Fatalf("recovery ignored notes read failure: %v", err)
+	}
+	h.readError = nil
+	result, err := p.Process(context.Background(), job)
+	if err != nil || result.ThingsID != h.createdID || len(result.Warnings) != 2 || h.captureCalls != 1 || h.finalisedID != h.createdID {
+		t.Fatalf("capture recovery failed: outcome=%+v error=%v helper=%+v", result, err, h)
+	}
+	for i, warning := range warnings {
+		if result.Warnings[i] != warning {
+			t.Fatalf("recovery lost original warning: %v", result.Warnings)
+		}
+	}
+}
+
+func TestCaptureResponseAndMissingTagWarningsAreDeduplicated(t *testing.T) {
+	t.Parallel()
+	store, _ := mutationStore(t)
+	warning := `ThingsIndex warning: tag "Missing" did not exist and was not applied.`
+	h := &recoverableCaptureHelper{fakeHelper: fakeHelper{createdID: "created-once", appliedTags: []string{}}, warnings: []string{warning}}
+	p := &Processor{Helper: h, Journal: store}
+	job := Job{ID: projectJob().ID, Task: capture.Request{TaskFields: capture.TaskFields{Title: "Task", Tags: []string{"Missing"}}}}
+	result, err := p.Process(context.Background(), job)
+	if err != nil || len(result.Warnings) != 1 || result.Warnings[0] != warning {
+		t.Fatalf("duplicate/lost warning: result=%+v error=%v", result, err)
+	}
+	entry, err := store.Get(context.Background(), job.ID)
+	if err != nil || entry.Notes != warning {
+		t.Fatalf("journal has duplicate/lost warning: entry=%+v error=%v", entry, err)
+	}
+}
+
+func TestUncertainCaptureRequiresOneExactRecoveryMatch(t *testing.T) {
+	t.Parallel()
+	for _, ids := range [][]string{nil, {"duplicate-1", "duplicate-2"}} {
+		store, _ := mutationStore(t)
+		job := Job{ID: projectJob().ID, Task: capture.Request{TaskFields: capture.TaskFields{Title: "Task"}}}
+		hash, err := job.Task.Hash()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := store.Ensure(context.Background(), job.ID, hash); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.MarkCreating(context.Background(), job.ID); err != nil {
+			t.Fatal(err)
+		}
+		h := &fakeHelper{createdID: "must-not-create", findIDs: ids}
+		p := &Processor{Helper: h, Journal: store}
+		if _, err := p.Process(context.Background(), job); err == nil || IsRetryable(err) || h.captureCalls != 0 || h.finalisedID != "" {
+			t.Fatalf("uncertain match caused mutation: matches=%v error=%v helper=%+v", ids, err, h)
+		}
 	}
 }

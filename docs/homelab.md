@@ -188,25 +188,45 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/nejmlabs/things-index/ma
 It installs the latest released universal binary to `~/.local/bin`, verifying
 GitHub's build-provenance attestation when the `gh` CLI is available, and
 launches the setup wizard (`things-index worker --setup`, rerunnable anytime).
+The shell wrapper verifies the pinned release signer before executing the
+download. Installation and permission setup run in Go; Python and Xcode
+Command Line Tools are not required. The installer retains the original binary
+in a private backup directory and prints its path.
 The wizard verifies the server URL and worker token against the live server, validates
 the optional Things auth token with one disposable test task, installs the
-bundled ThingsIndex Helper shortcut and settles its privacy dialogs, installs
-the LaunchAgent, and waits for the daemon to record its Things 3 automation
-consent.
+bundled ThingsIndex Helper shortcut and checks basic input and Things lookup access, and
+installs the LaunchAgent. Before accessing Things, it checks the executable's
+signing identity and guides the Full Disk Access step with the worker stopped.
+It then checks fresh database access, Automation consent, and readiness through
+the daemon itself, and repeats the checks after a controlled restart. Failed
+startup checks leave the LaunchAgent stopped and disabled, with setup reporting
+an error instead of success.
 
-For unattended operation across restarts, open **System Settings > Privacy &
-Security > Full Disk Access**, click **+**, and add and enable the actual worker
+During setup, open **System Settings > Privacy & Security > Full Disk Access**,
+click **+**, and add and enable the actual worker
 executable: normally `~/.local/bin/things-index`. Use **Command–Shift–G** in the
 file picker to enter its path. For a custom or manual installation, use the
 resolved executable path launched by the worker's launcher. Grant access to
-that executable, not Terminal or a shell.
+that executable. The wizard opens the settings and reveals the resolved file.
+If an older ThingsIndex entry is present, remove it and add the new executable;
+toggling a stale entry alone may retain the old identity. Type `done` in the
+wizard after enabling access. Closing its input does not confirm the grant.
+
+Where macOS permits reading the stored Full Disk Access entry, setup verifies
+that its code requirement matches the installed worker. If that protected
+information is unavailable, setup asks you to confirm the setting manually and
+reports it as unverified; it does not request Full Disk Access for Terminal or
+change the permission database. The subsequent daemon checks still have to
+pass. Initial approval remains an attended step in System Settings.
 
 The worker reads Things' protected database at startup. Approving the ordinary
 “access data from other apps” dialog only lasts until the worker process quits;
 Full Disk Access suppresses that prompt across restarts. It is a broad file
 access permission. Things Automation permission is separate: approve the
-worker's request to control Things, and settle the Helper shortcut's own
-privacy dialogs during setup. [Apple explains App Data permission lifetime and
+worker's request to control Things. The Helper shortcut's setup ping checks
+basic input and Things lookup access; heading writes may need separate
+first-use approval. Verify heading operations through the background worker
+during attended setup before unattended use. [Apple explains App Data permission lifetime and
 Full Disk Access](https://developer.apple.com/videos/play/wwdc2023/10053/).
 
 Releases through v0.2.5 use ad hoc signing. Their Full Disk Access entry can
@@ -215,7 +235,8 @@ workflow now requires a persistent signing certificate and identifier, and
 the updater rejects incompatible signing identities before replacing a signed
 installation. The first signed release requires a manual permission refresh:
 remove the old ThingsIndex Full Disk Access entry, add the newly installed
-worker, and approve Things Automation if requested. Verify a restart and an
+worker, and approve Things Automation if requested. The setup wizard guides
+this migration and repeats the worker's Automation preflight. Verify an
 update before relying on unattended operation; see [release signing and
 migration](macos-signing.md). [Apple explains how privacy grants track code
 identity](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements).
@@ -226,6 +247,10 @@ HTTPS route existing), pass `--no-setup` after a placeholder for `argv[0]`:
 ```sh
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/nejmlabs/things-index/main/deploy/mac-worker-install.sh)" install --no-setup
 ```
+
+`--no-setup` leaves the worker stopped and disabled. Run
+`~/.local/bin/things-index worker --setup` in the logged-in desktop session
+when ready to confirm its permissions and start it.
 
 The worker requires HTTPS because its server is not on loopback; a reverse
 proxy hostname, an SSH tunnel to loopback, or a Cloudflare Tunnel hostname
@@ -275,11 +300,11 @@ worker accepts no inbound connections.
   binary if either check fails. When migrating
   from v0.2.5 or an earlier ad hoc build, refresh Full Disk Access for the
   installed worker executable and approve Things Automation separately.
-  To repeat the Automation preflight when an old consent marker suppresses it:
+  To run the guided permission refresh and repeat the worker's Automation
+  preflight and startup checks:
 
   ```sh
-  rm "$HOME/Library/Application Support/ThingsIndex/automation-consent-granted"
-  launchctl kickstart -k "gui/$(id -u)/com.nejmlabs.things-index-worker"
+  things-index worker --setup
   ```
 
   Confirm the log reads "worker ready":

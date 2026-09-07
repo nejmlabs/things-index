@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/nejmlabs/things-index/internal/capture"
 	"github.com/nejmlabs/things-index/internal/helper"
@@ -36,7 +37,8 @@ func IsRetryable(err error) bool {
 	if errors.As(err, &operationError) {
 		return operationError.Code == "create_failed" ||
 			operationError.Code == "finalise_not_found" ||
-			operationError.Code == "finalise_unverified"
+			operationError.Code == "finalise_unverified" ||
+			operationError.Code == "update_unverified" // Prepared updates reconcile before any permitted replay.
 	}
 	return true
 }
@@ -79,7 +81,12 @@ type Processor struct {
 	Journal Journal
 }
 
+// JobTimeout leaves reporting and cancellation headroom in the 90-second lease.
+const JobTimeout = 45 * time.Second
+
 func (p *Processor) Process(ctx context.Context, job Job) (Outcome, error) {
+	ctx, cancel := context.WithTimeout(ctx, JobTimeout)
+	defer cancel()
 	if p.Helper == nil || p.Journal == nil {
 		return Outcome{}, errors.New("worker helper and journal are required")
 	}
@@ -98,59 +105,10 @@ func (p *Processor) Process(ctx context.Context, job Job) (Outcome, error) {
 		return Outcome{ThingsID: resp.ID}, nil
 	}
 
-	if job.Task.CreateProjectRequest != nil {
-		resp, err := p.Helper.CreateProject(ctx, *job.Task.CreateProjectRequest)
-		if err != nil {
-			return Outcome{}, err
-		}
-		return Outcome{ThingsID: resp.ID}, nil
-	}
-
-	if job.Task.UpdateTaskRequest != nil {
-		resp, err := p.Helper.UpdateTask(ctx, *job.Task.UpdateTaskRequest)
-		if err != nil {
-			return Outcome{}, err
-		}
-		return Outcome{ThingsID: resp.ID}, nil
-	}
-
-	if job.Task.ArchiveTaskRequest != nil {
-		resp, err := p.Helper.ArchiveTask(ctx, job.Task.ArchiveTaskRequest.ID, job.Task.ArchiveTaskRequest.Title, job.Task.ArchiveTaskRequest.Project, job.Task.ArchiveTaskRequest.Action)
-		if err != nil {
-			return Outcome{}, err
-		}
-		return Outcome{ThingsID: resp.ID}, nil
-	}
-
-	if job.Task.ArchiveProjectRequest != nil {
-		resp, err := p.Helper.ArchiveProject(ctx, job.Task.ArchiveProjectRequest.ID, job.Task.ArchiveProjectRequest.Name, job.Task.ArchiveProjectRequest.Action)
-		if err != nil {
-			return Outcome{}, err
-		}
-		return Outcome{ThingsID: resp.ID}, nil
-	}
-
-	if job.Task.HeadingOperation != "" && job.Task.HeadingRequest != nil {
-		switch job.Task.HeadingOperation {
-		case "create":
-			resp, err := p.Helper.CreateHeading(ctx, job.Task.HeadingRequest.Project, job.Task.HeadingRequest.Heading)
-			if err != nil {
-				return Outcome{}, err
-			}
-			return Outcome{ThingsID: resp.ID}, nil
-		case "archive":
-			resp, err := p.Helper.ArchiveHeading(ctx, job.Task.HeadingRequest.Project, job.Task.HeadingRequest.Heading)
-			if err != nil {
-				return Outcome{}, err
-			}
-			return Outcome{ThingsID: resp.ID}, nil
-		case "rename":
-			resp, err := p.Helper.RenameHeading(ctx, job.Task.HeadingRequest.Project, job.Task.HeadingRequest.Heading, job.Task.HeadingRequest.NewTitle)
-			if err != nil {
-				return Outcome{}, err
-			}
-			return Outcome{ThingsID: resp.ID}, nil
-		}
+	if job.Task.CreateProjectRequest != nil || job.Task.UpdateTaskRequest != nil ||
+		job.Task.ArchiveTaskRequest != nil || job.Task.ArchiveProjectRequest != nil ||
+		job.Task.HeadingOperation != "" || job.Task.CreateAreaRequest != nil || job.Task.CreateTagRequest != nil {
+		return p.processMutation(ctx, job)
 	}
 
 	payloadHash, err := job.Task.Hash()
@@ -176,9 +134,19 @@ func (p *Processor) Process(ctx context.Context, job Job) (Outcome, error) {
 		}
 		switch len(ids) {
 		case 0:
-			// The helper did not create the task, so the same stable request may be attempted again.
+			// An asynchronous native dispatch may still arrive. Absence now is
+			// not proof that no task was created; never send another add URL.
+			return Outcome{}, uncertainWriteError()
 		case 1:
 			finalNotes := job.Task.Notes
+			if reader, ok := p.Helper.(interface {
+				ReadCaptureNotes(context.Context, string) (string, error)
+			}); ok {
+				finalNotes, err = reader.ReadCaptureNotes(ctx, ids[0])
+				if err != nil {
+					return Outcome{}, err
+				}
+			}
 			if err := p.Journal.MarkCreated(ctx, job.ID, ids[0], finalNotes); err != nil {
 				return Outcome{}, err
 			}
@@ -209,6 +177,9 @@ func (p *Processor) Process(ctx context.Context, job Job) (Outcome, error) {
 		}
 		if captureErr != nil {
 			return Outcome{}, fmt.Errorf("create Things task: %w", captureErr)
+		}
+		if !response.OK || response.ID == "" {
+			return Outcome{}, permanentError(errors.New("Things capture returned no verified identifier"))
 		}
 		finalNotes := task.Notes
 		for _, warning := range response.Warnings {
@@ -247,20 +218,18 @@ func (p *Processor) Process(ctx context.Context, job Job) (Outcome, error) {
 }
 
 func (p *Processor) MarkReported(ctx context.Context, jobID string) error {
+	if store, ok := p.Journal.(OperationJournal); ok {
+		if _, err := store.GetOperation(ctx, jobID); err == nil {
+			return store.MarkOperationReported(ctx, jobID)
+		} else if !errors.Is(err, journal.ErrOperationNotFound) {
+			return err
+		}
+	}
 	return p.Journal.MarkReported(ctx, jobID)
 }
 
-// UsesJournal reports whether processing this task records idempotency state
-// in the journal. Query, update, archive, and heading operations execute
-// directly and leave no journal entry to mark reported.
-func UsesJournal(task capture.Request) bool {
-	return task.QueryTasksRequest == nil &&
-		task.CreateProjectRequest == nil &&
-		task.UpdateTaskRequest == nil &&
-		task.ArchiveTaskRequest == nil &&
-		task.ArchiveProjectRequest == nil &&
-		task.HeadingOperation == ""
-}
+// UsesJournal reports whether processing persists a write outcome.
+func UsesJournal(task capture.Request) bool { return task.QueryTasksRequest == nil }
 
 func isDestinationError(err error) bool {
 	var operationError *helper.OperationError
@@ -294,6 +263,9 @@ func missingTags(requested, applied []string) []string {
 }
 
 func appendWarning(notes, warning string) string {
+	if notes == warning || strings.Contains(notes, "\n\n"+warning) {
+		return notes
+	}
 	if notes == "" {
 		return warning
 	}

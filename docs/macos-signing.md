@@ -10,6 +10,18 @@ The installed file remains byte-for-byte the signed, attested release asset.
 The worker does not need a private signing key or access to a signing keychain.
 Local `make dist-mac` builds do not run this release signing step.
 
+The worker installer is a shell wrapper around the Go application and uses
+macOS's built-in `codesign` to check the public release certificate before
+executing a download. It does not require Python or Xcode Command Line Tools.
+The trusted Go installer then verifies both architectures and continuity with
+any installed signing certificate, preserves a private binary backup, stops
+the worker, and installs the new executable before running its setup wizard.
+`--no-setup` leaves the worker stopped until setup is run interactively.
+
+The public certificate fingerprint is pinned in `deploy/mac-worker-install.sh`.
+The release workflow checks that its configured signing identity matches this
+pin, so a changed CI secret cannot silently publish an incompatible installer.
+
 The updater checks each architecture before executing or installing a download.
 Every slice must use the same signing certificate, and a signed installation
 only accepts that same certificate with compatible designated requirements.
@@ -41,6 +53,8 @@ date, and responsible owner. Monitor expiry and plan renewal or compromise
 recovery before changing the identity. A replacement or reissued certificate
 can change the designated requirement even if its name is unchanged. Treat
 rotation as an attended permission migration, not an ordinary version update.
+Changing the release certificate also requires deliberately updating the
+installer's public pin and validating the new installation route.
 Do not assume self-signed certificates have Developer ID timestamp or
 revocation behavior.
 
@@ -82,7 +96,15 @@ production certificate or GitHub secrets are provisioned by this documentation.
 
 Stable signing supplies a consistent code identity; it does not grant macOS
 permissions. Existing ad-hoc builds have a different identity. The first move
-to the persistent certificate requires an attended migration on the Mac:
+to the persistent certificate requires an attended migration on the Mac.
+`things-index worker --setup` guides this process: it checks the signing
+identity, stops the worker for the permission step, opens Full Disk Access
+settings, and reveals the resolved executable. It verifies a readable stored
+grant against that executable. If macOS prevents that inspection, it requires
+explicit manual confirmation and reports that the stored grant is unverified.
+It never edits TCC or grants access automatically.
+
+The migration steps are:
 
 1. Install and verify the signed release at the actual launch agent executable
    path (normally `~/.local/bin/things-index`). Stop the worker while updating
@@ -90,10 +112,11 @@ to the persistent certificate requires an attended migration on the Mac:
 2. In System Settings → Privacy & Security → Full Disk Access, **remove the old
    ThingsIndex executable entry and add the newly signed executable**. Toggling
    an old entry alone can retain a stale code requirement. Enable the new entry.
-3. Re-run the worker's Automation preflight once; an existing successful
-   preflight marker does not validate the new identity. Follow the marker and
-   launch-agent restart instructions in [homelab.md](homelab.md), approve any
-   required Automation prompt, and check an actual Things AppleScript operation.
+3. Let setup re-run the worker's Automation preflight; an existing successful
+   preflight marker does not validate the new identity. Approve any required
+   Automation prompt. Setup checks fresh database access, the harmless Things
+   list-count Apple Event, and worker readiness, then repeats the checks after
+   a controlled restart. Failure leaves the worker stopped and setup incomplete.
 4. Confirm database access and worker health after a restart, then install a
    **different build signed with the same certificate** and repeat the checks
    without interacting with the Mac's screen. Include a login/reboot check for

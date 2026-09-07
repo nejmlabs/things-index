@@ -147,6 +147,14 @@ func NewHandler(store Queue, config Config) (http.Handler, error) {
 		Description: "Create a project in Things 3 using the requested title and optional area. After creation succeeds, use its things_id as destination.id when adding tasks to it.",
 	}, service.createProject))
 	register(toolschema.AddTool(mcpServer, &mcp.Tool{
+		Name:        "create_things_area",
+		Description: toolschema.AreaCreationDescription + " May return queued while the Mac is offline.",
+	}, service.createArea))
+	register(toolschema.AddTool(mcpServer, &mcp.Tool{
+		Name:        "create_things_tag",
+		Description: toolschema.TagCreationDescription + " May return queued while the Mac is offline.",
+	}, service.createTag))
+	register(toolschema.AddTool(mcpServer, &mcp.Tool{
 		Name:        "update_things_task",
 		Description: "Update, reschedule, or add notes/checklists to an existing task in Things 3.",
 	}, service.updateTask))
@@ -432,6 +440,7 @@ func (s *service) createHeading(ctx context.Context, _ *mcp.CallToolRequest, inp
 		return nil, CaptureResult{}, fmt.Errorf("invalid heading request: %w", err)
 	}
 	task := capture.Request{
+		TaskFields:       capture.TaskFields{IdempotencyKey: input.IdempotencyKey},
 		HeadingOperation: "create",
 		HeadingRequest:   &input,
 	}
@@ -451,6 +460,7 @@ func (s *service) archiveHeading(ctx context.Context, _ *mcp.CallToolRequest, in
 		return nil, CaptureResult{}, fmt.Errorf("invalid heading request: %w", err)
 	}
 	task := capture.Request{
+		TaskFields:       capture.TaskFields{IdempotencyKey: input.IdempotencyKey},
 		HeadingOperation: "archive",
 		HeadingRequest:   &input,
 	}
@@ -473,6 +483,7 @@ func (s *service) renameHeading(ctx context.Context, _ *mcp.CallToolRequest, inp
 		return nil, CaptureResult{}, errors.New("new_title is required when renaming a heading")
 	}
 	task := capture.Request{
+		TaskFields:       capture.TaskFields{IdempotencyKey: input.IdempotencyKey},
 		HeadingOperation: "rename",
 		HeadingRequest:   &input,
 	}
@@ -492,6 +503,7 @@ func (s *service) archiveTask(ctx context.Context, _ *mcp.CallToolRequest, input
 		return nil, CaptureResult{}, fmt.Errorf("invalid archive task request: %w", err)
 	}
 	task := capture.Request{
+		TaskFields:         capture.TaskFields{IdempotencyKey: input.IdempotencyKey},
 		ArchiveTaskRequest: &input,
 	}
 	job, err := s.queue.Enqueue(ctx, task)
@@ -510,6 +522,7 @@ func (s *service) archiveProject(ctx context.Context, _ *mcp.CallToolRequest, in
 		return nil, CaptureResult{}, fmt.Errorf("invalid archive project request: %w", err)
 	}
 	task := capture.Request{
+		TaskFields:            capture.TaskFields{IdempotencyKey: input.IdempotencyKey},
 		ArchiveProjectRequest: &input,
 	}
 	job, err := s.queue.Enqueue(ctx, task)
@@ -588,6 +601,7 @@ func (s *service) createProject(ctx context.Context, _ *mcp.CallToolRequest, inp
 		return nil, CaptureResult{}, fmt.Errorf("invalid create project request: %w", err)
 	}
 	task := capture.Request{
+		TaskFields:           capture.TaskFields{IdempotencyKey: input.IdempotencyKey},
 		CreateProjectRequest: &input,
 	}
 	job, err := s.queue.Enqueue(ctx, task)
@@ -601,11 +615,50 @@ func (s *service) createProject(ctx context.Context, _ *mcp.CallToolRequest, inp
 	return nil, result, nil
 }
 
+func (s *service) createArea(ctx context.Context, _ *mcp.CallToolRequest, input capture.CreateAreaRequest) (*mcp.CallToolResult, CaptureResult, error) {
+	if err := input.Validate(); err != nil {
+		return nil, CaptureResult{}, fmt.Errorf("invalid create area request: %w", err)
+	}
+	task := capture.Request{
+		TaskFields:        capture.TaskFields{IdempotencyKey: input.IdempotencyKey},
+		CreateAreaRequest: &input,
+	}
+	job, err := s.queue.Enqueue(ctx, task)
+	if err != nil {
+		return nil, CaptureResult{}, fmt.Errorf("queue create area: %w", err)
+	}
+	result, err := s.waitForResult(ctx, job.ID, s.config.WaitForResult)
+	if err != nil {
+		return nil, CaptureResult{}, err
+	}
+	return nil, result, nil
+}
+
+func (s *service) createTag(ctx context.Context, _ *mcp.CallToolRequest, input capture.CreateTagRequest) (*mcp.CallToolResult, CaptureResult, error) {
+	if err := input.Validate(); err != nil {
+		return nil, CaptureResult{}, fmt.Errorf("invalid create tag request: %w", err)
+	}
+	task := capture.Request{
+		TaskFields:       capture.TaskFields{IdempotencyKey: input.IdempotencyKey},
+		CreateTagRequest: &input,
+	}
+	job, err := s.queue.Enqueue(ctx, task)
+	if err != nil {
+		return nil, CaptureResult{}, fmt.Errorf("queue create tag: %w", err)
+	}
+	result, err := s.waitForResult(ctx, job.ID, s.config.WaitForResult)
+	if err != nil {
+		return nil, CaptureResult{}, err
+	}
+	return nil, result, nil
+}
+
 func (s *service) updateTask(ctx context.Context, _ *mcp.CallToolRequest, input capture.UpdateTaskRequest) (*mcp.CallToolResult, CaptureResult, error) {
 	if err := input.Validate(); err != nil {
 		return nil, CaptureResult{}, fmt.Errorf("invalid update task request: %w", err)
 	}
 	task := capture.Request{
+		TaskFields:        capture.TaskFields{IdempotencyKey: input.IdempotencyKey},
 		UpdateTaskRequest: &input,
 	}
 	job, err := s.queue.Enqueue(ctx, task)

@@ -81,7 +81,7 @@ func (s *Store) configure(ctx context.Context) error {
 			return fmt.Errorf("configure journal: %w", err)
 		}
 	}
-	return nil
+	return s.configureOperations(ctx)
 }
 
 func (s *Store) Ensure(ctx context.Context, jobID, payloadHash string) (Entry, bool, error) {
@@ -94,6 +94,9 @@ func (s *Store) Ensure(ctx context.Context, jobID, payloadHash string) (Entry, b
 		VALUES (?, ?, 'received', ?)
 		ON CONFLICT(job_id) DO NOTHING`, jobID, payloadHash, now)
 	if err != nil {
+		if err.Error() == "journal job kind conflict" {
+			return Entry{}, false, ErrPayloadMismatch
+		}
 		return Entry{}, false, fmt.Errorf("record delivery: %w", err)
 	}
 	affected, err := result.RowsAffected()
@@ -128,16 +131,15 @@ func (s *Store) Get(ctx context.Context, jobID string) (Entry, error) {
 	return entry, nil
 }
 
-// PruneReported removes delivery records that are reported or finalised
-// older than the retention cutoff. Incomplete records (received, creating,
-// created) are retained for crash recovery.
+// PruneReported removes only acknowledged delivery/write records. An applied
+// but unacknowledged operation must survive so redelivery cannot repeat it.
 func (s *Store) PruneReported(ctx context.Context, before time.Time) (int64, error) {
 	if before.IsZero() {
 		return 0, nil
 	}
 	result, err := s.db.ExecContext(ctx, `
 		DELETE FROM deliveries
-		WHERE state IN ('reported', 'finalised') AND updated_at < ?`, before.UTC().UnixMilli())
+		WHERE state = 'reported' AND updated_at < ?`, before.UTC().UnixMilli())
 	if err != nil {
 		return 0, fmt.Errorf("prune reported deliveries: %w", err)
 	}
@@ -145,7 +147,12 @@ func (s *Store) PruneReported(ctx context.Context, before time.Time) (int64, err
 	if err != nil {
 		return 0, fmt.Errorf("inspect pruned reported deliveries: %w", err)
 	}
-	return count, nil
+	operations, err := s.db.ExecContext(ctx, `DELETE FROM operations WHERE state='reported' AND updated_at < ?`, before.UTC().UnixMilli())
+	if err != nil {
+		return count, fmt.Errorf("prune reported writes: %w", err)
+	}
+	writes, err := operations.RowsAffected()
+	return count + writes, err
 }
 
 func (s *Store) MarkCreating(ctx context.Context, jobID string) error {

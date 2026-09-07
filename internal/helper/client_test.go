@@ -206,12 +206,15 @@ func TestClientCaptureAndFind(t *testing.T) {
 				}
 				return nil
 			case "/usr/bin/open":
-				// Simulate Things creating the task with the pending marker
-				// title and no request reference in the notes, matching what
-				// the real add URL produces.
-				macEpoch := time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC)
-				nowEpoch := time.Now().UTC().Sub(macEpoch).Seconds()
-				_, execErr := db.Exec(`INSERT INTO TMTask (uuid, type, title, notes, project, creationDate, trashed) VALUES ('task-1', 0, 'ThingsIndex pending [`+testRequestID+`]', '', 'proj-1', ?, 0)`, nowEpoch)
+				parsed, parseErr := url.Parse(args[len(args)-1])
+				if parseErr != nil {
+					return parseErr
+				}
+				if parsed.Path != "/add" {
+					return nil // Hidden app launch during explicit finalisation.
+				}
+				query := parsed.Query()
+				_, execErr := db.Exec(`INSERT INTO TMTask (uuid, type, title, notes, project, creationDate, trashed) VALUES ('task-1', 0, ?, ?, 'proj-1', ?, 0)`, query.Get("title"), query.Get("notes"), macEpochSeconds(time.Now()))
 				return execErr
 			default:
 				t.Fatalf("unexpected executable: %s", executable)
@@ -228,6 +231,7 @@ func TestClientCaptureAndFind(t *testing.T) {
 
 	task := capture.Request{TaskFields: capture.TaskFields{
 		Title:       "Buy milk",
+		Notes:       "Glass bottles",
 		Destination: &capture.Destination{Kind: capture.DestinationProject, Name: "Shopping"},
 		Tags:        []string{"Errand", "UnknownTag"},
 	}}
@@ -243,26 +247,38 @@ func TestClientCaptureAndFind(t *testing.T) {
 		t.Fatalf("unexpected applied tags: %#v", resp.AppliedTags)
 	}
 
-	// The pending marker must have been renamed to the final title inline.
+	// Capture can finish before the worker durably records the returned UUID.
+	// Its pending marker must survive that crash window, together with warnings.
+	var pendingTitle string
+	if err := db.QueryRow(`SELECT title FROM TMTask WHERE uuid = 'task-1'`).Scan(&pendingTitle); err != nil {
+		t.Fatal(err)
+	}
+	if pendingTitle != "ThingsIndex pending ["+testRequestID+"]" {
+		t.Fatalf("capture removed its recovery marker: %q", pendingTitle)
+	}
+	ids, err := client.FindCapture(context.Background(), testRequestID)
+	if err != nil || len(ids) != 1 || ids[0] != resp.ID {
+		t.Fatalf("cannot recover returned task: IDs=%v error=%v", ids, err)
+	}
+	notes, err := client.ReadCaptureNotes(context.Background(), resp.ID)
+	warning := `ThingsIndex warning: tag "UnknownTag" did not exist and was not applied.`
+	if err != nil || notes != "Glass bottles\n\n"+warning || len(resp.Warnings) != 1 || resp.Warnings[0] != warning {
+		t.Fatalf("capture lost warning: notes=%q response=%+v error=%v", notes, resp, err)
+	}
+	if task.Notes != "Glass bottles" {
+		t.Fatalf("capture changed caller's notes: %q", task.Notes)
+	}
+
+	if err := client.FinaliseCapture(context.Background(), resp.ID, task.Title); err != nil {
+		t.Fatal(err)
+	}
 	var finalTitle string
 	if err := db.QueryRow(`SELECT title FROM TMTask WHERE uuid = 'task-1'`).Scan(&finalTitle); err != nil {
 		t.Fatal(err)
 	}
-	if finalTitle != "Buy milk" {
-		t.Fatalf("title after capture = %q, want %q", finalTitle, "Buy milk")
-	}
-
-	// FindCapture reconciles in-flight captures by their pending marker title.
-	const otherRequestID = "00000000000000000000000000000002"
-	if _, err := db.Exec(`INSERT INTO TMTask (uuid, type, title, notes, trashed) VALUES ('task-2', 0, 'ThingsIndex pending [` + otherRequestID + `]', '', 0)`); err != nil {
-		t.Fatal(err)
-	}
-	ids, err := client.FindCapture(context.Background(), otherRequestID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(ids) != 1 || ids[0] != "task-2" {
-		t.Fatalf("unexpected found IDs: %#v", ids)
+	ids, err = client.FindCapture(context.Background(), testRequestID)
+	if err != nil || len(ids) != 0 || finalTitle != task.Title {
+		t.Fatalf("explicit finalisation failed: title=%q IDs=%v error=%v", finalTitle, ids, err)
 	}
 }
 
@@ -286,6 +302,152 @@ func TestClientPreflightDestinationErrors(t *testing.T) {
 	}
 }
 
+func TestFindCaptureRequiresExactLiveTaskMarker(t *testing.T) {
+	t.Parallel()
+	client, db, _ := projectCaptureFixture(t)
+	marker := "ThingsIndex pending [" + testRequestID + "]"
+	for _, row := range []struct {
+		id, title, notes string
+		kind, trashed    int
+	}{
+		{"pending", marker, "", 0, 0},
+		{"project", marker, "", 1, 0},
+		{"heading", marker, "", 2, 0},
+		{"trash", marker, "", 0, 1},
+		{"unrelated", "Existing task", "Reference " + testRequestID, 0, 0},
+	} {
+		if _, err := db.Exec(`INSERT INTO TMTask (uuid,type,title,notes,trashed) VALUES (?,?,?,?,?)`, row.id, row.kind, row.title, row.notes, row.trashed); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ids, err := client.FindCapture(context.Background(), testRequestID)
+	if err != nil || len(ids) != 1 || ids[0] != "pending" {
+		t.Fatalf("recovery matched unrelated records: IDs=%v error=%v", ids, err)
+	}
+}
+
+func TestCaptureUnknownTagsRemainExplicit(t *testing.T) {
+	t.Parallel()
+	client, _, adds := projectCaptureFixture(t)
+	warning := `ThingsIndex warning: tag "Missing" did not exist and was not applied.`
+	response, err := client.Capture(context.Background(), testRequestID, capture.Request{TaskFields: capture.TaskFields{
+		Title: "Task", Notes: "Original\n\n" + warning, Tags: []string{"Missing"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.AppliedTags == nil || len(response.AppliedTags) != 0 || len(response.Warnings) != 1 || response.Warnings[0] != warning {
+		t.Fatalf("unknown tags were not reported explicitly: %+v", response)
+	}
+	if len(*adds) != 1 || (*adds)[0].Get("tags") != "" || strings.Count((*adds)[0].Get("notes"), warning) != 1 {
+		t.Fatalf("unexpected warning or tag dispatch: %v", *adds)
+	}
+}
+
+func TestCaptureTagReadFailurePreventsDispatch(t *testing.T) {
+	t.Parallel()
+	for _, setup := range []string{`DROP TABLE TMTag`, `INSERT INTO TMTag (uuid,title) VALUES ('invalid',NULL)`} {
+		t.Run(setup, func(t *testing.T) {
+			client, db, _ := projectCaptureFixture(t)
+			if _, err := db.Exec(setup); err != nil {
+				t.Fatal(err)
+			}
+			runner := &scriptedRunner{}
+			client.Runner = runner
+			_, err := client.Capture(context.Background(), testRequestID, capture.Request{TaskFields: capture.TaskFields{Title: "Task", Tags: []string{"Important"}}})
+			if err == nil || !strings.Contains(err.Error(), "Things tag") || len(runner.calls) != 0 {
+				t.Fatalf("tag read failure allowed mutation: error=%v calls=%v", err, runner.calls)
+			}
+		})
+	}
+}
+
+type captureContextRunner func(context.Context, string, []string) ([]byte, []byte, error)
+
+func (run captureContextRunner) Run(ctx context.Context, executable string, args []string) ([]byte, []byte, error) {
+	return run(ctx, executable, args)
+}
+
+func TestCaptureInterruptedDispatchRemainsRecoverableAndRestoresApp(t *testing.T) {
+	t.Parallel()
+	for _, timeout := range []bool{false, true} {
+		name := "cancelled"
+		if timeout {
+			name = "command deadline"
+		}
+		t.Run(name, func(t *testing.T) {
+			client, db, _ := projectCaptureFixture(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			running, openCalls, quits := false, 0, 0
+			client.Runner = captureContextRunner(func(commandCtx context.Context, executable string, args []string) ([]byte, []byte, error) {
+				switch executable {
+				case "/usr/bin/pgrep":
+					if !running {
+						return nil, nil, errors.New("not running")
+					}
+				case "/usr/bin/open":
+					openCalls++
+					running = true
+					if _, err := db.Exec(`INSERT INTO TMTask (uuid,type,title,notes,creationDate) VALUES ('created',0,?,'Saved notes',?)`, "ThingsIndex pending ["+testRequestID+"]", macEpochSeconds(time.Now())); err != nil {
+						t.Fatal(err)
+					}
+					if timeout {
+						return nil, nil, context.DeadlineExceeded
+					}
+					cancel()
+				case "/usr/bin/osascript":
+					if commandCtx.Err() != nil || !strings.Contains(args[1], "quit") {
+						t.Fatalf("cleanup did not receive a usable context: %v %v", commandCtx.Err(), args)
+					}
+					quits++
+					running = false
+				default:
+					t.Fatalf("unexpected command %s", executable)
+				}
+				return nil, nil, nil
+			})
+			_, err := client.Capture(ctx, testRequestID, capture.Request{TaskFields: capture.TaskFields{Title: "Task"}})
+			want := context.Canceled
+			if timeout {
+				want = context.DeadlineExceeded
+			}
+			if !errors.Is(err, want) || openCalls != 1 || running || quits != 1 {
+				t.Fatalf("interruption was mishandled: error=%v dispatches=%d running=%v quits=%d", err, openCalls, running, quits)
+			}
+			ids, err := client.FindCapture(context.Background(), testRequestID)
+			if err != nil || len(ids) != 1 || ids[0] != "created" {
+				t.Fatalf("dispatched task cannot be recovered: IDs=%v error=%v", ids, err)
+			}
+		})
+	}
+}
+
+// Older fixtures used Cocoa timestamps. Retain them to prove that capture
+// identity does not depend on interpreting Things' private timestamp format.
+func macEpochSeconds(t time.Time) float64 {
+	return t.UTC().Sub(time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC)).Seconds()
+}
+
+func TestCaptureRejectsDuplicatePendingMarkers(t *testing.T) {
+	t.Parallel()
+	client, db, _ := projectCaptureFixture(t)
+	dispatches := 0
+	client.Runner = &scriptedRunner{handler: func(executable string, args []string) ([]byte, []byte, error) {
+		if executable == "/usr/bin/open" {
+			dispatches++
+			_, err := db.Exec(`INSERT INTO TMTask (uuid,type,title,creationDate) VALUES ('one',0,?,1),('two',0,?,1788662741)`, "ThingsIndex pending ["+testRequestID+"]", "ThingsIndex pending ["+testRequestID+"]")
+			return nil, nil, err
+		}
+		return nil, nil, nil
+	}}
+	response, err := client.Capture(context.Background(), testRequestID, capture.Request{TaskFields: capture.TaskFields{Title: "Task"}})
+	requireUpdateError(t, err, "capture_ambiguous")
+	if response.ID != "" || dispatches != 1 {
+		t.Fatalf("duplicate marker selected or creation repeated: response=%+v dispatches=%d", response, dispatches)
+	}
+}
+
 func TestClientFinaliseCapture(t *testing.T) {
 	t.Parallel()
 
@@ -296,7 +458,7 @@ func TestClientFinaliseCapture(t *testing.T) {
 	}
 	defer db.Close()
 
-	if _, err := db.Exec(`INSERT INTO TMTask (uuid, type, title) VALUES ('task-1', 0, 'ThingsIndex pending [123]')`); err != nil {
+	if _, err := db.Exec(`INSERT INTO TMTask (uuid, type, title) VALUES ('task-1', 0, ?)`, "ThingsIndex pending ["+testRequestID+"]"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -336,7 +498,7 @@ func TestClientFinaliseCaptureFailsWhenRenameNeverLands(t *testing.T) {
 	}
 	defer db.Close()
 
-	if _, err := db.Exec(`INSERT INTO TMTask (uuid, type, title) VALUES ('task-1', 0, 'ThingsIndex pending [123]')`); err != nil {
+	if _, err := db.Exec(`INSERT INTO TMTask (uuid, type, title) VALUES ('task-1', 0, ?)`, "ThingsIndex pending ["+testRequestID+"]"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -356,40 +518,124 @@ func TestClientFinaliseCaptureFailsWhenRenameNeverLands(t *testing.T) {
 	}
 }
 
+func TestFinaliseCapturePreservesManualChangesAndRejectsNonTasks(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, storedTitle, wantCode string
+		kind, trashed               int
+	}{
+		{name: "manual rename", storedTitle: "User revised this task", wantCode: "finalise_conflict"},
+		{name: "short marker", storedTitle: "ThingsIndex pending [123]", wantCode: "finalise_conflict"},
+		{name: "marker prefix", storedTitle: "Edited ThingsIndex pending [" + testRequestID + "]", wantCode: "finalise_conflict"},
+		{name: "marker suffix", storedTitle: "ThingsIndex pending [" + testRequestID + "] edited", wantCode: "finalise_conflict"},
+		{name: "project", storedTitle: "ThingsIndex pending [" + testRequestID + "]", kind: 1, wantCode: "finalise_not_found"},
+		{name: "heading already titled", storedTitle: "Final", kind: 2, wantCode: "finalise_not_found"},
+		{name: "trashed", storedTitle: "ThingsIndex pending [" + testRequestID + "]", trashed: 1, wantCode: "finalise_not_found"},
+		{name: "already finalised", storedTitle: "Final"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client, db, _ := projectCaptureFixture(t)
+			if _, err := db.Exec(`INSERT INTO TMTask (uuid,type,title,trashed) VALUES ('target',?,?,?)`, tc.kind, tc.storedTitle, tc.trashed); err != nil {
+				t.Fatal(err)
+			}
+			runner := &scriptedRunner{}
+			client.Runner = runner
+			err := client.FinaliseCapture(context.Background(), "target", "Final")
+			var opErr *OperationError
+			if tc.wantCode == "" && err != nil || tc.wantCode != "" && (!errors.As(err, &opErr) || opErr.Code != tc.wantCode) {
+				t.Fatalf("unexpected finalisation result: %v", err)
+			}
+			var storedTitle string
+			if err := db.QueryRow(`SELECT title FROM TMTask WHERE uuid='target'`).Scan(&storedTitle); err != nil {
+				t.Fatal(err)
+			}
+			if len(runner.calls) != 0 || storedTitle != tc.storedTitle {
+				t.Fatalf("finalisation changed unrelated/user-edited task: calls=%v title=%q", runner.calls, storedTitle)
+			}
+		})
+	}
+}
+
+func TestFinaliseCaptureRestoresRunningStateOnSuccessAndDeadline(t *testing.T) {
+	t.Parallel()
+	for _, token := range []string{"", "auth-token"} {
+		for _, initiallyRunning := range []bool{false, true} {
+			for _, applyRename := range []bool{false, true} {
+				name := "AppleScript"
+				if token != "" {
+					name = "URL"
+				}
+				if initiallyRunning {
+					name += "/running"
+				}
+				if applyRename {
+					name += "/success"
+				}
+				t.Run(name, func(t *testing.T) {
+					client, db, _ := projectCaptureFixture(t)
+					if _, err := db.Exec(`INSERT INTO TMTask (uuid,type,title) VALUES ('pending',0,?)`, "ThingsIndex pending ["+testRequestID+"]"); err != nil {
+						t.Fatal(err)
+					}
+					running, quits := initiallyRunning, 0
+					client.AuthToken = token
+					client.VerifyWindow = time.Second
+					client.Runner = captureContextRunner(func(commandCtx context.Context, executable string, args []string) ([]byte, []byte, error) {
+						rename := false
+						switch executable {
+						case "/usr/bin/pgrep":
+							if !running {
+								return nil, nil, errors.New("not running")
+							}
+						case "/usr/bin/open":
+							if len(args) < 3 || args[0] != "-g" || args[1] != "-j" {
+								t.Fatalf("launch was not hidden: %v", args)
+							}
+							running = true
+							rename = strings.HasPrefix(args[len(args)-1], "things:///update?")
+						case "/usr/bin/osascript":
+							if !running || commandCtx.Err() != nil {
+								t.Fatalf("Apple Event without a running app and live context: running=%v error=%v", running, commandCtx.Err())
+							}
+							if strings.Contains(args[1], "quit") {
+								running = false
+								quits++
+							}
+							rename = strings.Contains(args[1], "set name of")
+						default:
+							t.Fatalf("unexpected command: %s", executable)
+						}
+						if rename && applyRename {
+							_, err := db.Exec(`UPDATE TMTask SET title = 'Final' WHERE uuid = 'pending'`)
+							return nil, nil, err
+						}
+						return nil, nil, nil
+					})
+					ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+					defer cancel()
+					err := client.FinaliseCapture(ctx, "pending", "Final")
+					if applyRename && err != nil || !applyRename && !errors.Is(err, context.DeadlineExceeded) {
+						t.Fatalf("unexpected finalisation result: %v", err)
+					}
+					wantQuits := 1
+					if initiallyRunning {
+						wantQuits = 0
+					}
+					if running != initiallyRunning || quits != wantQuits {
+						t.Fatalf("finalisation changed running state: running=%v quits=%d", running, quits)
+					}
+				})
+			}
+		}
+	}
+}
+
 func TestUpdateTaskVerifiesAppliedChanges(t *testing.T) {
 	t.Parallel()
-
-	dbPath := setupTestThingsDB(t)
-	db, err := sql.Open("sqlite3", dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	if _, err := db.Exec(`INSERT INTO TMTask (uuid, type, title, userModificationDate) VALUES ('task-1', 0, 'Old title', 100)`); err != nil {
-		t.Fatal(err)
-	}
-
-	runner := &mockRunner{
-		onRun: func(executable string, args []string) error {
-			switch executable {
-			case "/usr/bin/pgrep":
-				return nil // Things is running, so no quit follows
-			case "/usr/bin/open":
-				_, execErr := db.Exec(`UPDATE TMTask SET title = 'New title', userModificationDate = 200 WHERE uuid = 'task-1'`)
-				return execErr
-			default:
-				t.Fatalf("unexpected executable: %s", executable)
-				return nil
-			}
-		},
-	}
-
-	client := &Client{
-		DBPath:       dbPath,
-		AuthToken:    "token-123",
-		Runner:       runner,
-		VerifyWindow: 300 * time.Millisecond,
+	client, runner := newTaskUpdateTestClient(t)
+	runner.onDispatch = func(values url.Values) error {
+		runner.activation = values.Get("when")
+		_, err := runner.db.Exec(`UPDATE TMTask SET title=?,todayIndex=0,startBucket=0,userModificationDate=200 WHERE uuid='task-1'`, values.Get("title"))
+		return err
 	}
 
 	resp, err := client.UpdateTask(context.Background(), capture.UpdateTaskRequest{
@@ -403,8 +649,8 @@ func TestUpdateTaskVerifiesAppliedChanges(t *testing.T) {
 	if !resp.OK || resp.ID != "task-1" {
 		t.Fatalf("unexpected response: %+v", resp)
 	}
-	if len(runner.lastArgs) != 2 || !strings.Contains(runner.lastArgs[1], "when=today") {
-		t.Fatalf("dispatched URL missing when=today: %v", runner.lastArgs)
+	if len(runner.dispatches) != 1 || runner.dispatches[0].Get("when") != "2026-09-05" {
+		t.Fatalf("dispatched URL did not preserve prepared today date: %v", runner.dispatches)
 	}
 }
 
@@ -784,12 +1030,22 @@ func TestPingHelperShortcut(t *testing.T) {
 func TestAutomationPreflight(t *testing.T) {
 	t.Parallel()
 
+	running := false
 	var runner *scriptedRunner
 	runner = &scriptedRunner{handler: func(executable string, args []string) ([]byte, []byte, error) {
 		switch executable {
 		case "/usr/bin/pgrep":
+			if running {
+				return nil, nil, nil
+			}
 			return nil, nil, errors.New("not running")
-		case "/usr/bin/open", "/usr/bin/osascript":
+		case "/usr/bin/open":
+			running = true
+			return nil, nil, nil
+		case "/usr/bin/osascript":
+			if strings.Contains(args[1], "quit") {
+				running = false
+			}
 			return nil, nil, nil
 		}
 		t.Fatalf("unexpected executable %s", executable)
@@ -802,11 +1058,11 @@ func TestAutomationPreflight(t *testing.T) {
 	}
 	// Things was not running: expect launch, the consent-raising Apple Event,
 	// and the quit that restores the no-Dock-icon state.
-	if len(runner.calls) != 4 {
+	if len(runner.calls) != 5 || running {
 		t.Fatalf("unexpected command sequence: %v", runner.calls)
 	}
 	if runner.calls[1][0] != "/usr/bin/open" || !strings.Contains(strings.Join(runner.calls[2], " "), "count of lists") ||
-		!strings.Contains(strings.Join(runner.calls[3], " "), "quit") {
+		!strings.Contains(strings.Join(runner.calls[4], " "), "quit") {
 		t.Fatalf("unexpected command sequence: %v", runner.calls)
 	}
 }
@@ -825,6 +1081,35 @@ func TestAutomationPreflightSurfacesDenial(t *testing.T) {
 	err := client.AutomationPreflight(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "Automation") {
 		t.Fatalf("expected consent-denial guidance, got %v", err)
+	}
+}
+
+func TestAutomationPreflightAllowsAttendedConsentWithinCallerDeadline(t *testing.T) {
+	t.Parallel()
+	for _, callerTimeout := range []time.Duration{0, time.Second} {
+		ctx := context.Background()
+		if callerTimeout != 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, callerTimeout)
+			defer cancel()
+		}
+		calls := 0
+		client := &Client{Timeout: time.Millisecond, Runner: captureContextRunner(func(commandCtx context.Context, _ string, _ []string) ([]byte, []byte, error) {
+			calls++
+			deadline, ok := commandCtx.Deadline()
+			remaining := time.Until(deadline)
+			maximum := 2 * time.Minute
+			if callerTimeout != 0 {
+				maximum = callerTimeout
+			}
+			if !ok || remaining <= maximum/2 || remaining > maximum {
+				t.Fatalf("unexpected consent command allowance: %v", remaining)
+			}
+			return nil, nil, nil // Things is already running.
+		})}
+		if err := client.AutomationPreflight(ctx); err != nil || calls != 2 {
+			t.Fatalf("unexpected preflight result: error=%v calls=%d", err, calls)
+		}
 	}
 }
 
