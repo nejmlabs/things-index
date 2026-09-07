@@ -8,10 +8,29 @@ Pebble Cloud ──HTTPS──> reverse proxy ──private HTTP──> Linux se
                                                               ▲
                                                               │ private HTTPS
                                                               │
-Things <── native Shortcut <── Mac worker ─────────────────────┘
+Things <── native automation <── Mac worker ───────────────────┘
 ```
 
+For a first installation, use the [Proxmox or Docker steps in the main
+README](../README.md#option-2-homelab--distributed-mode-proxmox--docker--mac-mini),
+then configure the private HTTPS route and follow [Mac worker](#mac-worker)
+below. Linux commands run on the server; Mac commands run as the user who owns
+Things. The detailed manual Linux installation below is an alternative to the
+automated installers.
+
 ## Linux server
+
+For the manual commands in this section, use a **root shell on a Debian/Ubuntu
+Linux server**, not Terminal on the Mac. Other distributions need equivalent
+package and architecture commands. First obtain the configuration examples;
+both the release-binary and source-build paths use this checkout:
+
+```sh
+apt-get update
+apt-get install -y curl git ca-certificates
+git clone https://github.com/nejmlabs/things-index.git
+cd things-index
+```
 
 Give the server a stable private address and set `THINGS_INDEX_LISTEN_ADDR` to
 that exact address, for example `192.168.1.50:8080`. The binary rejects
@@ -24,7 +43,7 @@ and break silently when it changes.
 
 Install the server as `/usr/local/bin/things-index-server`. The fast path is
 the static release binary (amd64 and arm64, provenance-attested like the Mac
-asset, runs on any distro):
+asset; no Go compiler is needed):
 
 ```sh
 curl -fL -o /usr/local/bin/things-index-server \
@@ -39,11 +58,9 @@ Or build it natively (the Proxmox installer automates this whole section):
 ```sh
 # Go 1.26+ (distribution-packaged Go is usually too old) plus a C toolchain;
 # the CGO SQLite build wants roughly 2GB of free memory or it thrashes.
-apt-get install -y git build-essential ca-certificates
+apt-get install -y build-essential
 curl -fsSL "https://go.dev/dl/go1.26.0.linux-$(dpkg --print-architecture).tar.gz" | tar -C /usr/local -xz
 
-git clone https://github.com/nejmlabs/things-index.git
-cd things-index
 /usr/local/go/bin/go build -o /usr/local/bin/things-index-server ./cmd/things-index-server
 ```
 
@@ -57,14 +74,21 @@ mkdir -p /etc/things-index /var/lib/things-index
 chown things-index:things-index /var/lib/things-index
 install -m 600 deploy/systemd/server.env.example /etc/things-index/server.env
 install -m 644 deploy/systemd/things-index-server.service /etc/systemd/system/
-# edit /etc/things-index/server.env (listen address + the three tokens), then:
+```
+
+**Before starting the service**, open `/etc/things-index/server.env` in your
+preferred text editor. Set the server's listen address and replace both token
+placeholders, generating each separately with `openssl rand -hex 32`. The
+dashboard token is optional. Save the file, keeping it root-owned with mode
+`0600`, then start the service:
+
+```sh
 systemctl daemon-reload
 systemctl enable --now things-index-server
 ```
 
-Set distinct public and worker tokens in `/etc/things-index/server.env`, make
-the file root-owned with mode `0600`, and restrict the host firewall so port
-8080 accepts traffic only from the reverse proxy, for example:
+Restrict the host firewall so port 8080 accepts traffic only from the reverse
+proxy. For example, on a host with UFW installed:
 
 ```sh
 ufw default deny incoming
@@ -178,21 +202,32 @@ below pins the tunnel path explicitly.
 
 ## Mac worker
 
-The supported path is the one-command installer, run in the logged-in Mac GUI
-session:
+Use **Terminal on the Mac, without `sudo`**, in the desktop session of the user
+who owns the Things library. Have macOS 14+, Things 3.17+ installed and opened
+once, and the Shortcuts app available. Keep the desktop visible for initial
+approvals. Have these values ready:
+
+| Setup value | Where it comes from |
+| --- | --- |
+| Server URL | The private worker **base URL**, e.g. `https://things-index-worker.internal.example.com`, without `/mcp` or `/worker`. An active SSH tunnel can use `http://127.0.0.1:8080`. |
+| Worker token | `THINGS_INDEX_WORKER_TOKEN` from the Linux server's configuration. This is different from the public MCP token. |
+| Things auth token (optional) | On the Mac: Things → Settings → General → Enable Things URLs → Manage. This unlocks additional task updates, including deadlines, tags and checklists. |
+
+The supported installation command is:
 
 ```sh
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/nejmlabs/things-index/main/deploy/mac-worker-install.sh)"
 ```
 
 It installs the latest released universal binary to `~/.local/bin`, verifying
-GitHub's build-provenance attestation when the `gh` CLI is available, and
-launches the setup wizard (`things-index worker --setup`, rerunnable anytime).
+GitHub's build-provenance attestation when an authenticated `gh` CLI is available,
+and launches the setup wizard (`~/.local/bin/things-index worker --setup`,
+rerunnable anytime). Use the full path if your shell says `command not found`.
 The shell wrapper verifies the pinned release signer before executing the
 download. Installation and permission setup run in Go; Python and Xcode
 Command Line Tools are not required. The installer retains the original binary
 in a private backup directory and prints its path.
-The wizard verifies the server URL and worker token against the live server, validates
+The wizard checks the server URL and worker token against the live server, validates
 the optional Things auth token with one disposable test task, installs the
 bundled ThingsIndex Helper shortcut and checks basic input and Things lookup access, and
 installs the LaunchAgent. Before accessing Things, it checks the executable's
@@ -201,6 +236,10 @@ It then checks fresh database access, Automation consent, and readiness through
 the daemon itself, and repeats the checks after a controlled restart. Failed
 startup checks leave the LaunchAgent stopped and disabled, with setup reporting
 an error instead of success.
+
+If setup warns that the server or token could not be checked, resolve that
+connection warning before unattended use; local worker readiness alone does
+not prove that queued MCP requests can reach it.
 
 During setup, open **System Settings > Privacy & Security > Full Disk Access**,
 click **+**, and add and enable the actual worker
@@ -225,9 +264,13 @@ Full Disk Access suppresses that prompt across restarts. It is a broad file
 access permission. Things Automation permission is separate: approve the
 worker's request to control Things. The Helper shortcut's setup ping checks
 basic input and Things lookup access; heading writes may need separate
-first-use approval. Verify heading operations through the background worker
-during attended setup before unattended use. [Apple explains App Data permission lifetime and
+first-use approval. Follow the [attended heading-permission steps](../shortcuts/README.md#first-run-verification)
+before testing heading writes through the background worker. [Apple explains App Data permission lifetime and
 Full Disk Access](https://developer.apple.com/videos/play/wwdc2023/10053/).
+
+After successful setup, the desktop may be locked. Keep the Mac awake and the
+Things user logged in; the LaunchAgent starts at login, so a reboot requires
+that user to log in again. Ordinary operation then needs no open Terminal.
 
 Releases through v0.2.5 use ad hoc signing. Their Full Disk Access entry can
 remain enabled while referring to an older binary's code hash. The release
@@ -274,6 +317,9 @@ worker accepts no inbound connections.
 
 ## Upgrading
 
+Update the **Mac worker first**, then the Linux server, so new server operations
+always have a compatible worker.
+
 - **Proxmox LXC** — run the update script on the Proxmox host; it finds the
   `things-index` container (or takes a CTID argument), raises memory for the
   build, pulls, rebuilds, restarts, and verifies `/healthz`. It refreshes the
@@ -287,7 +333,7 @@ worker accepts no inbound connections.
 - **Native systemd** — re-download the release binary (or repeat the native
   build, which needs the same ~2GB of free memory as at install time), then
   `systemctl restart things-index-server`.
-- **Mac worker** — `things-index update` self-updates: it queries the latest
+- **Mac worker** — `~/.local/bin/things-index update` self-updates: it queries the latest
   release, downloads that pinned tag's binary, verifies its provenance
   attestation when an authenticated `gh` CLI is available, smoke-tests it,
   and swaps it in before restarting the launchd agent. The `.old` backup is
@@ -304,7 +350,7 @@ worker accepts no inbound connections.
   preflight and startup checks:
 
   ```sh
-  things-index worker --setup
+  ~/.local/bin/things-index worker --setup
   ```
 
   Confirm the log reads "worker ready":
@@ -312,14 +358,20 @@ worker accepts no inbound connections.
   dialog without Full Disk Access does not prepare the next worker restart
   for unattended operation.
 
-Back up `/var/lib/things-index/queue.sqlite` on the server and the worker's
+Back up the server queue at `THINGS_INDEX_DB_PATH` (the manual example uses
+`/var/lib/things-index/queue.db`) and the worker's
 journal before upgrades that change their schema.
 
 ## Verification order
 
 1. Confirm `GET /healthz` through the private route.
-2. Start the Mac worker and confirm it remains in its long poll.
-3. Call the MCP endpoint with MCP Inspector using the public token.
+2. On the Mac, finish the setup wizard and confirm its startup **and restart**
+   checks pass. `~/.local/bin/things-index version` confirms the installed version;
+   the wizard's success banner confirms database/Automation readiness, not heading consent.
+3. Connect an MCP client to the **public URL ending in `/mcp`**, using
+   `THINGS_INDEX_PUBLIC_TOKEN` from the Linux configuration. This is not the
+   private worker URL/token. Complete the [heading checks](../shortcuts/README.md#first-run-verification)
+   while the Mac's desktop is still available.
 4. Create a disposable Inbox task and verify its temporary title was replaced.
 5. Test an exact project, area, and heading, plus This Evening, a reminder,
    deadline, tags, and checklist.
@@ -336,4 +388,6 @@ journal before upgrades that change their schema.
      https://things-index.example.com/healthz   # expect 404: not published
    ```
 
-7. Configure Pebble only after those checks pass.
+7. In Pebble's MCP configuration, use that public `/mcp` URL and public token
+   only after the checks pass. A queued response is not completion: wait for
+   `things_capture_status` to report success and check the item in Things.

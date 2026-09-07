@@ -16,7 +16,7 @@ installed for the same logged-in user that runs the worker.
 The supported onboarding path is the worker setup wizard:
 
 ```sh
-things-index worker --setup
+~/.local/bin/things-index worker --setup
 ```
 
 The wizard installs the Shortcut from the copy embedded in the binary (no
@@ -42,6 +42,85 @@ with Apple's built-in `shortcuts sign --mode anyone` command.
 
 The worker has no Cherri dependency. Cherri is only the pinned, optional
 maintainer tool used to rebuild the distributable Shortcut.
+
+## First-run verification
+
+The `ping` operation checks external input and performs one harmless lookup
+for an impossible Things ID; it does not create or edit anything. The setup
+wizard runs this check automatically after installing the Shortcut. A successful
+ping does not establish permission for heading writes, which may need separate
+first-use approval.
+
+For a manual ping from a **repository checkout**, run this from its root:
+
+```sh
+/usr/bin/shortcuts run "ThingsIndex Helper" \
+  --input-path "$PWD/shortcuts/examples/ping.json" \
+  --output-type public.json
+```
+
+To settle the write permissions, use **Terminal on the Mac with its desktop
+visible**, before sending heading writes through MCP. The background worker's
+30-second command deadline is too short to rely on while finding and approving
+first-use dialogs. The following direct commands need no repository checkout,
+Python or Go.
+
+1. In Things, create a new, empty project named **ThingsIndex Setup Check**. If
+   that name already exists, choose another unused name and replace the project
+   value in all three examples. These steps create, rename and complete one test
+   heading inside that project.
+2. In one Terminal window, prepare and run the create request:
+
+   ```sh
+   things_setup_dir=$(mktemp -d /tmp/things-index-setup.XXXXXX)
+   cat > "$things_setup_dir/create.json" <<'JSON'
+   {"schemaVersion":1,"operation":"create-heading","project":"ThingsIndex Setup Check","title":"Permission Check"}
+   JSON
+   /usr/bin/shortcuts run "ThingsIndex Helper" --input-path "$things_setup_dir/create.json" --output-type public.json
+   ```
+
+   Keep Shortcuts visible and approve the requested input/Things action access;
+   choose **Always Allow** if offered. Initial approval can take a few minutes.
+   Wait for JSON containing `"ok":true` and confirm **Permission Check** appears
+   in the project before continuing.
+3. Run the rename request in the same Terminal. It exercises Things' **Edit
+   Items / Title** action, which may need its own approval:
+
+   ```sh
+   cat > "$things_setup_dir/rename.json" <<'JSON'
+   {"schemaVersion":1,"operation":"rename-heading","project":"ThingsIndex Setup Check","heading":"Permission Check","title":"Permission Check Renamed"}
+   JSON
+   /usr/bin/shortcuts run "ThingsIndex Helper" --input-path "$things_setup_dir/rename.json" --output-type public.json
+   ```
+
+   Wait for `"ok":true` and confirm the new heading name in Things.
+4. Run the archive request. This exercises **Edit Items / Status**; approve any
+   separate first-use request and wait for `"ok":true`:
+
+   ```sh
+   cat > "$things_setup_dir/archive.json" <<'JSON'
+   {"schemaVersion":1,"operation":"archive-heading","project":"ThingsIndex Setup Check","heading":"Permission Check Renamed"}
+   JSON
+   /usr/bin/shortcuts run "ThingsIndex Helper" --input-path "$things_setup_dir/archive.json" --output-type public.json
+   ```
+
+If a command fails or is interrupted, inspect the project and the Shortcut's
+Privacy details before retrying. A missing reply does not prove the write did
+not happen; do not repeatedly dispatch an uncertain operation.
+
+Finally, use your connected MCP client to create a **different** heading named
+**Background Check** in that same project, rename it to **Background Check
+Renamed**, and archive it. Use `create_things_heading`, `rename_things_heading`
+and `archive_things_heading`, one at a time, waiting for each queued result to
+finish and checking Things. This entire second sequence must complete without
+clicks or approval dialogs. You can then move the disposable project to Trash
+in Things. The Shortcut ping and successful worker startup alone do not replace
+this background write check.
+
+The optional `capture-task.json` and `finalise-capture.json` fixtures exercise
+the two-step create/finalise contract. The capture fixture creates one clearly
+labelled disposable Inbox task. Copy its returned `id` into the finalise
+fixture before running that fixture.
 
 ## Safety contract
 
@@ -268,33 +347,6 @@ Use these stable codes where applicable:
 The final Shortcut action for every branch is `Stop and Output` with JSON text.
 The worker requests `public.json` output and rejects unknown fields, extra
 output, unsupported versions, and `ok: false` results.
-
-## First-run verification
-
-The `ping` operation checks external input and performs one harmless lookup
-for an impossible Things ID; it does not create or edit anything. The setup
-wizard runs this check automatically after installing the Shortcut. A successful
-ping does not establish permission for heading writes, which may need separate
-first-use approval.
-
-For manual verification, run it once from Terminal and approve the Shortcut's
-Things access during this deliberate setup run:
-
-```sh
-/usr/bin/shortcuts run "ThingsIndex Helper" \
-  --input-path "$PWD/shortcuts/examples/ping.json" \
-  --output-type public.json
-```
-
-Run the same command a second time and confirm that it returns its capabilities
-without a prompt. Then verify heading creation, renaming, and archiving through
-the background worker using a disposable project during attended setup. Resolve
-any first-use approval and verify background operations again before unattended use.
-
-The optional `capture-task.json` and `finalise-capture.json` fixtures exercise
-the two-step create/finalise contract. The capture fixture creates one clearly
-labelled disposable Inbox task. Copy its returned `id` into the finalise
-fixture before running that fixture.
 
 ## Maintainer rebuild
 

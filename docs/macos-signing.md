@@ -1,5 +1,10 @@
 # Stable macOS release signing
 
+**Installing or updating your Mac?** Follow [Mac worker setup](homelab.md#mac-worker)
+and the [one-time heading permissions](../shortcuts/README.md#first-run-verification).
+You do not need to create a certificate, install a private key, or configure
+GitHub secrets. The release-maintainer details below explain the signing setup.
+
 The macOS release workflow signs the final universal executable with one
 persistent certificate and the identifier `com.nejmlabs.things-index`. It then
 verifies both `arm64` and `x86_64` against that identifier and certificate before
@@ -97,7 +102,7 @@ production certificate or GitHub secrets are provisioned by this documentation.
 Stable signing supplies a consistent code identity; it does not grant macOS
 permissions. Existing ad-hoc builds have a different identity. The first move
 to the persistent certificate requires an attended migration on the Mac.
-`things-index worker --setup` guides this process: it checks the signing
+`~/.local/bin/things-index worker --setup` guides this process: it checks the signing
 identity, stops the worker for the permission step, opens Full Disk Access
 settings, and reveals the resolved executable. It verifies a readable stored
 grant against that executable. If macOS prevents that inspection, it requires
@@ -135,9 +140,11 @@ two different universal ThingsIndex builds through the release script and ran
 their `version` command without adding certificate trust. The real updater
 guard accepted a same-certificate update and legacy migration, and rejected a
 changed certificate, an uncertified candidate, and a missing architecture.
-**Actual Full Disk Access persistence
-and unattended worker operation across signed updates remain acceptance tests
-on the Mac mini.** [Apple: Allow apps to control other apps](https://support.apple.com/en-gb/guide/mac-help/mchl108e1718/mac)
+The v0.2.6 Mac mini validation preserved stored Full Disk Access and Automation
+records across signed updates and worker restarts. After separate attended
+Shortcut action approvals, background heading create/rename/archive also passed
+without interaction. These are results on the tested Mac, not a guarantee that
+future OS or Things changes cannot require approval. [Apple: Allow apps to control other apps](https://support.apple.com/en-gb/guide/mac-help/mchl108e1718/mac)
 
 ## Self-signing is not notarization
 
