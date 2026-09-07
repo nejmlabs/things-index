@@ -6,6 +6,10 @@ ThingsIndex is a Model Context Protocol (MCP) server for capturing, reading, sea
 
 ## ⚡ Quick Start & Onboarding
 
+For **Index 01 with a Mac mini**, follow **Option 2**: Linux hosts the MCP
+endpoint and queue; the Mac runs Things and processes the queued work. Option 1
+is for a client running locally on a Mac.
+
 ### Option 1: All-in-One Local Mac Mode
 For running directly on a Mac for local Claude Desktop or Cursor:
 
@@ -13,7 +17,7 @@ For running directly on a Mac for local Claude Desktop or Cursor:
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/nejmlabs/things-index/main/deploy/mac-install.sh)"
 ```
 
-This downloads the attested universal binary to `~/.local/bin` and ends with a choice: print the ready-to-paste Claude Desktop / Cursor stdio configuration, or start the local Streamable HTTP MCP server right away. Run `things-index install-shortcut` once to enable the heading tools in local mode (the worker wizard does this automatically in homelab mode).
+This downloads the attested universal binary to `~/.local/bin` and ends with a choice: print the ready-to-paste Claude Desktop / Cursor stdio configuration, or start the local Streamable HTTP MCP server right away. Run `~/.local/bin/things-index install-shortcut` once for heading tools in local mode, then complete the [one-time heading permissions](shortcuts/README.md#first-run-verification). The worker wizard installs the Shortcut automatically in homelab mode.
 
 Building from source instead: `make build`, then `./bin/things-index config` or `./bin/things-index start`.
 
@@ -22,8 +26,14 @@ Building from source instead: `make build`, then `./bin/things-index config` or 
 ### Option 2: Homelab / Distributed Mode (Proxmox / Docker + Mac mini)
 For 24/7 homelab infrastructure where the MCP server runs on Linux and leases jobs to a remote Mac:
 
+Have Things 3.17+ installed and opened once on macOS 14+, using the Mac account
+that owns your Things library. Initial setup needs that account's visible desktop
+for permission dialogs; run the Mac commands without `sudo`. After setup the
+screen can be locked, but the Mac must stay awake and that user must remain
+logged in. After a reboot, log in again to start the worker.
+
 1. **Deploy Server on Linux / Proxmox**:
-   * **Proxmox VE 1-Click LXC Installer**:
+   * **Proxmox VE 1-Click LXC Installer** — run in the **Proxmox host's root shell**:
      ```bash
      # Open to the LAN (the final banner prints the commands to tighten it later):
      bash -c "$(wget -qLO - https://raw.githubusercontent.com/nejmlabs/things-index/main/deploy/proxmox-install.sh)"
@@ -31,8 +41,10 @@ For 24/7 homelab infrastructure where the MCP server runs on Linux and leases jo
      # Or locked to your reverse proxy from the start (IPv4 or CIDR, validated up front):
      THINGS_INDEX_PROXY_IP=<proxy-ip> bash -c "$(wget -qLO - https://raw.githubusercontent.com/nejmlabs/things-index/main/deploy/proxmox-install.sh)"
      ```
-   * **Docker Compose** (the server refuses to start without tokens):
+   * **Docker Compose** — run on the **Docker host** from a repository checkout (the server refuses to start without tokens):
      ```bash
+     git clone https://github.com/nejmlabs/things-index.git
+     cd things-index
      make tokens > .env   # or set the three THINGS_INDEX_*_TOKEN vars yourself
      docker compose up -d
      ```
@@ -45,29 +57,40 @@ For 24/7 homelab infrastructure where the MCP server runs on Linux and leases jo
 
    Hostnames also need internal DNS records pointing at the proxy — the full phase-by-phase pathway (server, proxy, DNS, tunnel, worker, verification checklist) is in [`docs/homelab.md`](docs/homelab.md).
 
-3. **Connect the Mac Worker (One Command)**:
+3. **Connect the Mac Worker** — run in **Terminal on the Mac**, without `sudo`:
    ```bash
    bash -c "$(curl -fsSL https://raw.githubusercontent.com/nejmlabs/things-index/main/deploy/mac-worker-install.sh)"
    ```
-   This downloads the latest released universal binary (Apple Silicon + Intel) to `~/.local/bin`, verifies its GitHub build-provenance attestation when the `gh` CLI is present (`gh attestation verify ~/.local/bin/things-index --repo nejmlabs/things-index` by hand otherwise), and launches the setup wizard, which:
-   * Verifies the server connection **and** the worker token before configuring the background worker.
-   * Validates your optional Things auth token with a disposable test task (the token unlocks deadline/tag/checklist updates).
-   * Auto-detects the Things 3 SQLite database and verifies read-only connectivity.
-   * Installs the bundled **ThingsIndex Helper** shortcut and checks basic input and Things lookup access. Heading writes may need separate first-use approval; verify them through the background worker during attended setup before unattended use.
-   * Installs a launchd LaunchAgent that starts at login, auto-restarts the worker if it crashes, and logs to `~/Library/Logs/ThingsIndex/`.
-   * Checks the worker's signing identity and guides **Full Disk Access** setup before querying Things or starting the worker. It opens the settings and shows the actual executable to add; an old entry may need to be removed and added again.
-   * Verifies fresh database access and Things Automation consent through the background worker, then repeats startup after a restart. A failed check leaves the worker stopped and reports setup as incomplete. macOS still requires you to approve the initial permissions; see [Mac worker permissions](docs/homelab.md#mac-worker).
+   Have the **private worker URL**, **worker token**, and optional **Things auth
+   token** ready; [where to find each value](docs/homelab.md#mac-worker).
+   The installer verifies the signed universal release, installs it at
+   `~/.local/bin/things-index`, and runs the Go setup wizard. Python and Xcode
+   are not required. GitHub provenance is also checked when an authenticated
+   `gh` CLI is available.
+
+   Follow the wizard's Full Disk Access and Things Automation steps, add the
+   bundled **ThingsIndex Helper** Shortcut, and wait for its successful startup
+   and restart checks. See [Mac worker setup](docs/homelab.md#mac-worker) if a
+   check fails. The full command path works even when `~/.local/bin` is not on
+   your shell's PATH.
+
+   **Before leaving the Mac unattended**, complete the [heading-permission
+   walkthrough](shortcuts/README.md#first-run-verification). It exercises create,
+   rename and archive in a disposable project while you can approve each action,
+   then checks the background MCP route. The wizard's harmless ping does not
+   prove those write permissions. Finish the [verification checklist](docs/homelab.md#verification-order)
+   before connecting Index 01 with the public `/mcp` URL and public token.
 
    Releases through v0.2.5 use ad hoc signing, which can invalidate permissions after an update. The release workflow now requires a persistent signing certificate, and the updater checks the certificate and identity requirements before replacing an installed signed build. Moving to the first signed release still needs a manual permission refresh; see [release signing and migration](docs/macos-signing.md). Prompt-free operation across an update must be verified on the Mac after this migration.
 
-4. **Updating** — both halves update with one command:
+4. **Updating** — update the **Mac worker first**, then the server:
+   * **Mac worker** (in the Mac user's Terminal):
+     ```bash
+     ~/.local/bin/things-index update
+     ```
    * **Server** (on the Proxmox host — finds the `things-index` container, pulls, rebuilds, restarts):
      ```bash
      bash -c "$(wget -qLO - https://raw.githubusercontent.com/nejmlabs/things-index/main/deploy/proxmox-update.sh)"
-     ```
-   * **Mac worker** (self-update: downloads the latest release, verifies its provenance attestation, swaps the binary, restarts the agent):
-     ```bash
-     things-index update
      ```
 
 ---
@@ -195,5 +218,5 @@ server. Older workers cannot execute the new operations. See
 ## 🗑️ Clean Uninstallation
 To completely remove all daemons, databases, crontab entries, and launcher scripts:
 ```bash
-things-index uninstall
+~/.local/bin/things-index uninstall
 ```
