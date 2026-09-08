@@ -6,8 +6,9 @@ deployment profiles:
 - [Mac-only](macos-only.md): the server and worker run on one always-on Mac;
 - [Homelab](homelab.md): the server runs on Linux and the worker runs on a Mac.
 
-The Mac worker and bundled `ThingsIndex Helper` Shortcut are always required
-because Things automation is available only on macOS. The worker must run in
+The Mac worker is required in both profiles because Things automation runs on
+the Mac. The bundled `ThingsIndex Helper` Shortcut provides heading operations;
+task capture uses Things' URL scheme. The worker must run in
 the GUI session of the user who owns the Things library. A locked session is
 fine, but the user must log in after a reboot.
 
@@ -88,5 +89,5 @@ the new journal cannot reconstruct native writes already dispatched by an old
 binary.
 The existing signed Shortcut still handles heading operations; this update
 does not change its source or installed workflow. See the
-[write recovery contract](../README.md#write-recovery) for retry behaviour and
+[write recovery contract](write-recovery.md) for retry behaviour and
 the limits of reconciling native Things writes after an interruption.

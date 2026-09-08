@@ -12,7 +12,7 @@ Things <── native automation <── Mac worker ─────────�
 ```
 
 For a first installation, use the [Proxmox or Docker steps in the main
-README](../README.md#option-2-homelab--distributed-mode-proxmox--docker--mac-mini),
+README](../README.md#index-01--homelab-setup),
 then configure the private HTTPS route and follow [Mac worker](#mac-worker)
 below. Linux commands run on the server; Mac commands run as the user who owns
 Things. The detailed manual Linux installation below is an alternative to the

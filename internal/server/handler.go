@@ -104,7 +104,7 @@ func NewHandler(store Queue, config Config) (http.Handler, error) {
 	}, service.captureTask))
 	register(toolschema.AddTool(mcpServer, &mcp.Tool{
 		Name:        "things_capture_status",
-		Description: "Check a Things capture using the request_id returned by capture_things_task.",
+		Description: "Retrieve the status and available result of any queued Things operation, including reads, using its returned request_id.",
 	}, service.captureStatus))
 	register(toolschema.AddTool(mcpServer, &mcp.Tool{
 		Name:        "create_things_heading",
@@ -128,19 +128,19 @@ func NewHandler(store Queue, config Config) (http.Handler, error) {
 	}, service.archiveProject))
 	register(toolschema.AddTool(mcpServer, &mcp.Tool{
 		Name:        "get_things_today",
-		Description: "Get all tasks scheduled for Today in Things 3.",
+		Description: "Get up to 50 open tasks in Things 3 Today. Use search_things_tasks with scope today and limit up to 200 for more results.",
 	}, service.getToday))
 	register(toolschema.AddTool(mcpServer, &mcp.Tool{
 		Name:        "get_things_inbox",
-		Description: "Get all unorganized tasks in Things 3 Inbox.",
+		Description: "Get up to 50 open Inbox tasks in Things 3. Use search_things_tasks with scope inbox and limit up to 200 for more results.",
 	}, service.getInbox))
 	register(toolschema.AddTool(mcpServer, &mcp.Tool{
 		Name:        "list_things_projects",
-		Description: "List all active projects and their areas in Things 3.",
+		Description: "List up to 50 active Things 3 projects with areas, notes, and open task counts. Use search_things_tasks with scope projects and limit up to 200 for more results.",
 	}, service.listProjects))
 	register(toolschema.AddTool(mcpServer, &mcp.Tool{
 		Name:        "search_things_tasks",
-		Description: "Search tasks in Things 3 across any scope (today, inbox, anytime, someday, all) by title, project, area, or tag.",
+		Description: "Search task titles, notes, and project titles in Things 3. Task scopes: today, inbox, anytime, someday, or all (default); filter by exact project, area, or tag names. Scope projects lists active projects without task filters. Returns 50 results by default, with limit up to 200 and no pagination.",
 	}, service.searchTasks))
 	register(toolschema.AddTool(mcpServer, &mcp.Tool{
 		Name:        "create_things_project",

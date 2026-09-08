@@ -2,8 +2,10 @@
 
 `ThingsIndex Helper` is the worker's adapter for Things heading operations —
 create, rename, and archive run through the Shortcut's native Things App
-Intents because no URL-scheme or AppleScript surface reaches headings. The
-worker invokes it with Apple's built-in `shortcuts` command and exchanges
+Intents because the URL scheme and AppleScript do not expose these edits to
+headings in existing projects. The URL scheme can include headings when
+creating a new project. The worker invokes it with Apple's built-in `shortcuts`
+command and exchanges
 versioned JSON files. (Captures use the Things URL scheme directly; the
 capture operations specified below remain implemented in the Shortcut, but
 the worker currently calls only `ping` and the three heading operations.)

@@ -362,7 +362,7 @@ func runStdio() error {
 
 	mustAddTool(mcpServer, &mcp.Tool{
 		Name:        "get_things_today",
-		Description: "Get all tasks scheduled for Today in Things 3.",
+		Description: "Get up to 50 open tasks in Things 3 Today. Use search_things_tasks with scope today and limit up to 200 for more results.",
 	}, func(callCtx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
 		resp, err := captureAdapter.QueryTasks(callCtx, capture.QueryTasksRequest{Scope: "today"})
 		if err != nil {
@@ -377,7 +377,7 @@ func runStdio() error {
 
 	mustAddTool(mcpServer, &mcp.Tool{
 		Name:        "get_things_inbox",
-		Description: "Get all unorganized tasks in Things 3 Inbox.",
+		Description: "Get up to 50 open Inbox tasks in Things 3. Use search_things_tasks with scope inbox and limit up to 200 for more results.",
 	}, func(callCtx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
 		resp, err := captureAdapter.QueryTasks(callCtx, capture.QueryTasksRequest{Scope: "inbox"})
 		if err != nil {
@@ -392,7 +392,7 @@ func runStdio() error {
 
 	mustAddTool(mcpServer, &mcp.Tool{
 		Name:        "list_things_projects",
-		Description: "List all active projects and their areas in Things 3.",
+		Description: "List up to 50 active Things 3 projects with areas, notes, and open task counts. Use search_things_tasks with scope projects and limit up to 200 for more results.",
 	}, func(callCtx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
 		resp, err := captureAdapter.QueryTasks(callCtx, capture.QueryTasksRequest{Scope: "projects"})
 		if err != nil {
@@ -407,7 +407,7 @@ func runStdio() error {
 
 	mustAddTool(mcpServer, &mcp.Tool{
 		Name:        "search_things_tasks",
-		Description: "Search tasks in Things 3 across any scope (today, inbox, anytime, someday, all) by title, project, area, or tag.",
+		Description: "Search task titles, notes, and project titles in Things 3. Task scopes: today, inbox, anytime, someday, or all (default); filter by exact project, area, or tag names. Scope projects lists active projects without task filters. Returns 50 results by default, with limit up to 200 and no pagination.",
 	}, func(callCtx context.Context, _ *mcp.CallToolRequest, input capture.QueryTasksRequest) (*mcp.CallToolResult, any, error) {
 		resp, err := captureAdapter.QueryTasks(callCtx, input)
 		if err != nil {

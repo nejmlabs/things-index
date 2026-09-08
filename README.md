@@ -1,222 +1,319 @@
 # ThingsIndex
 
-ThingsIndex is a Model Context Protocol (MCP) server for capturing, reading, searching, updating, and archiving tasks from **Pebble Index 01**, **Claude Desktop**, **Cursor**, and AI agents into **Things 3** on macOS.
+Connect **Things 3** to **Pebble Index 01**, **Claude Desktop**, **Codex**, and
+other AI clients through the Model Context Protocol (MCP). Capture tasks by
+voice, find what needs doing, and organise tasks, projects, areas, tags, and
+headings.
 
----
+Built primarily for Index 01's voice workflow, so task capture works from a
+single spoken request without follow-up questions. Things runs on your Mac;
+you can connect a local AI client directly, or run a server and queue for remote
+access.
 
-## ⚡ Quick Start & Onboarding
+[What's new](#whats-new-in-the-latest-release) · [Setup](#setup) ·
+[What you can do](#what-you-can-do) · [Updating](#updating) ·
+[Roadmap](#roadmap) · [Documentation](#documentation)
 
-For **Index 01 with a Mac mini**, follow **Option 2**: Linux hosts the MCP
-endpoint and queue; the Mac runs Things and processes the queued work. Option 1
-is for a client running locally on a Mac.
+## What's new in the latest release
 
-### Option 1: All-in-One Local Mac Mode
-For running directly on a Mac for local Claude Desktop or Cursor:
+**[v0.2.6](https://github.com/nejmlabs/things-index/releases/tag/v0.2.6)** —
+7 September 2026
+
+- **Create areas and tags from MCP**, including tags under an existing parent.
+- **Recover interrupted writes more reliably.** Saved write records and retry
+  keys help recover confirmed results without repeating the same change.
+- **Check results more thoroughly**, including project details, checklists,
+  and dates. Today, Anytime, and Someday use Things' public lists.
+- **Simpler Mac worker setup.** The Go installer guides permissions and checks
+  startup and restart. Persistent release signing and update identity checks
+  help preserve macOS permissions across updates. Python is not required.
+
+**Upgrading:** update the Mac worker before the server. Users moving from
+v0.2.5 or earlier need a one-time permission refresh. Heading operations still
+use the ThingsIndex Helper Shortcut and need their own initial approvals.
+See [updating](#updating) and the [full release notes](https://github.com/nejmlabs/things-index/releases/tag/v0.2.6).
+
+## What you can do
+
+| In Things | Available through ThingsIndex | Interface |
+| --- | --- | --- |
+| Tasks | Capture, search, edit, schedule, complete, cancel, and move to Trash. Include reminders when capturing; append checklist lines when updating. | URL scheme and AppleScript for changes; read-only SQLite for details. |
+| Projects | List, create, complete, and cancel. Capture tasks into an existing project using **fuzzy matching** on a spoken project name. | URL scheme for creation; AppleScript for archiving; read-only SQLite for listing. |
+| Areas and tags | Create areas and tags, including tags under an existing parent. | AppleScript. |
+| Headings | Create a heading inside an existing project, rename it, and mark it completed/archived. | Helper Shortcut using native Things actions. |
+| Lists and status | Read Today and Inbox, search other scopes, and check whether a queued request has finished. | AppleScript and read-only SQLite for Things lists; ThingsIndex's queue for request status. |
+
+For example, ask your connected client:
+
+- “What's in my Today list?”
+- “Add buy paint to the kitchen project.”
+- “Create a project called Kitchen renovation.”
+- “Create a tag called Waiting under Work.”
+
+For task capture, project matching handles a unique partial name or a small
+spelling mistake. If the requested project is missing or ambiguous, the task goes to
+Inbox with the requested destination recorded in its notes. The response
+explains what happened; Index 01 does not need to present choices. Creating a
+new project is a separate, explicit request.
+
+See the [complete MCP tool reference](docs/mcp-tools.md) for all **15 tools**
+(**14 in direct stdio mode**), each tool's interface, result limits, examples,
+matching rules, and Things auth-token requirements.
+
+<a id="-quick-start--onboarding"></a>
+
+## Setup
+
+Choose the path that matches where your MCP client runs:
+
+| Your setup | Start here |
+| --- | --- |
+| Index 01 with a Mac mini and a Linux, Proxmox, or Docker server | [Index 01 / homelab setup](#index-01--homelab-setup) |
+| Claude Desktop or Cursor on the same Mac as Things | [Local Mac setup](#local-mac-setup) |
+| Remote access with the server and worker both on one Mac | [Advanced Mac-only deployment](docs/macos-only.md) |
+
+**Before you start:** install and open Things 3.17+ on macOS 14+. Run Mac setup
+commands in Terminal as the user who owns the Things library, **without
+`sudo`**, with the desktop visible for permission approvals.
+
+For unattended operation, the Mac must stay awake and that user must remain
+logged in. The screen can be locked after setup; after a reboot, log in again
+to start the worker.
+
+<a id="option-2-homelab--distributed-mode-proxmox--docker--mac-mini"></a>
+
+### Index 01 / homelab setup
+
+The **server** receives MCP requests and keeps queued work on Linux. The
+**Mac worker** connects to that server and performs the work in Things.
+
+#### 1. Install the server
+
+Choose **one** of these methods.
+
+**Proxmox:** run in the **Proxmox host's root shell**:
+
+```bash
+bash -c "$(wget -qLO - https://raw.githubusercontent.com/nejmlabs/things-index/main/deploy/proxmox-install.sh)"
+```
+
+The default opens the server to the LAN. The installer's final banner explains
+how to restrict access to your reverse proxy. To restrict it from the start,
+see the [Proxmox network options](deploy/README.md#proxmox-network-options).
+
+**Docker Compose:** run on the **Docker host**:
+
+```bash
+git clone https://github.com/nejmlabs/things-index.git
+cd things-index
+umask 077
+make tokens > .env
+docker compose up -d
+```
+
+Run token generation once for a new installation. Keep `.env` private: it
+contains the credentials used to connect your clients and Mac worker.
+
+#### 2. Configure the connection
+
+Set up a reverse proxy or tunnel with two separate routes:
+
+| Connection | What to use |
+| --- | --- |
+| Index 01 / Pebble Cloud → MCP server | Public HTTPS URL ending in `/mcp`, with `THINGS_INDEX_PUBLIC_TOKEN`. |
+| Mac worker → server | Private HTTPS base URL, with `THINGS_INDEX_WORKER_TOKEN`. |
+
+Publish only `/mcp`; keep the worker API, health endpoint, and optional dashboard
+private. The Mac worker rejects plain HTTP except to a loopback address.
+
+Follow the [network setup guide](deploy/README.md), with worked examples for
+[Traefik](deploy/traefik/README.md) and
+[Cloudflare Tunnel](deploy/cloudflare/README.md).
+[Internal DNS and the full setup sequence](docs/homelab.md) are covered in the
+homelab guide. An [SSH tunnel](docs/homelab.md#no-domain-alternative-persistent-ssh-tunnel)
+is available for LAN-only use, but does not make the server reachable by Pebble Cloud.
+
+#### 3. Install the Mac worker
+
+Run in **Terminal on the Mac that runs Things**:
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/nejmlabs/things-index/main/deploy/mac-worker-install.sh)"
+```
+
+Have the private worker **base URL** and worker token ready. The optional Things
+auth token enables additional task updates; see
+[where to find each setup value](docs/homelab.md#mac-worker).
+
+The installer downloads the signed release to `~/.local/bin/things-index`,
+checks its signature, and opens the Go setup wizard. Follow its Full Disk
+Access and Things Automation steps, add the bundled **ThingsIndex Helper**
+Shortcut, and wait for the startup and restart checks to pass.
+
+**Before leaving the Mac unattended**, complete the
+[one-time heading-permission walkthrough](shortcuts/README.md#first-run-verification).
+The wizard's basic Shortcut check does not prove permission to create, rename,
+or archive headings; those actions can need separate approvals.
+
+#### 4. Verify and connect Index 01
+
+Follow the [verification checklist](docs/homelab.md#verification-order),
+including a test task and the background heading checks. Then configure
+Index 01 with the **public `/mcp` URL and public token**.
+
+A queued response means the Mac has not yet confirmed the operation. The client
+should check `things_capture_status` until it reports success or failure.
+
+<a id="option-1-all-in-one-local-mac-mode"></a>
+
+### Local Mac setup
+
+For Claude Desktop or Cursor running on the same Mac as Things, run:
 
 ```bash
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/nejmlabs/things-index/main/deploy/mac-install.sh)"
 ```
 
-This downloads the attested universal binary to `~/.local/bin` and ends with a choice: print the ready-to-paste Claude Desktop / Cursor stdio configuration, or start the local Streamable HTTP MCP server right away. Run `~/.local/bin/things-index install-shortcut` once for heading tools in local mode, then complete the [one-time heading permissions](shortcuts/README.md#first-run-verification). The worker wizard installs the Shortcut automatically in homelab mode.
+Choose the option to print the client configuration, then paste it into your
+MCP client's settings. The installer can also start a local HTTP MCP server
+that stays running in Terminal. GitHub build provenance is checked when an
+authenticated `gh` CLI is available.
 
-Building from source instead: `make build`, then `./bin/things-index config` or `./bin/things-index start`.
+Restart your MCP client, ask for your Today list, and create a disposable Inbox
+task. Approve any requested Things Automation or data access while you are at
+the Mac, and confirm both results in Things. This local path does not run the
+worker setup wizard. Remove the test task once the check passes.
 
----
+To enable heading tools, run:
 
-### Option 2: Homelab / Distributed Mode (Proxmox / Docker + Mac mini)
-For 24/7 homelab infrastructure where the MCP server runs on Linux and leases jobs to a remote Mac:
-
-Have Things 3.17+ installed and opened once on macOS 14+, using the Mac account
-that owns your Things library. Initial setup needs that account's visible desktop
-for permission dialogs; run the Mac commands without `sudo`. After setup the
-screen can be locked, but the Mac must stay awake and that user must remain
-logged in. After a reboot, log in again to start the worker.
-
-1. **Deploy Server on Linux / Proxmox**:
-   * **Proxmox VE 1-Click LXC Installer** — run in the **Proxmox host's root shell**:
-     ```bash
-     # Open to the LAN (the final banner prints the commands to tighten it later):
-     bash -c "$(wget -qLO - https://raw.githubusercontent.com/nejmlabs/things-index/main/deploy/proxmox-install.sh)"
-
-     # Or locked to your reverse proxy from the start (IPv4 or CIDR, validated up front):
-     THINGS_INDEX_PROXY_IP=<proxy-ip> bash -c "$(wget -qLO - https://raw.githubusercontent.com/nejmlabs/things-index/main/deploy/proxmox-install.sh)"
-     ```
-   * **Docker Compose** — run on the **Docker host** from a repository checkout (the server refuses to start without tokens):
-     ```bash
-     git clone https://github.com/nejmlabs/things-index.git
-     cd things-index
-     make tokens > .env   # or set the three THINGS_INDEX_*_TOKEN vars yourself
-     docker compose up -d
-     ```
-
-2. **Put HTTPS in front** (the worker refuses plain HTTP off loopback):
-   Any reverse proxy or tunnel satisfying the contract in [`deploy/README.md`](deploy/README.md) works. Two worked examples ship in the repo:
-   * [`deploy/traefik/`](deploy/traefik/) — inbound LAN reverse proxy (fill-in config + checklist).
-   * [`deploy/cloudflare/`](deploy/cloudflare/) — outbound Cloudflare Tunnel runbook: publishes only `/mcp`, no inbound ports on your network.
-   * **No domain at all**: an SSH tunnel to loopback also satisfies the worker — one-off for a quick test (`ssh -N -L 8080:<server-ip>:8080 <user>@<lan-host>`), or persistent across reboots via the shipped launchd template ([`deploy/launchd/com.nejmlabs.things-index-tunnel.plist.example`](deploy/launchd/com.nejmlabs.things-index-tunnel.plist.example), walkthrough in [`docs/homelab.md`](docs/homelab.md)). Use `http://127.0.0.1:8080` in the next step. LAN-only: nothing is published for Pebble Cloud.
-
-   Hostnames also need internal DNS records pointing at the proxy — the full phase-by-phase pathway (server, proxy, DNS, tunnel, worker, verification checklist) is in [`docs/homelab.md`](docs/homelab.md).
-
-3. **Connect the Mac Worker** — run in **Terminal on the Mac**, without `sudo`:
-   ```bash
-   bash -c "$(curl -fsSL https://raw.githubusercontent.com/nejmlabs/things-index/main/deploy/mac-worker-install.sh)"
-   ```
-   Have the **private worker URL**, **worker token**, and optional **Things auth
-   token** ready; [where to find each value](docs/homelab.md#mac-worker).
-   The installer verifies the signed universal release, installs it at
-   `~/.local/bin/things-index`, and runs the Go setup wizard. Python and Xcode
-   are not required. GitHub provenance is also checked when an authenticated
-   `gh` CLI is available.
-
-   Follow the wizard's Full Disk Access and Things Automation steps, add the
-   bundled **ThingsIndex Helper** Shortcut, and wait for its successful startup
-   and restart checks. See [Mac worker setup](docs/homelab.md#mac-worker) if a
-   check fails. The full command path works even when `~/.local/bin` is not on
-   your shell's PATH.
-
-   **Before leaving the Mac unattended**, complete the [heading-permission
-   walkthrough](shortcuts/README.md#first-run-verification). It exercises create,
-   rename and archive in a disposable project while you can approve each action,
-   then checks the background MCP route. The wizard's harmless ping does not
-   prove those write permissions. Finish the [verification checklist](docs/homelab.md#verification-order)
-   before connecting Index 01 with the public `/mcp` URL and public token.
-
-   Releases through v0.2.5 use ad hoc signing, which can invalidate permissions after an update. The release workflow now requires a persistent signing certificate, and the updater checks the certificate and identity requirements before replacing an installed signed build. Moving to the first signed release still needs a manual permission refresh; see [release signing and migration](docs/macos-signing.md). Prompt-free operation across an update must be verified on the Mac after this migration.
-
-4. **Updating** — update the **Mac worker first**, then the server:
-   * **Mac worker** (in the Mac user's Terminal):
-     ```bash
-     ~/.local/bin/things-index update
-     ```
-   * **Server** (on the Proxmox host — finds the `things-index` container, pulls, rebuilds, restarts):
-     ```bash
-     bash -c "$(wget -qLO - https://raw.githubusercontent.com/nejmlabs/things-index/main/deploy/proxmox-update.sh)"
-     ```
-
----
-
-## 🛠️ Complete MCP Tools Directory
-
-| Tool Name | Type | Description |
-| :--- | :---: | :--- |
-| `get_things_today` | Read | Returns all tasks currently scheduled for **Today** with area, project, heading, and notes. |
-| `get_things_inbox` | Read | Returns all unprocessed tasks in the **Inbox**. |
-| `list_things_projects` | Read | Lists all active **Projects**, their parent Areas, notes, and open task counts. |
-| `search_things_tasks` | Read | Search tasks across any scope (`today`, `inbox`, `anytime`, `someday`, `all`) by text query, project, area, or tag. |
-| `capture_things_task` | Write | Create a task in Inbox, Project, Area, or under a Heading with notes, tags, checklists, deadlines, and reminders. |
-| `create_things_project` | Write | Create a new project inside an Area with notes, tags, start schedule, and deadline. |
-| `create_things_area` | Write | Create an area, or reuse one unique exact name (ignoring case) with a warning. |
-| `create_things_tag` | Write | Create a tag with an optional existing parent tag; reuse requires the same parent. |
-| `update_things_task` | Write | Update an open task’s title or notes, reschedule it, or add deadlines, tags, and checklists (deadline/tags/checklist/non-today schedules need the Things auth token). |
-| `create_things_heading` | Write | Create a new section heading inside an existing project (runs the bundled ThingsIndex Helper shortcut; verified via SQLite before reporting success). |
-| `rename_things_heading` | Write | Rename an existing section heading inside a project (runs the bundled ThingsIndex Helper shortcut; verified via SQLite before reporting success). |
-| `archive_things_heading` | Write | Archive a section heading from an active project (runs the bundled ThingsIndex Helper shortcut; verified via SQLite before reporting success). |
-| `archive_things_task` | Write | Archive a task: mark `completed` (Logbook), `canceled` (Logbook), or move to `trash`. |
-| `archive_things_project` | Write | Archive an entire project: mark `completed` or `canceled`. |
-| `things_capture_status` | Read | Check async status of any queued operation via `request_id` (server mode only; stdio mode captures synchronously). |
-
-### Project capture from Index 01
-
-Index 01 handles each spoken command without a clarification exchange. Say
-“Add buy paint to the kitchen project” to capture a task, or explicitly ask
-“Create a project called Kitchen renovation” to create a project.
-
-`create_things_project` creates the requested title in an optional exact area.
-It reuses an active exact-name project only in that same area; omitting the area
-means an unfiled project. If requested notes, tags, or dates differ on a reused
-project, it returns a warning describing which fields were not applied. After
-creation succeeds, the returned `things_id` can
-be used directly in a task's destination:
-
-```json
-{"title":"Buy paint","destination":{"kind":"project","id":"<returned things_id>"}}
+```bash
+~/.local/bin/things-index install-shortcut
 ```
 
-For an existing project, `capture_things_task` accepts its name as spoken:
+Then complete the [heading-permission walkthrough](shortcuts/README.md#first-run-verification).
+The helper is used for heading edits; ordinary task capture uses Things' URL
+scheme directly.
 
-```json
-{"title":"Buy paint","destination":{"kind":"project","name":"kitchen"}}
+## Updating
+
+**For a server-and-worker installation, update the Mac worker first.**
+
+On the Mac:
+
+```bash
+~/.local/bin/things-index update
 ```
 
-Project matching prefers exact names, then handles punctuation, reordered
-words, a unique whole-word partial name, or a small typo in the full name
-(such as “Kichen renovation”). Only active projects are considered. A matching
-notice names the selected project so the voice client can confirm it. Numeric
-differences such as 2025 versus 2026 are not treated as typos.
+Then update the server using the method you installed with:
 
-If “kitchen” could mean both “Kitchen renovation” and “Kitchen supplies”, the
-task is saved in Inbox. Its notes retain the requested project and heading,
-and the confirmation explains the Inbox fallback. The same applies when no
-project matches or an explicit project ID is unavailable. Index 01 does not
-need to ask a follow-up question or offer choices, and an uncertain match does
-not create a new project.
+- **Proxmox:** run this on the Proxmox host:
 
-Explicit project IDs take precedence over names. Area names and heading names
-remain exact, and project creation does not use fuzzy matching. If an explicit
-project creation request fails, the client reports the failure without asking
-for clarification.
+  ```bash
+  bash -c "$(wget -qLO - https://raw.githubusercontent.com/nejmlabs/things-index/main/deploy/proxmox-update.sh)"
+  ```
 
-In server mode, check `things_capture_status` until a queued project creation
-succeeds before adding tasks using its ID. A queued result means the Mac has
-not yet confirmed the operation.
+- **Docker Compose:** run in the server's repository checkout:
 
-Area and tag creation also work without a clarification exchange. For example,
-`create_things_area` accepts `{"title":"Work"}`, and `create_things_tag` accepts
-`{"title":"Waiting","parent":"Work"}` when the parent tag already exists.
-Missing or ambiguous parent names fail before creation. Existing tags are never
-moved to a different parent implicitly. Tag names cannot contain commas because
-Things' tag application interface uses comma-separated names.
+  ```bash
+  git pull
+  docker compose up -d --build
+  ```
+
+- **Manual installation:** follow the [upgrade guide](docs/homelab.md#upgrading).
+
+For v0.2.5 or earlier, follow the [signing and permission migration guide](docs/macos-signing.md).
+Stable signing helps preserve grants across updates; it does not guarantee
+that future macOS or Things updates will never request consent again.
+
+## How it works
+
+ThingsIndex is written in **Go**. Most changes use Things' URL scheme or
+AppleScript. The helper Shortcut handles creating headings in existing
+projects, renaming headings, and archiving them.
+
+ThingsIndex reads item details from Things' SQLite database **without writing
+to it**. Today, Anytime, and Someday membership comes from Things' public lists.
+Native Things automation performs changes and leaves syncing to Things.
+
+In server mode, requests wait in a durable queue while the Mac is unavailable.
+The worker processes them when it reconnects. Data returned through MCP is
+shared with the AI client and provider you choose.
 
 ### Write recovery
 
-All write tools accept an optional `idempotency_key`. Reuse the same key and
-identical input when retrying a command; use a new key for a new intentional
-change. The same key with different input is rejected. Both direct stdio MCP
-and the queued Mac worker keep a durable local write journal.
+All write tools accept an optional `idempotency_key`. Retry a command using the
+**same key and identical input**; use a new key for a new intentional change.
+Saved write records help recover results after interruptions. An uncertain
+write may require checking the item in Things before retrying.
 
-Task capture keeps its unique pending title until its Things UUID is saved in
-the journal, then finalises the title. A restart can recover that marker and
-preserve any placement or missing-tag warnings. Completed writes retain their
-result so a lost server acknowledgement does not repeat the mutation.
+See the [write recovery guide](docs/write-recovery.md) for the full guarantees,
+limitations, deadlines, and retention rules.
 
-Task updates save their intended before/after values before dispatch. Appending
-notes becomes an exact replacement computed once; retries check for conflicting
-edits. Checklists are appended once and verified against the existing item IDs,
-titles, and statuses. An uncertain checklist or native creation is reconciled
-where possible and otherwise reported as uncertain without repeating it. Things
-does not provide an atomic transaction with this journal, so some interrupted
-writes require checking the item in Things. Concurrent edits to the same fields
-can still race with the native write.
+## Roadmap
 
-Ordinary native commands have a 30-second deadline, each job has 45 seconds,
-and reporting has a separate 10-second allowance within the 90-second lease.
-Initial attended Automation setup retains its two-minute allowance. Date checks
-use public Things calendar properties; SQLite remains read-only. The Evening
-check also depends on Things' current read-only bucket schema and rejects
-unrecognised values.
+Future work, roughly in priority order. Scope and timing may change.
 
-Only server-acknowledged journal entries are eligible for retention cleanup.
-Uncertain writes and unacknowledged results remain available for recovery;
-stdio results are retained because stdio has no durable delivery acknowledgement.
-Server idempotency protection is bounded by retained queue and journal history.
-The existing signed Shortcut remains the implementation for heading operations.
+- [ ] **Guided setup and permission checks.** Bring the heading create,
+  rename, and archive checks into setup, with clear results for each capability
+  and guidance for any remaining attended macOS approvals.
+- [ ] **Consistent Mac installers.** Give local and worker installations the
+  same signature checks, signing-identity checks, backup protections, and
+  permission guidance.
+- [ ] **Easier recovery.** Make interrupted or uncertain requests easier to
+  inspect, explain what was confirmed in Things, and guide the next action
+  without requiring users to inspect databases or interpret raw logs.
+- [ ] **More complete reading tools.** Add pagination for larger libraries,
+  explicit area and tag listing, and detailed item retrieval.
+- [ ] **Optional desktop clarification.** Let conversational clients ask which
+  project the user means before capturing a task. Keep Index 01's current
+  single-request behaviour and Inbox fallback as the default.
 
-For an upgrade that adds area/tag tools, update the Mac worker before the MCP
-server. Older workers cannot execute the new operations. See
-[deployment profiles](docs/deployment.md) for signing, setup, and retention.
+Later candidates include moving existing tasks between projects, areas, and
+headings; editing existing project details; and editing individual checklist
+items. New operations should use supported Things interfaces, with helper
+Shortcuts reserved for functionality that needs them.
 
----
+## Documentation
 
-## 🔒 Aims
-* **Unattended Execution**: Uses native Things automation for writes and read-only SQLite for item details. Today, Anytime, and Someday membership comes from Things' public lists. Background operation across restarts requires Full Disk Access for the worker, separate Things Automation permission for AppleScript, and the **ThingsIndex Helper** shortcut's permissions for headings. Release signing and updater identity checks preserve the identity used by those grants; existing ad hoc installations need a one-time migration and verification. See [Mac worker permissions](docs/homelab.md#mac-worker).
-* **Zero Foreground Steal**: Suppresses window focus and automatically quits Things 3 (no Dock dot) if it was closed before capture.
-* **Strictly Read-Only SQLite (`_query_only=1`)**: Never performs raw SQL writes to Cultured Code's database; Cultured Code's official engine handles writing and Things Cloud sync.
-* **Durable Queue**: In server mode, If the Mac is asleep or rebooting, tasks wait safely in the server queue and process immediately on wakeup.
+| Guide | Covers |
+| --- | --- |
+| [MCP tools](docs/mcp-tools.md) | All tool names, examples, project matching, and Index 01 behaviour. |
+| [Homelab deployment](docs/homelab.md) | Server, network, Mac worker, verification, and upgrades. |
+| [Advanced Mac-only deployment](docs/macos-only.md) | Running the server and worker together on one Mac. |
+| [Deployment settings](docs/deployment.md) | Tokens, the optional dashboard, and data retention. |
+| [Helper Shortcut](shortcuts/README.md) | Installation, heading permissions, and how the helper works. |
+| [macOS signing](docs/macos-signing.md) | Release identity and permission migration. |
+| [Write recovery](docs/write-recovery.md) | Retry behaviour and interrupted operations. |
 
----
+## Building from source
 
-## 🗑️ Clean Uninstallation
-To completely remove all daemons, databases, crontab entries, and launcher scripts:
+Install Go 1.26+ and a C toolchain for SQLite, then run from a repository checkout:
+
+```bash
+make build
+./bin/things-index config
+```
+
+The configuration command prints settings for a local MCP client. Use
+`./bin/things-index start` for local HTTP mode. Released Mac binaries do not
+require Go, Python, or Xcode to install.
+
+The `cmd/` folder contains the executable entry points. The `internal/` folder
+contains the Go packages used by this project. **`internal` controls which Go
+code can import those packages; it does not mean confidential or unpublished.**
+These source files belong in the public repository so others can build and
+review the application.
+
+## Uninstalling
+
+On the Mac, this removes the worker's local configuration, logs, and recovery
+state. Back up any state you need before running it:
+
 ```bash
 ~/.local/bin/things-index uninstall
 ```
+
+Follow the printed manual steps to remove the helper Shortcut, Automation
+grant, and executable. Also remove any Full Disk Access grant and the MCP
+client configuration you added. Separately installed servers and tunnels need
+their own removal.

@@ -1,5 +1,8 @@
 /bin/
 /dist/
+/.env
+/.env.*
+!/.env.example
 /.tmp-*.json
 /status.md
 /*.db

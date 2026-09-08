@@ -8,7 +8,7 @@ Pebble Cloud ──HTTPS──> tunnel or reverse proxy ──> 127.0.0.1:8080/m
                                                           ▲
                                                           │ HTTP loopback
                                                           │
-Things <── native Shortcut <── Mac worker <────────────────┘
+Things <── native automation <── Mac worker <──────────────┘
 ```
 
 The public ingress must route exactly `/mcp`. The worker API and health endpoint
@@ -17,7 +17,8 @@ must not be published.
 ## Requirements
 
 - Things 3 installed for the macOS user running the worker;
-- the `ThingsIndex Helper` Shortcut installed and approved for Things access;
+- for heading tools, the `ThingsIndex Helper` Shortcut installed and approved
+  for its Things actions;
 - that user logged into the GUI session after each reboot;
 - a public HTTPS tunnel or reverse proxy that can restrict the published path;
 - two independent bearer tokens as described in [Deployment profiles](deployment.md).
@@ -91,7 +92,12 @@ launchctl bootstrap "gui/$(id -u)" \
   "$HOME/Library/LaunchAgents/com.nejmlabs.things-index-server.plist"
 ```
 
-Before loading the worker as a background agent, launch its setup GUI:
+Before loading the worker as a background agent, follow the
+[Mac worker permission guidance](homelab.md#mac-worker), granting Full Disk
+Access to the executable used by this profile: `~/.local/bin/things-index-worker`.
+Use the signed release and its guided setup if you need a stable identity
+across updates; these manual source builds do not acquire that release identity.
+Then launch the dedicated worker's setup GUI:
 
 ```sh
 "$HOME/.local/bin/things-index-worker" --setup
@@ -145,4 +151,7 @@ Do not configure the ingress until its path restriction has been verified.
 4. Create a disposable Inbox task and verify its temporary title was replaced.
 5. Test an exact project, area, and heading, plus This Evening, a reminder,
    deadline, tags, and checklist.
-6. Configure Pebble only after those checks pass.
+6. Complete the [heading-permission walkthrough](../shortcuts/README.md#first-run-verification),
+   including create, rename, and archive through the background MCP route.
+   The setup page's basic checks do not establish permission for those writes.
+7. Configure Pebble only after those checks pass.

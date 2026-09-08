@@ -14,6 +14,17 @@ One-command installers, service templates, and HTTPS ingress examples.
 Service templates for running the pieces by hand live in
 [`systemd/`](systemd/) (Linux server) and [`launchd/`](launchd/) (Mac).
 
+### Proxmox network options
+
+By default, the Proxmox installer opens port 8080 to the LAN and prints commands
+to restrict it later. If you already know your reverse proxy's IPv4 address or
+CIDR, restrict access from the start by running this in the Proxmox host's root
+shell, replacing `<proxy-ip>` with that value:
+
+```sh
+THINGS_INDEX_PROXY_IP=<proxy-ip> bash -c "$(wget -qLO - https://raw.githubusercontent.com/nejmlabs/things-index/main/deploy/proxmox-install.sh)"
+```
+
 ## HTTPS ingress: the contract
 
 The server deliberately speaks plain HTTP on a loopback or private address

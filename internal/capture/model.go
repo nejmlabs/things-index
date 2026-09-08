@@ -115,13 +115,13 @@ func (r ArchiveProjectRequest) Validate() error {
 }
 
 type QueryTasksRequest struct {
-	Scope            string `json:"scope,omitempty" jsonschema:"Scope: 'today', 'inbox', 'anytime', 'someday', 'projects', or 'all' (default: 'today')."`
-	Query            string `json:"query,omitempty" jsonschema:"Optional search text to filter by title and notes."`
-	Project          string `json:"project,omitempty" jsonschema:"Optional project name filter."`
-	Area             string `json:"area,omitempty" jsonschema:"Optional area name filter."`
-	Tag              string `json:"tag,omitempty" jsonschema:"Optional tag name filter."`
-	IncludeCompleted bool   `json:"include_completed,omitempty" jsonschema:"Include completed tasks (default: false)."`
-	Limit            int    `json:"limit,omitempty" jsonschema:"Max results to return (default: 50)."`
+	Scope            string `json:"scope,omitempty" jsonschema:"Scope: 'today', 'inbox', 'anytime', 'someday', 'projects', or 'all' (default: 'all'). The projects scope lists active projects and only applies limit."`
+	Query            string `json:"query,omitempty" jsonschema:"Optional text search in task titles, notes, and project titles. Task scopes only."`
+	Project          string `json:"project,omitempty" jsonschema:"Optional exact project name filter, ignoring case. Task scopes only."`
+	Area             string `json:"area,omitempty" jsonschema:"Optional exact area name filter, ignoring case. Task scopes only."`
+	Tag              string `json:"tag,omitempty" jsonschema:"Optional exact tag name filter, ignoring case. Task scopes only."`
+	IncludeCompleted bool   `json:"include_completed,omitempty" jsonschema:"Also include completed and canceled tasks, subject to scope (default: false). Trash is always excluded; ignored for projects."`
+	Limit            int    `json:"limit,omitempty" jsonschema:"Maximum results: 1 to 200. Omitted or out-of-range values use 50. No pagination."`
 }
 
 func (q QueryTasksRequest) Validate() error {
